@@ -1,0 +1,19 @@
+Product/Service Name,Type,Sales Description,Sales Price / Rate,Income Account,Purchase Description,Purchase Cost,Expense Account,Inventory Asset Account,Quantity on Hand,Reorder Point,Quantity as of Date,Taxable
+Reynaldo's Soy Chorizo,Inventory,Reynaldo's Soy Chorizo - 16/11oz,2.24,Sales of Product Income,Reynaldo's Soy Chorizo - 16/11oz,1.52,Cost of Goods Sold,Inventory Asset,5,0,05/25/2026,Yes
+Salsa Verde El Campestre,Inventory,Salsa Verde El Campestre - 12/16oz,29.88,Sales of Product Income,Salsa Verde El Campestre - 12/16oz,1.84,Cost of Goods Sold,Inventory Asset,0,0,05/25/2026,Yes
+Salsa Taquera El Campestre,Inventory,Salsa Taquera El Campestre - 12/16oz,29.88,Sales of Product Income,Salsa Taquera El Campestre - 12/16oz,1.84,Cost of Goods Sold,Inventory Asset,0,0,05/25/2026,Yes
+Salsa Roja El Campestre,Inventory,Salsa Roja El Campestre - 12/16oz,29.88,Sales of Product Income,Salsa Roja El Campestre - 12/16oz,1.84,Cost of Goods Sold,Inventory Asset,0,0,05/25/2026,Yes
+Salsa Quemada  El Campestre,Inventory,Salsa Quemada  El Campestre - 12/16oz,29.88,Sales of Product Income,Salsa Quemada  El Campestre - 12/16oz,1.84,Cost of Goods Sold,Inventory Asset,0,0,05/25/2026,Yes
+Salsa Mexicana El Campestre,Inventory,Salsa Mexicana El Campestre - 12/16oz,29.88,Sales of Product Income,Salsa Mexicana El Campestre - 12/16oz,1.84,Cost of Goods Sold,Inventory Asset,0,0,05/25/2026,Yes
+Salsa El Campestre,Inventory,Salsa El Campestre - 12/16oz,29.88,Sales of Product Income,Salsa El Campestre - 12/16oz,1.84,Cost of Goods Sold,Inventory Asset,0,0,05/25/2026,Yes
+Reynaldo's No Sugar Added Rice Pudding,Inventory,Reynaldo's No Sugar Added Rice Pudding - 24/7oz,1.50,Sales of Product Income,Reynaldo's No Sugar Added Rice Pudding - 24/7oz,0.82,Cost of Goods Sold,Inventory Asset,5,0,05/25/2026,Yes
+Reynaldo's Rice Pudding,Inventory,Reynaldo's Rice Pudding - 24/7oz,1.50,Sales of Product Income,Reynaldo's Rice Pudding - 24/7oz,0.82,Cost of Goods Sold,Inventory Asset,5,0,05/25/2026,Yes
+Mole Rojo Juquilita,Inventory,Mole Rojo Juquilita - 1box 50units/17oz,277.50,Sales of Product Income,Mole Rojo Juquilita - 1box 50units/17oz,3.75,Cost of Goods Sold,Inventory Asset,0,0,05/25/2026,Yes
+Mole Negro Juquilita,Inventory,Mole Negro Juquilita - 1box 50units/17oz,277.50,Sales of Product Income,Mole Negro Juquilita - 1box 50units/17oz,3.75,Cost of Goods Sold,Inventory Asset,0,0,05/25/2026,Yes
+Mole Coloradito Juquilita,Inventory,Mole Coloradito Juquilita - 1 box 50units/17oz,277.50,Sales of Product Income,Mole Coloradito Juquilita - 1 box 50units/17oz,4.00,Cost of Goods Sold,Inventory Asset,0,0,05/25/2026,Yes
+Mole Negro or Rojo Juquilita,Inventory,Mole Negro or Rojo Juquilita - 1box 50units/17oz,277.50,Sales of Product Income,Mole Negro or Rojo Juquilita - 1box 50units/17oz,3.80,Cost of Goods Sold,Inventory Asset,0,0,05/25/2026,Yes
+Reynaldo's Longaniza,Inventory,Reynaldo's Longaniza - 20/10oz,4.20,Sales of Product Income,Reynaldo's Longaniza - 20/10oz,2.65,Cost of Goods Sold,Inventory Asset,5,0,05/25/2026,Yes
+LALA ProbioC Daily Probiotic Shots,Inventory,LALA ProbioC Daily Probiotic Shots - 7 case / 5-2.5 fl oz.,18.83,Sales of Product Income,LALA ProbioC Daily Probiotic Shots - 7 case / 5-2.5 fl oz.,1.99,Cost of Goods Sold,Inventory Asset,0,0,05/25/2026,Yes
+LALA Queso Panela,Inventory,LALA Queso Panela - 10/10oz,38.90,Sales of Product Income,LALA Queso Panela - 10/10oz,2.93,Cost of Goods Sold,Inventory Asset,0,0,05/25/2026,Yes
+LALA Queso Oaxaca,Inventory,LALA Queso Oaxaca - 10/10oz,55.90,Sales of Product Income,LALA Queso Oaxaca - 10/10oz,3.94,Cost of Goods Sold,Inventory Asset,1,0,05/25/2026,Yes
+LALA Media Crema,Inventory,LALA Media Crema - 27/8fl oz,53.73,Sales of Product Income,LALA Media Crema - 27/8fl oz,1.45,Cost of Goods Sold,Inventory Asset,0,0,05/25/2026,Yes
