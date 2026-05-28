@@ -241,5 +241,27 @@ CREATE TABLE IF NOT EXISTS `pre_order_items` (
 -- -----------------------------------------------------------------------------
 SET FOREIGN_KEY_CHECKS = 1;
 -- =============================================================================
--- Fin del schema — 15 tablas
+-- Migración — Fase 48: normalización de firmas + hidden products
+-- Para bases existentes (ejecutar una sola vez en orden)
+-- =============================================================================
+
+-- 1. Migrar firmas existentes de orders a batch_signatures
+INSERT IGNORE INTO batch_signatures (batch_id, signature)
+SELECT batch_id, signature
+FROM orders
+WHERE signature IS NOT NULL
+  AND batch_id IS NOT NULL
+GROUP BY batch_id;
+
+-- 2. Eliminar columna obsoleta signature de orders
+ALTER TABLE orders DROP COLUMN IF EXISTS signature;
+
+-- 3. Agregar columna hidden a products
+ALTER TABLE products ADD COLUMN IF NOT EXISTS hidden TINYINT(1) NOT NULL DEFAULT 0 AFTER stock;
+
+-- 4. Marcar productos tipo Hours/Services como ocultos
+UPDATE products SET hidden = 1 WHERE type IN ('Hours', 'Services');
+
+-- =============================================================================
+-- Fin del schema — 15 tablas + migración Fase 48
 -- =============================================================================

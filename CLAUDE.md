@@ -23,6 +23,7 @@ MySQL vía XAMPP: `C:\xampp\mysql\bin\mysql.exe -u root <database>`
 ## Estructura
 
 ```
+excellentia_schema.sql       # Schema completo (15 tablas + migraciones)
 src/
 ├── controllers/        # Lógica de negocio
 │   └── orderController.ts
@@ -35,7 +36,7 @@ src/
 │   └── adminOnly.ts    # role === 'admin'
 ├── db/
 │   ├── connection.ts   # Pool mysql2 (limit 10)
-│   └── schema.sql      # DDL completo + comentarios de migración
+│   └── schema.sql      # DDL completo (copia de excellentia_schema.sql)
 └── index.ts            # Entry point, puerto 3000
 ```
 
@@ -59,7 +60,7 @@ CREATE TABLE IF NOT EXISTS orders (
     id              INT AUTO_INCREMENT PRIMARY KEY,
     barcode         VARCHAR(50) NOT NULL,
     product_name    VARCHAR(255) NOT NULL,
-    price           DECIMAL(10,6) NOT NULL,
+    price           DECIMAL(10,2) NOT NULL,
     quantity        DECIMAL(10,2) NOT NULL,
     total           DECIMAL(10,2) NOT NULL,
     batch_id        VARCHAR(50),
@@ -67,7 +68,6 @@ CREATE TABLE IF NOT EXISTS orders (
     user_id         INT,
     customer_id     VARCHAR(50) NULL,
     customer_name   VARCHAR(255) NULL,
-    signature       MEDIUMTEXT NULL,      -- base64 PNG firma del cliente
     qb_invoice_id   VARCHAR(50),
     status          ENUM('PENDING','SENT','FAILED','CANCELLED') DEFAULT 'PENDING',
     error_log       TEXT,
@@ -84,7 +84,6 @@ CREATE TABLE IF NOT EXISTS orders (
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_id VARCHAR(50) NULL;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_name VARCHAR(255) NULL;
 ALTER TABLE products ADD COLUMN IF NOT EXISTS min_price DECIMAL(10,2) NULL AFTER price;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS signature MEDIUMTEXT NULL AFTER customer_name;
 ```
 
 ## createBatch — flujo
@@ -110,7 +109,6 @@ Body: { items[], customer_id?, customer_name?, signature?, damage_items?, paymen
 ## Notas de diseño
 
 - `signature` se guarda en **cada fila** del batch (redundante pero consistente con `customer_id`/`customer_name` que también se repiten por fila). No hay tabla separada de batches.
-- `SELECT o.*` en `listOrders` ya incluye `signature` automáticamente.
 - `price` en la tabla es `DECIMAL(10,6)` (6 decimales) — permite precio/lb con precisión suficiente.
 - SyncEngine corre cada 5 min en `index.ts` para reintentar PENDING/FAILED.
 - `loadTokensFromDb()` al arrancar carga tokens QB desde MySQL (fallback a `.env`).
