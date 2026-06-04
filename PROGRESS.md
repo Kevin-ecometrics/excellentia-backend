@@ -1,6 +1,6 @@
 # Excellentia — Progreso del Proyecto
 
-> Estado actual: **Fase 49 ✅ — UX: Stock visible, ticket en inglés, modal dañados scroll fix**
+> Estado actual: **Fase 52 ✅ — QBO connection card en Settings (estado, Connect/Reconnect/Disconnect)**
 
 ---
 
@@ -102,6 +102,8 @@
 | **Fase 40** | Sync nombre producto webapp → QBO al editar desde modal | **100%** ✅ |
 | **Fase 41** | Sales Description + tabla read-only + toda edición via modal | **100%** ✅ |
 | **Fase 42** | SKU QBO ↔ Barcode sync bidireccional | **100%** ✅ |
+| **Fase 51** | QBO OAuth: disconnect, redirect post-auth, página desconexión | **100%** ✅ |
+| **Fase 52** | QBO connection card en Settings webapp | **100%** ✅ |
 
 ---
 
@@ -1361,6 +1363,58 @@ La firma PNG base64 se guardaba una vez por fila en `orders` (5 ítems en un bat
 
 ---
 
+## Fase 51: QBO OAuth — Disconnect handler + redirect post-auth ✅
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 51.1 | `qbCallback` — redirige al dashboard (`DASHBOARD_URL`) en vez de devolver JSON. Compatibilidad con flujo browser-based de Intuit | `src/controllers/qbController.ts` | ✅ |
+| 51.2 | `qbDisconnect` — nuevo handler: revoca el access token en Intuit, elimina todos los registros de `qb_tokens` en MySQL, redirige a página de confirmación (`DISCONNECTED_URL`) | `src/controllers/qbController.ts` | ✅ |
+| 51.3 | `GET /api/qb/disconnect` — nueva ruta registrada (sin auth, Intuit redirige directamente a ella) | `src/routes/quickbooks.ts` | ✅ |
+| 51.4 | `.env` — variables `DASHBOARD_URL` y `DISCONNECTED_URL` para configurar los redirects por entorno (localhost en dev, `https://app.excellentiafoods.com/...` en producción) | `.env` | ✅ |
+
+### Webapp
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 51.5 | Página `/qb-disconnected` — confirmación visual con ícono, mensaje explicativo, botones "Ir al dashboard" y "Volver a conectar QuickBooks" | `app/qb-disconnected/page.tsx` | ✅ |
+
+---
+
+## Fase 52: QBO connection card en Settings webapp ✅
+
+### Webapp
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 52.1 | Card "QuickBooks Online" en `/settings` — fetcha `GET /api/qb/status` al montar, muestra badge verde "Connected" / ámbar "Token expired" / rojo "Not connected", entorno (sandbox/production) y fecha del último sync | `app/settings/_components/SettingsClient.tsx` | ✅ |
+| 52.2 | Botón **Connect / Reconnect** — siempre visible, redirige a `/api/qb/auth` para iniciar flujo OAuth | `SettingsClient.tsx` | ✅ |
+| 52.3 | Botón **Disconnect** — visible solo cuando el token está activo, redirige a `/api/qb/disconnect` | `SettingsClient.tsx` | ✅ |
+| 52.4 | Estado `qbLoading` — muestra "Checking status…" mientras carga, sin layout shift | `SettingsClient.tsx` | ✅ |
+
+---
+
+### Valores para el formulario de Intuit QBO (producción)
+
+| Campo | Valor |
+|---|---|
+| Host domain | `app.excellentiafoods.com` |
+| Launch URL | `https://app.excellentiafoods.com/dashboard` |
+| Disconnect URL | `https://app.excellentiafoods.com/api/qb/disconnect` |
+| Connect/Reconnect URL | `https://app.excellentiafoods.com/api/qb/auth` |
+
+### Al hacer deploy a producción
+
+Actualizar en `.env` del servidor:
+```env
+DASHBOARD_URL=https://app.excellentiafoods.com/dashboard
+DISCONNECTED_URL=https://app.excellentiafoods.com/qb-disconnected
+REDIRECT_URI=https://app.excellentiafoods.com/api/qb/callback
+```
+
+---
+
 ## Pendiente / Mejoras futuras
 
 ### Android
@@ -1391,7 +1445,7 @@ La firma PNG base64 se guardaba una vez por fila en `orders` (5 ítems en un bat
 | Bloqueado | **Reset de contraseña (self-service)** | Requiere SMTP/dominio propio — pendiente hasta contar con email. Workaround: admin resetea desde webapp `/users` |
 | ✅ | ~~**Log de actividad**~~ | Completado en Fase 16 |
 | ✅ | ~~**Exportar CSV**~~ | Completado en Fase 16 |
-| Baja | **Producción QBO** | Cambiar `ENVIRONMENT=production` y conectar empresa real de QuickBooks |
+| Media | **Producción QBO** | Cambiar `ENVIRONMENT=production`, actualizar `REDIRECT_URI`/`DASHBOARD_URL`/`DISCONNECTED_URL`, registrar URLs en Intuit Developer Console, reconectar empresa real de QuickBooks via `/api/qb/auth` |
 | ✅ | ~~**Configuración de empresa dinámica**~~ | Completado en Fase 17 (backend + webapp) |
 
 ### Webapp

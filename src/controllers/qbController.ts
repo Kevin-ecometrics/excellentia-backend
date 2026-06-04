@@ -1,7 +1,7 @@
 import type { Request, Response } from 'express';
 import pool from '../db/connection.ts';
 import { findAllItems } from '../services/qbItems.ts';
-import { oauthClient, getAuthUri, handleCallback } from '../services/qbAuth.ts';
+import { oauthClient, getAuthUri, handleCallback, saveTokensToDb } from '../services/qbAuth.ts';
 import logger from '../services/logger.ts';
 
 export async function qbStatus(_req: Request, res: Response): Promise<void> {
@@ -35,14 +35,36 @@ export async function qbAuth(_req: Request, res: Response): Promise<void> {
 export async function qbCallback(req: Request, res: Response): Promise<void> {
   try {
     const fullUrl = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
-    const result = await handleCallback(fullUrl);
-    res.json({
-      message: 'Autenticación con QuickBooks completada exitosamente',
-      realm_id: result.realmId,
-    });
+    await handleCallback(fullUrl);
+    const dashboardUrl = process.env.DASHBOARD_URL ?? 'https://app.excellentiafoods.com/dashboard';
+    res.redirect(dashboardUrl);
   } catch (err) {
     logger.error('qbCallback error:', err);
     res.status(500).json({ error: 'Error en callback OAuth de QuickBooks' });
+  }
+}
+
+export async function qbDisconnect(_req: Request, res: Response): Promise<void> {
+  try {
+    // Revocar el token en Intuit si está disponible
+    if (oauthClient.isAccessTokenValid()) {
+      try {
+        await oauthClient.revoke({ token_type_hint: 'access_token' });
+        logger.info('Token QBO revocado en Intuit');
+      } catch (revokeErr) {
+        logger.warn('No se pudo revocar el token en Intuit (ya expirado o inválido):', revokeErr);
+      }
+    }
+
+    // Limpiar tokens en la base de datos
+    await pool.query('DELETE FROM qb_tokens');
+    logger.info('Tokens QBO eliminados de la base de datos');
+
+    const disconnectedUrl = process.env.DISCONNECTED_URL ?? 'https://app.excellentiafoods.com/qb-disconnected';
+    res.redirect(disconnectedUrl);
+  } catch (err) {
+    logger.error('qbDisconnect error:', err);
+    res.status(500).json({ error: 'Error al desconectar QuickBooks' });
   }
 }
 
