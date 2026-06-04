@@ -1333,6 +1333,34 @@ La firma PNG base64 se guardaba una vez por fila en `orders` (5 ítems en un bat
 
 ---
 
+---
+
+## Fase 50: cPanel Deployment — Passenger + Frontend estático ✅
+
+### Deployment fixes
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 50.1 | `package.json` — `start` script cambiado de `bun run` a `node dist/index.js` | `package.json` | ✅ |
+| 50.2 | Build cambiado a `--format=cjs` (CommonJS) para compatibilidad con Node.js estándar | `package.json` | ✅ |
+| 50.3 | `"main": "dist/index.js"` agregado para detección de Passenger | `package.json` | ✅ |
+| 50.4 | Logger — creación automática de directorio `logs/` si no existe, fallback a solo Console si falla | `src/services/logger.ts` | ✅ |
+| 50.5 | `process.exit(1)` eliminado del startup — errores se recolectan en `startErrors` sin matar el proceso | `src/index.ts` | ✅ |
+| 50.6 | Endpoint `/api/startup-status` para diagnóstico de entorno | `src/index.ts` | ✅ |
+| 50.7 | Express sirve frontend estático (Next.js `out/`) con `extensions: ['html']` para SPA routing | `src/index.ts` | ✅ |
+| 50.8 | Ruta del frontend configurable via `WEBAPP_DIR` env var, default `../excellentia-webapp/out` | `src/index.ts` | ✅ |
+| 50.9 | Middleware trailing slash redirect (301) — `/pagina/` → `/pagina` para compatibilidad con export estático | `src/index.ts` | ✅ |
+
+### Webapp fixes
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 50.10 | Home page (`/`) redirige a `/login` si no hay sesión, o `/dashboard` si hay sesión | `app/page.tsx` | ✅ |
+| 50.11 | Home page ya no redirige a `/orders` para operadores — siempre va a `/dashboard` | `app/page.tsx` | ✅ |
+| 50.12 | Botón de descarga APK en página de Configuración (admin only) | `app/settings/_components/SettingsClient.tsx` | ✅ |
+
+---
+
 ## Pendiente / Mejoras futuras
 
 ### Android

@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import path from 'path';
+import fs from 'fs';
 import express from 'express';
 import type { Request, Response } from 'express';
 import cors from 'cors';
@@ -59,14 +61,6 @@ app.get('/api/startup-status', (_req: Request, res: Response) => {
 });
 
 // Legacy QBO endpoints (v0)
-app.get('/', (_req: Request, res: Response) => {
-  if (startErrors.length > 0) {
-    res.status(500).json({ status: 'error', errors: startErrors });
-    return;
-  }
-  res.json({ status: 'ok', environment: process.env.ENVIRONMENT, realmId: process.env.REALM_ID });
-});
-
 app.get('/api/company', async (_req: Request, res: Response) => {
   try {
     const data = await makeQboApiCall(`/v3/company/${process.env.REALM_ID ?? ''}/companyinfo/${process.env.REALM_ID ?? ''}`);
@@ -114,6 +108,28 @@ app.use('/api/activity', activityRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/setup', setupRoutes);
 app.use('/api/preorders', preOrderRoutes);
+
+// Strip trailing slashes for frontend routes
+app.use((req, res, next) => {
+  if (req.path.length > 1 && req.path.endsWith('/')) {
+    const query = req.url.slice(req.path.length)
+    res.redirect(301, req.path.slice(0, -1) + query)
+    return
+  }
+  next()
+})
+
+// Frontend estático (Next.js export)
+const webappDir = process.env.WEBAPP_DIR
+  ? path.resolve(process.env.WEBAPP_DIR)
+  : path.resolve('../excellentia-webapp/out');
+
+if (fs.existsSync(webappDir)) {
+  app.use(express.static(webappDir, { extensions: ['html'] }));
+  logger.info(`Sirviendo frontend desde: ${webappDir}`);
+} else {
+  logger.warn(`Directorio frontend no encontrado: ${webappDir}`);
+}
 
 // Error handler
 app.use(errorHandler);
