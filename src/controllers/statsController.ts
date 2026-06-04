@@ -96,7 +96,7 @@ export async function getStats(req: Request, res: Response): Promise<void> {
         ${isOperator ? `AND user_id = ${userId}` : ''}
         ORDER BY created_at DESC LIMIT 6
       `),
-      // Productos (siempre global)
+      // Productos no ocultos (siempre global)
       pool.query(`
         SELECT
           COUNT(*) AS total,
@@ -104,6 +104,7 @@ export async function getStats(req: Request, res: Response): Promise<void> {
           SUM(barcode IS NULL OR barcode = '') AS no_barcode,
           SUM(weight_per_unit IS NULL) AS no_weight
         FROM products
+        WHERE hidden = 0
       `),
     ]) as any[];
 
