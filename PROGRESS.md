@@ -1,6 +1,6 @@
 # Excellentia — Progreso del Proyecto
 
-> Estado actual: **Fase 52 ✅ — QBO connection card en Settings (estado, Connect/Reconnect/Disconnect)**
+> Estado actual: **Fase 53 ✅ — Fix duración de sesión (Backend + Android)**
 
 ---
 
@@ -104,6 +104,7 @@
 | **Fase 42** | SKU QBO ↔ Barcode sync bidireccional | **100%** ✅ |
 | **Fase 51** | QBO OAuth: disconnect, redirect post-auth, página desconexión | **100%** ✅ |
 | **Fase 52** | QBO connection card en Settings webapp | **100%** ✅ |
+| **Fase 53** | Fix duración de sesión (Backend + Android) | **100%** ✅ |
 
 ---
 
@@ -1412,6 +1413,24 @@ DASHBOARD_URL=https://app.excellentiafoods.com/dashboard
 DISCONNECTED_URL=https://app.excellentiafoods.com/qb-disconnected
 REDIRECT_URI=https://app.excellentiafoods.com/api/qb/callback
 ```
+
+---
+
+## Fase 53: Fix duración de sesión ✅
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 53.1 | Access token cambiado de `'15m'` a `'7d'` — coincide con la duración del refresh token y la cookie de la webapp | `src/services/jwtService.ts` | ✅ |
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 53.2 | `TokenAuthenticator` — tras refresh exitoso, el request reintentado ahora incluye el nuevo token en el header `Authorization: Bearer {token}`. Antes se quitaba el header pero no se ponía el nuevo, causando un segundo 401 y logout forzado al expirar el token | `data/network/RetrofitClient.kt` | ✅ |
+
+**Causa raíz:** El access token duraba 15 minutos pero la cookie de la webapp y el refresh token duraban 7 días — desincronización que sacaba al usuario al login después de 15 min de inactividad. En Android, el `TokenAuthenticator` tenía el bug de no poner el nuevo Bearer token en el retry, por lo que el refresh silencioso fallaba y mandaba al login en lugar de continuar la sesión.
 
 ---
 
