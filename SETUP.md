@@ -81,6 +81,12 @@ X_REFRESH_TOKEN_EXPIRES_IN=8726400
 # App
 LOG_LEVEL=info
 NODE_ENV=production
+
+# CORS — dominio de la webapp (ej. https://tuwebapp.vercel.app). Dejar vacío permite todos los orígenes.
+ALLOWED_ORIGIN=https://tuwebapp.vercel.app
+
+# QuickBooks — cliente por defecto si el pedido no trae customer_id
+QB_DEFAULT_CUSTOMER_ID=2
 ```
 
 > Para generar JWT_SECRET y JWT_REFRESH_SECRET seguros, corre en tu máquina local:

@@ -20,6 +20,11 @@ const defaultTokens: TokenOverrides = {
 };
 
 let oauthClient: OAuthClient;
+let _tokensAvailable = false;
+
+export function hasQboTokens(): boolean {
+  return _tokensAvailable;
+}
 
 function createClient(tokenOverrides?: TokenOverrides): OAuthClient {
   const token = { ...defaultTokens, ...tokenOverrides };
@@ -79,6 +84,7 @@ async function loadTokensFromDb(): Promise<boolean> {
       createdAt: row.token_created_at ?? undefined,
     });
     logger.info('Tokens de QuickBooks cargados desde MySQL');
+    _tokensAvailable = true;
     return true;
   } catch (err) {
     logger.error('Error cargando tokens QBO desde MySQL:', err);
@@ -98,6 +104,7 @@ function loadTokensFromEnv(): boolean {
     if (!token.access_token) return false;
     oauthClient = createClient(token);
     logger.info('Tokens QBO cargados desde .env');
+    _tokensAvailable = true;
     return true;
   } catch (err) {
     logger.error('Error cargando tokens desde .env:', err);
@@ -224,6 +231,7 @@ async function handleCallback(reqUrl: string): Promise<{ access_token: string; r
     createdAt: token.createdAt ?? Date.now(),
   });
 
+  _tokensAvailable = true;
   logger.info('OAuth callback completado — tokens guardados en MySQL');
   return { access_token: token.access_token ?? '', refresh_token: token.refresh_token ?? '', realmId };
 }

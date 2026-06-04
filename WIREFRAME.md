@@ -322,8 +322,12 @@
 │  products                                                        │
 │  id · barcode(UNIQUE) · name · price(DECIMAL 10,2)              │
 │  min_price(DECIMAL 10,2 NULL) · stock · category · brand        │
-│  weight_per_unit(DECIMAL 10,4 NULL) · qb_item_id                │
+│  description(TEXT NULL) · weight_per_unit(DECIMAL 10,4 NULL)    │
+│  hidden(TINYINT 1 DEFAULT 0) · qb_item_id                       │
 │  cached_at · updated_at                                          │
+│                                                                  │
+│  hidden=1 → no aparece en listProducts ni en la app Android     │
+│  Usado para ocultar ítems del sistema de QBO (QBO-1, QBO-2)     │
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
@@ -394,6 +398,16 @@
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
+│  batch_signatures                                                │
+│  batch_id(VARCHAR 100, PK) · signature(MEDIUMTEXT)              │
+│  created_at                                                      │
+│                                                                  │
+│  Una fila por batch (no por orden) — la firma se guarda aquí    │
+│  en vez de repetirse en cada fila de orders. Se carga bajo       │
+│  demanda via GET /api/orders/damage/:batchId                     │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
 │  sync_meta                                                       │
 │  entity(PK) · last_sync_at                                      │
 └─────────────────────────────────────────────────────────────────┘
@@ -461,11 +475,13 @@ Migraciones automáticas (onUpgrade):
 │  │  Line[]:                                               │  │
 │  │    - SalesItemLineDetail (por cada item del batch)     │  │
 │  │      · ItemRef: qb_item_id                             │  │
-│  │      · Qty: quantity (lb)                              │  │
-│  │      · UnitPrice: price ($/lb)                        │  │
+│  │      · Qty: 1  (siempre — 1 scan = 1 unidad física)   │  │
+│  │      · UnitPrice: item.total (monto total de la línea) │  │
+│  │      · Description: "X.XX lb a $X.XX/lb"              │  │
+│  │      QBO descuenta 1 unidad de inventario por scan     │  │
 │  │    - DescriptionOnly (si hay damage_items)             │  │
 │  │      · Description: "Damaged: X unit(s) - product"    │  │
-│  │  CustomerMemo: "Payment: Cash · Damaged: X items"      │  │
+│  │  CustomerMemo: "Payment: Cash | Negative Sale: X..."   │  │
 │  └────────────────────────────────────────────────────────┘  │
 │                                                              │
 │  OAuth 2.0 Flow:                                             │
@@ -475,11 +491,36 @@ Migraciones automáticas (onUpgrade):
 │  4. access_token expira → intuit-oauth renueva automático    │
 │  5. refresh_token expira (100 días) → repetir paso 1        │
 │                                                              │
-│  Sync de productos (Items → products):                       │
+│  Sync de productos (QB → MySQL):                             │
 │  POST /api/qb/sync-products [admin]                          │
-│  · Trae todos los Items activos de QB                        │
-│  · Upsert en MySQL products tabla                            │
-│  · Guarda qb_item_id para crear invoices                     │
+│  · Trae Items activos de QB (hidden=0 no se toca)            │
+│  · Upsert en MySQL: barcode=item.Sku (fallback QBO-{Id})     │
+│  · Sincroniza: name, description, price, stock, qb_item_id   │
+│  · Ítems del sistema (QBO-1, QBO-2) marcados hidden=1        │
+│                                                              │
+│  Sync inventario (MySQL → QB):                               │
+│  updateItemQtyOnHand(itemId, qty)   — stock webapp → QBO     │
+│  · Solo ítems Type='Inventory' (Service se ignora, warning)  │
+│  · Llamado desde updateProduct cuando stock cambia           │
+│                                                              │
+│  Sync metadata (MySQL → QB):                                 │
+│  updateItemMeta(itemId, {name?, description?, sku?,          │
+│                           unitPrice?})                       │
+│  · Sparse update en un solo GET + POST a QBO                 │
+│  · Llamado desde updateProduct cuando nombre/desc/barcode    │
+│    o precio de venta cambian (una sola llamada QBO)          │
+│  · Precio de compra (Cost) solo se edita en QBO directamente │
+│                                                              │
+│  Descuento automático de stock (al vender):                  │
+│  · createBatch → UPDATE products SET stock=GREATEST(s-1,0)   │
+│    por cada línea del batch (1 scan = 1 unidad)              │
+│  · Ocurre antes del sync a QBO para garantizar consistencia  │
+│  · QBO también descuenta 1 unidad via Qty:1 en el Invoice    │
+│                                                              │
+│  Requisito para sync stock QBO:                              │
+│  · Ítems deben ser Type='Inventory' en QBO                   │
+│    (cambiar desde UI: Productos y servicios → Editar → tipo) │
+│  · Cuentas requeridas: Inventory Asset + Cost of Goods Sold  │
 │                                                              │
 │  SyncEngine (background cada 5 min):                         │
 │  · SELECT orders WHERE status='PENDING' AND retry_count >= 0 │
@@ -592,7 +633,40 @@ TicketDetailActivity (orders_json con signature)
   · [Reimprimir] si impresora configurada
 ```
 
-### 7d. Flujo Sync Offline → Online
+### 7d. Flujo Inventario QBO
+
+```
+IMPORTAR (QB → MySQL):
+  POST /api/qb/sync-products [admin]
+    → item.Sku → products.barcode  (fallback: QBO-{Id})
+    → item.Name → products.name
+    → item.Description → products.description
+    → item.UnitPrice → products.price
+    → item.QtyOnHand → products.stock
+    → item.Type='Inventory' → permite sync de stock en ventas
+    → ítems QBO-1, QBO-2 marcados hidden=1 (ítems del sistema)
+
+VENDER (MySQL auto-descuento):
+  POST /api/orders/batch
+    → por cada línea: UPDATE products SET stock=GREATEST(stock-1,0)
+    → Invoice QBO: Qty=1, UnitPrice=total (QBO también -1 unidad)
+
+EDITAR desde webapp (MySQL → QB):
+  PUT /api/products/:id
+    nombre / descripción / barcode / precio
+      → updateItemMeta(qb_item_id, {name, description, sku, unitPrice})
+      → un solo GET + POST a QBO
+    stock
+      → updateItemQtyOnHand(qb_item_id, qty)
+      → solo si Type='Inventory', silencioso si falla QBO
+
+Precio de compra (Cost/PurchaseCost):
+  · Solo se edita directamente en QBO
+  · No gestionado desde la webapp
+  · QBO lo usa para calcular COGS y ganancia bruta
+```
+
+### 7e. Flujo Sync Offline → Online
 
 ```
 Sin conexión:
@@ -626,6 +700,8 @@ HistoryActivity chip "Fallidos":
 │  · Usuarios      [admin only]                                │
 │  · Configuración [admin only]                                │
 │  · User card: nombre · email · badge rol                     │
+│  · Toggle idioma ES/EN (globo + pills) — persiste en         │
+│    localStorage, aplica a toda la webapp via LangProvider    │
 └──────────────────────────────────────────────────────────────┘
 
 /dashboard  [admin]
@@ -644,9 +720,17 @@ HistoryActivity chip "Fallidos":
   · [admin] Cambiar status · Forzar sync QB
 
 /products  [admin editable · operator lectura]
-  · Tabla: nombre · barcode · precio · min_price · stock · QB Item
-  · [admin] Editar inline · Crear · Eliminar
-  · Botón "Sincronizar QB" → POST /api/qb/sync-products
+  · Tabla: nombre · descripción (gris, truncada) · barcode · precio
+    · min_price · stock (rojo si=0, ámbar si≤5) · QB Item
+  · Stat card "Sin stock" (rojo) visible para admins
+  · Productos hidden=1 nunca aparecen (ítems sistema QBO)
+  · [admin] Botón lápiz por fila → ProductModal (nombre, descripción,
+    barcode, precio, min_price, stock) — toda edición via modal
+  · Modal guarda en MySQL y sincroniza a QBO:
+      nombre/descripción/barcode/precio → updateItemMeta (1 sola llamada)
+      stock → updateItemQtyOnHand (solo ítems Inventory)
+  · Productos se crean en QBO (no desde la webapp) y se importan
+  · Botón "Sincronizar QB" [admin] → POST /api/qb/sync-products
 
 /customers  [admin]
   · Tabla: nombre QB · dirección · pedidos · total gastado
@@ -785,4 +869,29 @@ CREATE TABLE IF NOT EXISTS pre_order_items (id INT AUTO_INCREMENT PRIMARY KEY, p
 -- Fix Fase 37: ENUM corrupto (CONVERTED partido por \r\n de Windows)
 ALTER TABLE pre_orders MODIFY COLUMN status ENUM('DRAFT','CONFIRMED','CONVERTED','CANCELLED') DEFAULT 'DRAFT';
 UPDATE pre_orders SET status = 'CONVERTED' WHERE status = '';
+
+-- Fase 38-39: Stock + QBO Inventory sync
+-- (stock ya existe en products desde la fase inicial)
+
+-- Fase 41: Sales Description en productos
+ALTER TABLE products ADD COLUMN IF NOT EXISTS description TEXT NULL AFTER stock;
+
+-- Fase 45: Ocultar ítems del sistema de QBO
+ALTER TABLE products ADD COLUMN IF NOT EXISTS hidden TINYINT(1) NOT NULL DEFAULT 0;
+UPDATE products SET hidden = 1 WHERE barcode IN ('QBO-1', 'QBO-2');
+
+-- Fase 48: Normalización firmas — una por batch en vez de una por orden
+CREATE TABLE IF NOT EXISTS batch_signatures (
+  batch_id   VARCHAR(100) NOT NULL PRIMARY KEY,
+  signature  MEDIUMTEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+-- Migrar firmas existentes de orders → batch_signatures
+INSERT IGNORE INTO batch_signatures (batch_id, signature)
+  SELECT batch_id, signature
+  FROM orders
+  WHERE signature IS NOT NULL AND signature != ''
+  GROUP BY batch_id;
+-- Eliminar columna signature de orders (ejecutar después de migrar)
+ALTER TABLE orders DROP COLUMN IF EXISTS signature;
 ```

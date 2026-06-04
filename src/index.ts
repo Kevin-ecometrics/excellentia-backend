@@ -22,14 +22,48 @@ import setupRoutes from './routes/setup.ts';
 import preOrderRoutes from './routes/preOrders.ts';
 import { auth } from './middleware/auth.ts';
 
+const startErrors: string[] = [];
+
+const REQUIRED_ENV = ['JWT_SECRET', 'JWT_REFRESH_SECRET', 'DB_HOST', 'DB_USER', 'DB_NAME'] as const;
+for (const key of REQUIRED_ENV) {
+  if (!process.env[key]) {
+    const msg = `Variable de entorno requerida no definida: ${key}`;
+    console.error(`[FATAL] ${msg}`);
+    startErrors.push(msg);
+  }
+}
+
 const app = express();
 const port = parseInt(process.env.PORT ?? '3000');
 
-app.use(cors());
+const allowedOrigin = process.env.ALLOWED_ORIGIN;
+app.use(cors(allowedOrigin ? { origin: allowedOrigin } : {}));
 app.use(express.json({ limit: '10mb' }));
+
+// Diagnostic endpoint
+app.get('/api/startup-status', (_req: Request, res: Response) => {
+  res.json({
+    alive: true,
+    node: process.version,
+    env: process.env.NODE_ENV,
+    cwd: process.cwd(),
+    errors: startErrors,
+    loaded: {
+      jwt: !!process.env.JWT_SECRET,
+      refresh: !!process.env.JWT_REFRESH_SECRET,
+      dbHost: !!process.env.DB_HOST,
+      dbUser: !!process.env.DB_USER,
+      dbName: !!process.env.DB_NAME,
+    },
+  });
+});
 
 // Legacy QBO endpoints (v0)
 app.get('/', (_req: Request, res: Response) => {
+  if (startErrors.length > 0) {
+    res.status(500).json({ status: 'error', errors: startErrors });
+    return;
+  }
   res.json({ status: 'ok', environment: process.env.ENVIRONMENT, realmId: process.env.REALM_ID });
 });
 
@@ -107,6 +141,7 @@ async function start() {
 }
 
 start().catch((err: unknown) => {
-  logger.error('Error al iniciar servidor:', err);
-  process.exit(1);
+  const msg = err instanceof Error ? err.message : String(err);
+  logger.error('Error al iniciar servidor (no fatal):', msg);
+  startErrors.push(`start(): ${msg}`);
 });

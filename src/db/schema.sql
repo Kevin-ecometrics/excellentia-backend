@@ -258,10 +258,8 @@ ALTER TABLE orders DROP COLUMN IF EXISTS signature;
 -- 3. Agregar columna hidden a products
 ALTER TABLE products ADD COLUMN IF NOT EXISTS hidden TINYINT(1) NOT NULL DEFAULT 0 AFTER stock;
 
--- 4. Marcar productos tipo Hours/Services como ocultos
-UPDATE products SET hidden = 1 WHERE type IN ('Hours', 'Services');
-
 -- =============================================================================
 -- Fin del schema — 15 tablas + migración Fase 48
 -- =============================================================================
+SET FOREIGN_KEY_CHECKS = 1;
 SET FOREIGN_KEY_CHECKS = 1;

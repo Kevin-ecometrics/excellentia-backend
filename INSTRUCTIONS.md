@@ -56,11 +56,7 @@ bun run src/db/initdb.ts
 # 3. Crear tablas, admin user y sincronizar productos desde QBO
 bun run src/seed.ts
 
-# 4. Migraciones (solo si la DB ya existe)
-mysql -u root excellentia -e "ALTER TABLE orders MODIFY COLUMN quantity DECIMAL(10,2) NOT NULL;"
-mysql -u root excellentia -e "ALTER TABLE products ADD COLUMN IF NOT EXISTS min_price DECIMAL(10,2) NULL AFTER price;"
-
-# 5. Iniciar servidor
+# 4. Iniciar servidor
 bun run src/index.ts
 ```
 
@@ -301,10 +297,6 @@ Estas tablas se crean automáticamente al correr el seed inicial:
 ### MySQL — Migraciones manuales (correr en phpMyAdmin → DB `excellentia` → SQL)
 
 ```sql
--- Fase 7: precio mínimo por producto
-ALTER TABLE orders MODIFY COLUMN quantity DECIMAL(10,2) NOT NULL;
-ALTER TABLE products ADD COLUMN IF NOT EXISTS min_price DECIMAL(10,2) NULL AFTER price;
-
 -- Fase 17: configuración de empresa (también se auto-crea al primer GET /api/settings)
 CREATE TABLE IF NOT EXISTS company_settings (
   id INT AUTO_INCREMENT PRIMARY KEY,

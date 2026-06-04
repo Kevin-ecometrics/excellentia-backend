@@ -18,6 +18,8 @@ export interface Product {
   category: string | null;
   brand: string | null;
   stock: number;
+  hidden: number;
+  description: string | null;
   weight_per_unit: number | null;
   qb_item_id: string | null;
   created_at: Date;
@@ -40,6 +42,7 @@ export interface Order {
   price: number;
   quantity: number;
   total: number;
+  batch_id: string | null;
   device_id: number | null;
   user_id: number | null;
   customer_id: string | null;

@@ -1,6 +1,7 @@
 import pool from '../db/connection.ts';
 import { findItemsUpdatedSince } from './qbItems.ts';
 import { createInvoice } from './qbInvoices.ts';
+import { hasQboTokens } from './qbAuth.ts';
 import logger from './logger.ts';
 
 let intervalId: ReturnType<typeof setInterval> | null = null;
@@ -23,6 +24,7 @@ export function stopSyncEngine(): void {
 }
 
 async function processPendingOrders(): Promise<void> {
+  if (!hasQboTokens()) return;
   try {
     const [pending] = await pool.query(
       "SELECT o.*, p.qb_item_id FROM orders o LEFT JOIN products p ON o.barcode = p.barcode WHERE o.status = 'PENDING'"
@@ -77,6 +79,7 @@ async function processPendingOrders(): Promise<void> {
 }
 
 async function syncProductsFromQbo(): Promise<void> {
+  if (!hasQboTokens()) return;
   try {
     const [rows] = await pool.query("SELECT last_sync_at FROM sync_meta WHERE entity = 'product'") as any[];
     const lastSync = rows[0]?.last_sync_at ?? '2000-01-01T00:00:00-07:00';
