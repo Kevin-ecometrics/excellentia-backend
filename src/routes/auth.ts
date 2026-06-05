@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { login, register, me, refresh, changePassword } from '../controllers/authController.ts';
+import { login, register, me, refresh, changePassword, logout } from '../controllers/authController.ts';
 import { auth } from '../middleware/auth.ts';
 import { adminOnly } from '../middleware/adminOnly.ts';
 import rateLimit from 'express-rate-limit';
@@ -15,6 +15,7 @@ const loginLimiter = rateLimit({
 const router = Router();
 
 router.post('/login', loginLimiter, login);
+router.post('/logout', logout);
 router.post('/refresh', refresh);
 router.post('/register', auth, adminOnly, register);
 router.get('/me', auth, me);

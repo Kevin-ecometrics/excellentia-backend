@@ -2,8 +2,9 @@ import 'dotenv/config';
 import path from 'path';
 import fs from 'fs';
 import express from 'express';
-import type { Request, Response } from 'express';
+import type { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
 import { makeQboApiCall, loadTokensFromDb, loadTokensFromEnv } from './services/qbAuth.ts';
 import { startSyncEngine } from './services/syncEngine.ts';
 import { errorHandler } from './middleware/errorHandler.ts';
@@ -38,9 +39,22 @@ for (const key of REQUIRED_ENV) {
 const app = express();
 const port = parseInt(process.env.PORT ?? '3000');
 
+app.use(helmet());
+
 const allowedOrigin = process.env.ALLOWED_ORIGIN;
-app.use(cors(allowedOrigin ? { origin: allowedOrigin } : {}));
+app.use(cors(allowedOrigin
+  ? { origin: allowedOrigin, credentials: true }
+  : { credentials: true }
+));
 app.use(express.json({ limit: '10mb' }));
+
+// Cache-Control en todas las rutas API con datos sensibles
+app.use('/api', (_req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
+});
 
 // Diagnostic endpoint
 app.get('/api/startup-status', (_req: Request, res: Response) => {

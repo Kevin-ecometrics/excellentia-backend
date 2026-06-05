@@ -1,4 +1,5 @@
 import OAuthClient from 'intuit-oauth';
+import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'crypto';
 import pool from '../db/connection.ts';
 import logger from './logger.ts';
 
@@ -19,6 +20,49 @@ const defaultTokens: TokenOverrides = {
   x_refresh_token_expires_in: parseInt(process.env.X_REFRESH_TOKEN_EXPIRES_IN ?? '8726400'),
 };
 
+// AES-256-CBC encryption for QB tokens stored in DB
+function getAesKey(): Buffer {
+  const raw = process.env.QB_TOKEN_KEY ?? '';
+  if (!raw) throw new Error('QB_TOKEN_KEY no definida en variables de entorno');
+  // Derive a 32-byte key from whatever the user provides
+  return createHash('sha256').update(raw).digest();
+}
+
+function encryptToken(plain: string): string {
+  const iv = randomBytes(16);
+  const cipher = createCipheriv('aes-256-cbc', getAesKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
+  return `${iv.toString('hex')}:${encrypted.toString('hex')}`;
+}
+
+function decryptToken(stored: string): string {
+  if (!stored.includes(':')) return stored; // legacy plain-text fallback
+  const [ivHex, encHex] = stored.split(':');
+  const decipher = createDecipheriv('aes-256-cbc', getAesKey(), Buffer.from(ivHex, 'hex'));
+  return Buffer.concat([decipher.update(Buffer.from(encHex, 'hex')), decipher.final()]).toString('utf8');
+}
+
+// CSRF protection: pending OAuth states (state → expiry timestamp)
+const _pendingStates = new Map<string, number>();
+const STATE_TTL_MS = 10 * 60 * 1000; // 10 min
+
+function generateState(): string {
+  const state = randomBytes(32).toString('hex');
+  _pendingStates.set(state, Date.now() + STATE_TTL_MS);
+  // Cleanup expired states
+  for (const [k, exp] of _pendingStates) {
+    if (Date.now() > exp) _pendingStates.delete(k);
+  }
+  return state;
+}
+
+function validateState(state: string): boolean {
+  const exp = _pendingStates.get(state);
+  if (!exp || Date.now() > exp) return false;
+  _pendingStates.delete(state);
+  return true;
+}
+
 let oauthClient: OAuthClient;
 let _tokensAvailable = false;
 
@@ -33,7 +77,7 @@ function createClient(tokenOverrides?: TokenOverrides): OAuthClient {
     clientSecret: process.env.CLIENT_SECRET ?? '',
     environment: (process.env.ENVIRONMENT ?? 'sandbox') as 'sandbox' | 'production',
     redirectUri: process.env.REDIRECT_URI ?? `http://localhost:${process.env.PORT ?? '3000'}/api/qb/callback`,
-    logging: true,
+    logging: false,
     token,
   });
 }
@@ -50,15 +94,17 @@ async function saveTokensToDb(tokens: {
 }): Promise<void> {
   try {
     const [existing] = await pool.query('SELECT id FROM qb_tokens ORDER BY id DESC LIMIT 1') as any[];
+    const encAccess = encryptToken(tokens.access_token);
+    const encRefresh = encryptToken(tokens.refresh_token);
     if (existing.length > 0) {
       await pool.query(
         'UPDATE qb_tokens SET access_token = ?, refresh_token = ?, realm_id = ?, expires_in = ?, x_refresh_token_expires_in = ?, token_created_at = ?, updated_at = NOW() WHERE id = ?',
-        [tokens.access_token, tokens.refresh_token, tokens.realm_id ?? null, tokens.expires_in ?? null, tokens.x_refresh_token_expires_in ?? null, tokens.token_created_at ?? null, existing[0].id]
+        [encAccess, encRefresh, tokens.realm_id ?? null, tokens.expires_in ?? null, tokens.x_refresh_token_expires_in ?? null, tokens.token_created_at ?? null, existing[0].id]
       );
     } else {
       await pool.query(
         'INSERT INTO qb_tokens (access_token, refresh_token, realm_id, expires_in, x_refresh_token_expires_in, token_created_at) VALUES (?, ?, ?, ?, ?, ?)',
-        [tokens.access_token, tokens.refresh_token, tokens.realm_id ?? null, tokens.expires_in ?? null, tokens.x_refresh_token_expires_in ?? null, tokens.token_created_at ?? null]
+        [encAccess, encRefresh, tokens.realm_id ?? null, tokens.expires_in ?? null, tokens.x_refresh_token_expires_in ?? null, tokens.token_created_at ?? null]
       );
     }
     logger.info('Tokens de QuickBooks guardados en MySQL');
@@ -76,8 +122,8 @@ async function loadTokensFromDb(): Promise<boolean> {
 
     const row = rows[0];
     oauthClient = createClient({
-      access_token: row.access_token,
-      refresh_token: row.refresh_token,
+      access_token: decryptToken(row.access_token),
+      refresh_token: decryptToken(row.refresh_token),
       realmId: row.realm_id ?? defaultTokens.realmId,
       expires_in: row.expires_in ?? defaultTokens.expires_in,
       x_refresh_token_expires_in: row.x_refresh_token_expires_in ?? defaultTokens.x_refresh_token_expires_in,
@@ -205,10 +251,16 @@ async function makeQboBatch(batchItems: any[], retried = false): Promise<any> {
 }
 
 function getAuthUri(): string {
-  return oauthClient.authorizeUri({ scope: [OAuthClient.scopes.Accounting, OAuthClient.scopes.OpenId], state: 'excellentia' });
+  const state = generateState();
+  return oauthClient.authorizeUri({ scope: [OAuthClient.scopes.Accounting, OAuthClient.scopes.OpenId], state });
 }
 
 async function handleCallback(reqUrl: string): Promise<{ access_token: string; refresh_token: string; realmId: string }> {
+  const url = new URL(reqUrl);
+  const returnedState = url.searchParams.get('state') ?? '';
+  if (!validateState(returnedState)) {
+    throw new Error('OAuth state inválido o expirado — posible ataque CSRF');
+  }
   const authResponse = await oauthClient.createToken(reqUrl);
   const token = authResponse.getToken();
   const realmId = (authResponse as any).realmId ?? defaultTokens.realmId;

@@ -36,6 +36,9 @@ export async function login(req: Request, res: Response): Promise<void> {
     );
 
     logActivity({ userId: user.id, userEmail: user.email, action: 'LOGIN', ip: req.ip });
+
+    const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+    res.setHeader('Set-Cookie', `jwt=${token}; Path=/; Max-Age=${7 * 24 * 60 * 60}; HttpOnly; SameSite=Strict${secure}`);
     res.json({
       token,
       refreshToken,
@@ -96,6 +99,10 @@ export async function register(req: Request, res: Response): Promise<void> {
       res.status(400).json({ error: 'Email y password requeridos' });
       return;
     }
+    if (password.length < 8) {
+      res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
+      return;
+    }
 
     const [existing] = await pool.query('SELECT id FROM users WHERE email = ?', [email]) as any[];
     if (existing.length > 0) {
@@ -117,6 +124,12 @@ export async function register(req: Request, res: Response): Promise<void> {
   }
 }
 
+export async function logout(_req: Request, res: Response): Promise<void> {
+  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  res.setHeader('Set-Cookie', `jwt=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict${secure}`);
+  res.json({ ok: true });
+}
+
 export async function me(req: Request, res: Response): Promise<void> {
   res.json({ user: req.user });
 }
@@ -128,8 +141,8 @@ export async function changePassword(req: Request, res: Response): Promise<void>
       res.status(400).json({ error: 'Contraseña actual y nueva requeridas' });
       return;
     }
-    if (newPassword.length < 6) {
-      res.status(400).json({ error: 'La nueva contraseña debe tener al menos 6 caracteres' });
+    if (newPassword.length < 8) {
+      res.status(400).json({ error: 'La nueva contraseña debe tener al menos 8 caracteres' });
       return;
     }
     const [rows] = await pool.query('SELECT * FROM users WHERE id = ?', [req.user?.id]) as any[];

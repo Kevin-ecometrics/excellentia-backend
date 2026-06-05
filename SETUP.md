@@ -63,6 +63,7 @@ DB_NAME=nombre_base_datos
 # JWT
 JWT_SECRET=cadena_larga_aleatoria_min_32_chars
 JWT_REFRESH_SECRET=cadena_larga_aleatoria_distinta
+QB_TOKEN_KEY=cadena_larga_aleatoria_para_cifrar_tokens_qb
 
 # QuickBooks — obtener en developer.intuit.com → My Apps → Keys & OAuth
 CLIENT_ID=tu_client_id_de_intuit
@@ -89,11 +90,11 @@ ALLOWED_ORIGIN=https://tuwebapp.vercel.app
 QB_DEFAULT_CUSTOMER_ID=2
 ```
 
-> Para generar JWT_SECRET y JWT_REFRESH_SECRET seguros, corre en tu máquina local:
+> Para generar `JWT_SECRET`, `JWT_REFRESH_SECRET` y `QB_TOKEN_KEY` seguros, corre en tu máquina local:
 > ```bash
 > bun -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
 > ```
-> Ejecuta el comando dos veces y usa cada resultado para una variable distinta.
+> Ejecuta el comando **tres veces** y usa cada resultado para una variable distinta (`JWT_SECRET`, `JWT_REFRESH_SECRET`, `QB_TOKEN_KEY`).
 
 **Dónde encontrar los valores de QuickBooks:**
 
@@ -252,14 +253,30 @@ O desde la webapp: **Productos → Sincronizar QB**.
 
 ## 8. Configurar la webapp (Next.js)
 
-La webapp (`excellentia-webapp`) se despliega por separado en Vercel o similar:
+La webapp (`excellentia-webapp`) es un **export estático** servido por el mismo Express en el mismo dominio (`https://tudominio.com`). No se despliega en Vercel.
 
-1. Conecta el repositorio en [vercel.com](https://vercel.com)
-2. Agrega la variable de entorno:
-   ```
-   NEXT_PUBLIC_API_URL=https://tudominio.com
-   ```
-3. Deploy automático con cada push
+### 8.1 Compilar la webapp localmente
+
+```bash
+# En excellentia-webapp/
+NEXT_PUBLIC_API_URL=https://tudominio.com bun run build
+```
+
+Resultado: carpeta `out/` con los archivos estáticos.
+
+### 8.2 Subir el export a cPanel
+
+Sube el contenido de `out/` al directorio que Express sirve como estático (por defecto `../excellentia-webapp/out` relativo a la app, o configura `WEBAPP_DIR` en las variables de entorno de cPanel).
+
+### 8.3 Variable de entorno en cPanel
+
+Agrega en el Node.js App Manager (o `.htaccess`):
+
+```
+SetEnv WEBAPP_DIR /home/tu_usuario/ruta/a/out
+```
+
+> `NEXT_PUBLIC_API_URL` se inyecta en tiempo de build, no en runtime — no hace falta agregarla a cPanel.
 
 ---
 
@@ -307,15 +324,22 @@ Si alguno falla con error 500, revisa los logs en el Node.js App Manager de cPan
 ```
 [ ] bun build → dist/index.js generado sin errores
 [ ] dist/index.js + package.json subidos a cPanel (File Manager)
+[ ] Webapp: NEXT_PUBLIC_API_URL=https://tudominio.com bun run build → carpeta out/ subida a cPanel
 [ ] Base de datos MySQL creada en cPanel → MySQL Databases
-[ ] Variables de entorno configuradas (DB, JWT, QB, PORT)
+[ ] Variables de entorno configuradas (DB, JWT_SECRET, JWT_REFRESH_SECRET, QB_TOKEN_KEY, QB, PORT)
+[ ] NODE_ENV=production en variables de entorno (activa Secure en la cookie JWT)
+[ ] ENVIRONMENT=production en variables de entorno (activa QuickBooks producción)
+[ ] SetEnv QB_TOKEN_KEY ... agregado al .htaccess del subdominio (igual al valor en Node.js App Manager)
 [ ] npm install corrido desde Node.js App Manager
 [ ] App iniciada (Start) en Node.js App Manager
 [ ] Abrir https://tudominio.com/api/setup → respuesta ok: true
-[ ] QB OAuth: abrir https://tudominio.com/api/qb/auth → completar flujo
+[ ] QB OAuth: abrir https://tudominio.com/api/qb/auth → completar flujo (guarda tokens cifrados)
 [ ] Productos sincronizados desde webapp → Productos → Sincronizar QB
 [ ] Configuración de empresa guardada desde webapp → Configuración
 [ ] Contraseña del admin cambiada (no dejar admin123)
+[ ] Login desde la webapp → cookie jwt aparece como HttpOnly en DevTools → Application → Cookies
 [ ] App Android apuntando a https://tudominio.com
 [ ] Test de login exitoso desde la app Android
 ```
+
+> **Importante — primera vez con `QB_TOKEN_KEY`:** si ya tenías tokens guardados en la tabla `qb_tokens` sin cifrar, vuelve a hacer el flujo OAuth (`/api/qb/auth`) para que se sobrescriban cifrados. Los tokens antiguos en texto plano fallarán al intentar descifrarlos.

@@ -1,6 +1,6 @@
 # Excellentia — Progreso del Proyecto
 
-> Estado actual: **Fase 56 🔄 — Seguridad Intuit App Store (Backend + Webapp + cPanel)**
+> Estado actual: **Fase 56 ✅ — Seguridad Intuit App Store (Backend + Webapp + cPanel completados)**
 
 ---
 
@@ -1501,7 +1501,7 @@ Red se restaura → NetworkCallback.onAvailable():
 
 ---
 
-## Fase 56: Seguridad Intuit App Store 🔄
+## Fase 56: Seguridad Intuit App Store ✅ (código) / ⬜ organizacional
 
 Requisitos de seguridad obligatorios para publicar en el QuickBooks App Store. Revisados contra la documentación oficial de Intuit (`/go-live/publish-app/security-requirements`).
 
@@ -1514,25 +1514,25 @@ Requisitos de seguridad obligatorios para publicar en el QuickBooks App Store. R
 | 56.3 | TLS 1.2+ con AES-256 confirmado (SSL Labs A rating) | ✅ |
 | 56.4 | `RewriteCond %{REQUEST_METHOD} ^TRACE` + `[F]` agregado al `.htaccess` del subdominio y dominio principal | ✅ |
 
-### Backend — `excellentia/` ⬜
+### Backend — `excellentia/` ✅
 
 | # | Tarea | Prioridad | Estado |
 |---|---|---|---|
-| 56.5 | Cifrar `refresh_token` y `access_token` con AES-256 antes de guardar en tabla `qb_tokens` | 🔴 Crítico | ⬜ |
-| 56.6 | Llave AES en variable de entorno separada (`QB_TOKEN_KEY`) | 🔴 Crítico | ⬜ |
-| 56.7 | Descifrar tokens al cargar desde DB en `loadTokensFromDb()` | 🔴 Crítico | ⬜ |
-| 56.8 | OAuth `state` aleatorio (crypto UUID) + verificación en `qbCallback` — previene CSRF en flujo OAuth | 🔴 Crítico | ⬜ |
-| 56.9 | Password mínimo 8 caracteres en `register` (actualmente sin validación) y en `changePassword` (actualmente 6) | 🔴 Crítico | ⬜ |
-| 56.10 | Instalar `helmet` — headers de seguridad: `X-Frame-Options`, `X-Content-Type-Options`, `Strict-Transport-Security`, `X-XSS-Protection`, `Referrer-Policy` | 🟡 Medio | ⬜ |
-| 56.11 | `Cache-Control: no-cache, no-store` en todas las rutas con datos sensibles (`/api/auth`, `/api/orders`, `/api/qb`, `/api/customers`) | 🟡 Medio | ⬜ |
-| 56.12 | Quitar `logging: true` del cliente OAuth en `qbAuth.ts` — puede volcar tokens en logs | 🟡 Medio | ⬜ |
+| 56.5 | Cifrar `refresh_token` y `access_token` con AES-256 antes de guardar en tabla `qb_tokens` | 🔴 Crítico | ✅ |
+| 56.6 | Llave AES en variable de entorno separada (`QB_TOKEN_KEY`) — generada en `.env` local y en cPanel `SetEnv` | 🔴 Crítico | ✅ |
+| 56.7 | Descifrar tokens al cargar desde DB en `loadTokensFromDb()` — fallback a texto plano (legacy) | 🔴 Crítico | ✅ |
+| 56.8 | OAuth `state` aleatorio (32 bytes hex) + verificación en `handleCallback` con TTL 10 min — previene CSRF | 🔴 Crítico | ✅ |
+| 56.9 | Password mínimo 8 caracteres en `register` y en `changePassword` (antes era 6) | 🔴 Crítico | ✅ |
+| 56.10 | `helmet` instalado y aplicado — headers: `X-Frame-Options`, `X-Content-Type-Options`, `HSTS`, `X-XSS-Protection`, `Referrer-Policy` | 🟡 Medio | ✅ |
+| 56.11 | `Cache-Control: no-cache, no-store, must-revalidate` en todas las rutas `/api/*` | 🟡 Medio | ✅ |
+| 56.12 | `logging: false` en cliente OAuth (`qbAuth.ts`) — tokens ya no se vuelcan en logs | 🟡 Medio | ✅ |
 
-### Webapp — `excellentia-webapp/` ⬜
+### Webapp — `excellentia-webapp/` ✅
 
 | # | Tarea | Prioridad | Estado |
 |---|---|---|---|
-| 56.13 | Cookie JWT seteada server-side con atributos `HttpOnly; Secure; SameSite=Strict` | 🔴 Crítico | ⬜ |
-| 56.14 | `app/lib/auth.ts` — eliminar lectura de `document.cookie` (incompatible con HttpOnly); server components leen cookie desde el request directamente | 🔴 Crítico | ⬜ |
+| 56.13 | Login → backend pone `Set-Cookie: jwt=TOKEN; HttpOnly; Secure; SameSite=Strict` · Logout → `POST /api/auth/logout` borra cookie HttpOnly · Middleware auth lee cookie primero, luego Bearer (retrocompat Android) | 🔴 Crítico | ✅ |
+| 56.14 | `app/lib/auth.ts` reescrito — `getUserInfo()` lee cookie `jwt_user` (no-HttpOnly, sólo info pública) · `apiFetch()` wrapper con `credentials:'include'` · `logout()` llama backend + limpia `jwt_user` · Eliminados `getToken()`, `decodeJwt()`, `Authorization: Bearer` de los 10+ archivos | 🔴 Crítico | ✅ |
 
 ### Organizacional ⬜
 
