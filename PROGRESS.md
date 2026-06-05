@@ -1,6 +1,6 @@
 # Excellentia — Progreso del Proyecto
 
-> Estado actual: **Fase 53 ✅ — Fix duración de sesión (Backend + Android)**
+> Estado actual: **Fase 56 🔄 — Seguridad Intuit App Store (Backend + Webapp + cPanel)**
 
 ---
 
@@ -105,6 +105,8 @@
 | **Fase 51** | QBO OAuth: disconnect, redirect post-auth, página desconexión | **100%** ✅ |
 | **Fase 52** | QBO connection card en Settings webapp | **100%** ✅ |
 | **Fase 53** | Fix duración de sesión (Backend + Android) | **100%** ✅ |
+| **Fase 54** | Offline mode completo (Android) | **100%** ✅ |
+| **Fase 55** | Reorden flujo de firma (Android) | **100%** ✅ |
 
 ---
 
@@ -1431,6 +1433,114 @@ REDIRECT_URI=https://app.excellentiafoods.com/api/qb/callback
 | 53.2 | `TokenAuthenticator` — tras refresh exitoso, el request reintentado ahora incluye el nuevo token en el header `Authorization: Bearer {token}`. Antes se quitaba el header pero no se ponía el nuevo, causando un segundo 401 y logout forzado al expirar el token | `data/network/RetrofitClient.kt` | ✅ |
 
 **Causa raíz:** El access token duraba 15 minutos pero la cookie de la webapp y el refresh token duraban 7 días — desincronización que sacaba al usuario al login después de 15 min de inactividad. En Android, el `TokenAuthenticator` tenía el bug de no poner el nuevo Bearer token en el retry, por lo que el refresh silencioso fallaba y mandaba al login en lugar de continuar la sesión.
+
+---
+
+## Fase 54: Offline mode completo ✅
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 54.1 | `PendingBatchEntity` + `PendingBatchDao` — nueva tabla `pending_batches` en SQLite para guardar batches completos cuando no hay red | `data/local/entities/PendingBatchEntity.kt`, `data/local/dao/PendingBatchDao.kt` | ✅ |
+| 54.2 | `AppDatabase` — tabla `pending_batches` en `onCreate` y `onUpgrade`, versión → **7** | `data/local/AppDatabase.kt` | ✅ |
+| 54.3 | `ApiService` — nuevo endpoint `getAllProducts(limit)` sin filtro de búsqueda para prefetch masivo | `data/network/ApiService.kt` | ✅ |
+| 54.4 | `OrderRepository.sendBatch()` — si `isOfflineMode()` es true o hay excepción de red, guarda el batch completo (JSON) en `pending_batches` y devuelve `batchId = "OFFLINE_PENDING"` en vez de fallar | `data/repository/OrderRepository.kt` | ✅ |
+| 54.5 | `OrderRepository.prefetchAllProducts()` — descarga todos los productos (`GET /api/products?limit=500`) y los guarda en `cached_products` | `data/repository/OrderRepository.kt` | ✅ |
+| 54.6 | `OrderRepository.prefetchAllCustomers()` — descarga todos los clientes QB y los guarda en `cached_customers` | `data/repository/OrderRepository.kt` | ✅ |
+| 54.7 | `ProductRepository` — recibe `SecurePreferences`; si `isOfflineMode()` salta directamente al cache SQLite sin intentar el API ni esperar timeout | `data/repository/ProductRepository.kt` | ✅ |
+| 54.8 | `ProductDao.searchByQuery()` — búsqueda fuzzy por `barcode LIKE` o `name LIKE` para encontrar productos aunque el barcode guardado sea diferente al escaneado | `data/local/dao/ProductDao.kt` | ✅ |
+| 54.9 | `SyncWorker` — procesa `pending_batches` al sincronizar (además de `pending_orders`); dispara notificación al usuario cuando un batch offline se sincroniza exitosamente | `data/sync/SyncWorker.kt` | ✅ |
+| 54.10 | `SyncWorker.enqueueOneTime()` — nuevo método para disparar sync inmediato al recuperar la red | `data/sync/SyncWorker.kt` | ✅ |
+| 54.11 | `AndroidManifest.xml` — permiso `ACCESS_NETWORK_STATE` | `AndroidManifest.xml` | ✅ |
+| 54.12 | `MainActivity` — `ConnectivityManager.NetworkCallback` real: `onAvailable` oculta el banner, dispara sync + prefetch; `onLost` muestra el banner y activa offline mode | `MainActivity.kt` | ✅ |
+| 54.13 | `MainActivity` — pre-caché inicial en `onCreate` si hay red: llama `prefetchAllProducts()` + `prefetchAllCustomers()` en background | `MainActivity.kt` | ✅ |
+| 54.14 | `MainActivity.isNetworkAvailable()` — usa `NET_CAPABILITY_VALIDATED` + `NET_CAPABILITY_INTERNET` para detectar internet real (no solo WiFi conectado sin internet) | `MainActivity.kt` | ✅ |
+| 54.15 | `MainActivity.showManualEntryDialog()` — en modo offline hace búsqueda fuzzy en SQLite en lugar de llamar al API; muestra lista de selección si hay múltiples coincidencias | `MainActivity.kt` | ✅ |
+| 54.16 | `CurrentOrderActivity.finalizeOrder()` — maneja respuesta `OFFLINE_PENDING`: imprime ticket si hay impresora, limpia el carrito y navega a `OrderSuccessActivity` con flag `offline_pending = true` | `CurrentOrderActivity.kt` | ✅ |
+| 54.17 | `OrderSuccessActivity` — muestra Snackbar "Sin conexión — pedido guardado, se enviará automáticamente" cuando `offline_pending = true` | `OrderSuccessActivity.kt` | ✅ |
+
+**Flujo offline completo:**
+```
+Online → MainActivity.onCreate() → prefetchAllProducts() + prefetchAllCustomers() → SQLite cache lleno
+
+Red se pierde → NetworkCallback.onLost() → isOfflineMode = true → bannerOffline visible
+
+Usuario escanea / entra código manual:
+  → ProductRepository ve isOfflineMode=true → busca en cached_products directamente
+  → Si no encuentra por barcode exacto → searchByQuery (LIKE por barcode o nombre)
+
+Usuario finaliza pedido:
+  → sendBatch() ve isOfflineMode=true → guarda en pending_batches (JSON completo)
+  → Imprime ticket si hay impresora configurada
+  → OrderSuccessActivity muestra "Pedido guardado — se enviará cuando haya conexión"
+
+Red se restaura → NetworkCallback.onAvailable():
+  → isOfflineMode = false
+  → SyncWorker.enqueueOneTime() → procesa pending_batches → POST /api/orders/batch
+  → Notificación al usuario cuando se sincroniza
+  → prefetchAllProducts() + prefetchAllCustomers() (actualiza cache)
+```
+
+---
+
+## Fase 55: Reorden flujo de firma ✅
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 55.1 | `btnFinalize` onClick — ahora llama `askDamagedItems()` directamente en lugar de `launchSignature()` | `CurrentOrderActivity.kt` | ✅ |
+| 55.2 | `customerPickerLauncher` — tras seleccionar cliente con `launchSignatureAfterCustomer`, ahora continúa a `askDamagedItems()` en lugar de `launchSignature()` | `CurrentOrderActivity.kt` | ✅ |
+| 55.3 | `askPaymentMethod()` — los tres botones (Cash / Check / Skip) ahora llaman `launchSignature()` en lugar de `checkPrinterThenFinalize()` | `CurrentOrderActivity.kt` | ✅ |
+| 55.4 | `signatureLauncher` result — tras confirmar firma llama `checkPrinterThenFinalize()` en lugar de `askDamagedItems()` | `CurrentOrderActivity.kt` | ✅ |
+
+**Flujo anterior:** Finalizar → Cliente → **Firma** → Artículos dañados → Pago → Impresora → Enviar
+
+**Flujo nuevo:** Finalizar → Cliente → Artículos dañados → Pago → **Firma** → Impresora → Enviar
+
+---
+
+## Fase 56: Seguridad Intuit App Store 🔄
+
+Requisitos de seguridad obligatorios para publicar en el QuickBooks App Store. Revisados contra la documentación oficial de Intuit (`/go-live/publish-app/security-requirements`).
+
+### cPanel ✅
+
+| # | Tarea | Estado |
+|---|---|---|
+| 56.1 | SSL wildcard 5 años activo — calificación A en SSL Labs | ✅ |
+| 56.2 | HTTPS forzado en dominio y subdominio (ya existía en `.htaccess`) | ✅ |
+| 56.3 | TLS 1.2+ con AES-256 confirmado (SSL Labs A rating) | ✅ |
+| 56.4 | `RewriteCond %{REQUEST_METHOD} ^TRACE` + `[F]` agregado al `.htaccess` del subdominio y dominio principal | ✅ |
+
+### Backend — `excellentia/` ⬜
+
+| # | Tarea | Prioridad | Estado |
+|---|---|---|---|
+| 56.5 | Cifrar `refresh_token` y `access_token` con AES-256 antes de guardar en tabla `qb_tokens` | 🔴 Crítico | ⬜ |
+| 56.6 | Llave AES en variable de entorno separada (`QB_TOKEN_KEY`) | 🔴 Crítico | ⬜ |
+| 56.7 | Descifrar tokens al cargar desde DB en `loadTokensFromDb()` | 🔴 Crítico | ⬜ |
+| 56.8 | OAuth `state` aleatorio (crypto UUID) + verificación en `qbCallback` — previene CSRF en flujo OAuth | 🔴 Crítico | ⬜ |
+| 56.9 | Password mínimo 8 caracteres en `register` (actualmente sin validación) y en `changePassword` (actualmente 6) | 🔴 Crítico | ⬜ |
+| 56.10 | Instalar `helmet` — headers de seguridad: `X-Frame-Options`, `X-Content-Type-Options`, `Strict-Transport-Security`, `X-XSS-Protection`, `Referrer-Policy` | 🟡 Medio | ⬜ |
+| 56.11 | `Cache-Control: no-cache, no-store` en todas las rutas con datos sensibles (`/api/auth`, `/api/orders`, `/api/qb`, `/api/customers`) | 🟡 Medio | ⬜ |
+| 56.12 | Quitar `logging: true` del cliente OAuth en `qbAuth.ts` — puede volcar tokens en logs | 🟡 Medio | ⬜ |
+
+### Webapp — `excellentia-webapp/` ⬜
+
+| # | Tarea | Prioridad | Estado |
+|---|---|---|---|
+| 56.13 | Cookie JWT seteada server-side con atributos `HttpOnly; Secure; SameSite=Strict` | 🔴 Crítico | ⬜ |
+| 56.14 | `app/lib/auth.ts` — eliminar lectura de `document.cookie` (incompatible con HttpOnly); server components leen cookie desde el request directamente | 🔴 Crítico | ⬜ |
+
+### Organizacional ⬜
+
+| # | Tarea | Estado |
+|---|---|---|
+| 56.15 | Completar security affidavit cuando Intuit lo solicite (dentro de 2 semanas) | ⬜ |
+| 56.16 | Permitir escaneo de vulnerabilidades de Intuit o proveer resultados de scan propio (< 1 año) | ⬜ |
+| 56.17 | Cambiar `ENVIRONMENT=production` en cPanel antes del go-live | ⬜ |
 
 ---
 
