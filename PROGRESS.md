@@ -1501,7 +1501,7 @@ Red se restaura → NetworkCallback.onAvailable():
 
 ---
 
-## Fase 56: Seguridad Intuit App Store ✅ (código) / ⬜ organizacional
+## Fase 56: Seguridad Intuit App Store ✅ (código) / 🔄 organizacional
 
 Requisitos de seguridad obligatorios para publicar en el QuickBooks App Store. Revisados contra la documentación oficial de Intuit (`/go-live/publish-app/security-requirements`).
 
@@ -1534,13 +1534,45 @@ Requisitos de seguridad obligatorios para publicar en el QuickBooks App Store. R
 | 56.13 | Login → backend pone `Set-Cookie: jwt=TOKEN; HttpOnly; Secure; SameSite=Strict` · Logout → `POST /api/auth/logout` borra cookie HttpOnly · Middleware auth lee cookie primero, luego Bearer (retrocompat Android) | 🔴 Crítico | ✅ |
 | 56.14 | `app/lib/auth.ts` reescrito — `getUserInfo()` lee cookie `jwt_user` (no-HttpOnly, sólo info pública) · `apiFetch()` wrapper con `credentials:'include'` · `logout()` llama backend + limpia `jwt_user` · Eliminados `getToken()`, `decodeJwt()`, `Authorization: Bearer` de los 10+ archivos | 🔴 Crítico | ✅ |
 
-### Organizacional ⬜
+### Deploy a producción ✅
 
 | # | Tarea | Estado |
 |---|---|---|
-| 56.15 | Completar security affidavit cuando Intuit lo solicite (dentro de 2 semanas) | ⬜ |
+| 56.18 | Backend desplegado en cPanel — Node.js 20, npm install, variables de entorno configuradas | ✅ |
+| 56.19 | Webapp (export estático) subida a cPanel y servida por Express en mismo dominio | ✅ |
+
+### Organizacional 🔄
+
+| # | Tarea | Estado |
+|---|---|---|
+| 56.15 | App Assessment Questionnaire de Intuit — revisado y corregido (ver respuestas abajo) | 🔄 |
 | 56.16 | Permitir escaneo de vulnerabilidades de Intuit o proveer resultados de scan propio (< 1 año) | ⬜ |
-| 56.17 | Cambiar `ENVIRONMENT=production` en cPanel antes del go-live | ⬜ |
+| 56.17 | Cambiar `ENVIRONMENT=production` en cPanel (actualmente en `sandbox`) antes del go-live real | ⬜ |
+
+#### Respuestas correctas del App Assessment Questionnaire
+
+**General Questions (Accounting API)**
+- Q1: Simple Start ✅
+- Q2: Yes — *"Our app is version-agnostic. It only uses the Accounting API (Invoices and Items) which are available across all QuickBooks Online versions. We monitor API changes through the Intuit developer changelog and update accordingly."*
+- Q3: Sales tax for US ✅ · Q4: No webhooks ✅ · Q5: No CDC ✅
+
+**General Questions (primera tab)**
+- Q1–Q6: No / No / Yes confirm / Yes / No / No ✅
+
+**Authorization and Authentication**
+- Q1–Q6: todos Yes ✅
+- Q7 ¿Depende del OAuth playground? → **No** (la app tiene su propio flujo OAuth completo en `/api/qb/auth`)
+
+**App Information**
+- Q1: Built from scratch ✅
+- Q2 Plataforma → **Web/SaaS + Mobile** (no "Desktop app")
+- Q3: Reads + Writes ✅ · Q4: Private app ✅ · Q5: Only QBO admin ✅ · Q6: No ✅
+
+**Security**
+- Q1: No breach ✅ · Q2: Yes ✅ · Q3: Yes ✅ · Q4: No MFA ✅
+- Q5 ¿Captcha? → **No**
+- Q6 ¿WebSocket? → **No**
+- Q7: No, data only for original customer ✅
 
 ---
 
@@ -1562,6 +1594,11 @@ Requisitos de seguridad obligatorios para publicar en el QuickBooks App Store. R
 | ✅ | ~~**Último escaneo en MainActivity**~~ | Completado en Fase 18 — muestra barcode, nombre y hora |
 | ✅ | ~~**Cache cleanup**~~ | Completado en Fase 18 — borra productos cacheados > 7 días al iniciar |
 | ✅ | ~~**Configuración de empresa dinámica**~~ | Completado en Fase 17 |
+| Alta | **Badge crédito cliente activo** | Mostrar en `CurrentOrderActivity` si el cliente activo tiene crédito disponible por damage. Depende del sistema de créditos. |
+| Media | **Notificación sync pedido PENDING** | Pulir `OrderStatusWorker` — notificar al vendedor cuando un pedido PENDING se sincroniza exitosamente a QB |
+| Media | **Buscar cliente por nombre desde MainActivity** | Actualmente solo se puede escanear o ingresar código. Agregar búsqueda de cliente directamente desde la pantalla principal sin abrir `CustomerPickerActivity` |
+| Media | **Pre-órdenes offline** | Pre-órdenes funcionen sin internet usando SQLite local. Al recuperar red se sincronizan automáticamente vía `SyncWorker` |
+| Media | **Historial de precios mejorado** | En `ProductDetailActivity` mostrar el precio promedio que ese cliente ha pagado por el producto, además del historial de transacciones |
 
 ### Backend
 
@@ -1574,8 +1611,13 @@ Requisitos de seguridad obligatorios para publicar en el QuickBooks App Store. R
 | Bloqueado | **Reset de contraseña (self-service)** | Requiere SMTP/dominio propio — pendiente hasta contar con email. Workaround: admin resetea desde webapp `/users` |
 | ✅ | ~~**Log de actividad**~~ | Completado en Fase 16 |
 | ✅ | ~~**Exportar CSV**~~ | Completado en Fase 16 |
-| Media | **Producción QBO** | Cambiar `ENVIRONMENT=production`, actualizar `REDIRECT_URI`/`DASHBOARD_URL`/`DISCONNECTED_URL`, registrar URLs en Intuit Developer Console, reconectar empresa real de QuickBooks via `/api/qb/auth` |
 | ✅ | ~~**Configuración de empresa dinámica**~~ | Completado en Fase 17 (backend + webapp) |
+| Alta | **Sistema de créditos por damage — backend** | Tabla `customer_credits` + endpoint para generar/aplicar créditos. Prerequisito: `units_per_case` en productos. Decidir si Credit Memos van a QB o solo en MySQL |
+| Alta | **Endpoint stats operadores del día** | Query SQL sobre `orders` de hoy agrupada por `user_id` con total pedidos, ingresos y último pedido. Alimenta la tabla de operadores del dashboard |
+| Media | **Producción QBO** | Cambiar `ENVIRONMENT=production`, actualizar `REDIRECT_URI`/`DASHBOARD_URL`/`DISCONNECTED_URL`, registrar URLs en Intuit Developer Console, reconectar empresa real de QuickBooks via `/api/qb/auth` |
+| Media | **Webhook QB → backend** | Recibir notificaciones de QB cuando se crea/edita un producto directamente en QB. Elimina necesidad de "Sincronizar QB" manual. Requiere registrar endpoint en Intuit Developer Console |
+| Media | **Credit Memos QB** | Crear Credit Memos en QB cuando se registra damage. Parte del sistema de créditos por damage. Depende de `units_per_case` y tabla `customer_credits` |
+| Media | **Email resumen diario** | Enviar resumen automático al admin con pedidos del día, ingresos totales y operadores activos. Bloqueado hasta tener SMTP |
 
 ### Webapp
 
@@ -1587,3 +1629,10 @@ Requisitos de seguridad obligatorios para publicar en el QuickBooks App Store. R
 | ✅ | ~~**Página de clientes**~~ | Completado en Fase 16 |
 | ✅ | ~~**Ver ticket completo**~~ | Completado en Fase 16 |
 | ✅ | ~~**Configuración de empresa**~~ | Completado en Fase 17 |
+| Alta | **Dashboard semi-realtime (polling)** | Polling cada 30s en KPIs, actividad reciente y gráfica de pedidos por hora. Top 5 y gráfica de 7 días solo se refrescan al cambiar filtro de período. Opción SSE descartada por limitaciones de cPanel/Passenger. |
+| Alta | **Dashboard — tabla de operadores del día** | Sección nueva en dashboard (solo admin) con tabla: Operador / Pedidos hoy / Total $ / Último pedido. Incluir "último visto" usando `activity_log`. Online en tiempo real descartado — requeriría heartbeat en Android y backend. |
+| Alta | **Unidades por caja en productos** | Agregar campo `units_per_case` a tabla `products` y al modal de edición de productos. Campo opcional, sin impacto en QB. Prerequisito para el sistema de créditos por damage. |
+| Alta | **Sistema de créditos por damage** | Damage reportado genera crédito al cliente. Prerequisitos: (1) `units_per_case` en productos, (2) definir cálculo del crédito (¿por unidad? ¿por peso?), (3) decidir si Credit Memos van a QB o solo en MySQL. Requiere tabla `customer_credits` + endpoint nuevo. |
+| Media | **Alerta de stock bajo** | Badge/indicador rojo en productos con stock ≤ 5 en la página de productos. Ya existe el dato, mínimo esfuerzo. |
+| Media | **Historial de créditos por cliente** | Página o sección en `/customers` mostrando créditos generados, aplicados y saldo disponible por cliente. Depende del sistema de créditos. |
+| Media | **Reporte de damage por período** | Sección en dashboard con: total perdido por damage por semana/mes, top productos más dañados, qué operador reporta más damage. Útil para decisiones de compra. |

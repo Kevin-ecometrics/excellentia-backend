@@ -251,6 +251,47 @@ O desde la webapp: **Productos → Sincronizar QB**.
 
 ---
 
+## 7b. Pasar de Sandbox a Producción (cuando Intuit apruebe la app)
+
+### Variables que cambian en cPanel
+
+En **Node.js App Manager → Environment Variables**, actualiza solo estas 3:
+
+| Variable | Valor |
+|---|---|
+| `CLIENT_ID` | Nuevo Client ID de producción |
+| `CLIENT_SECRET` | Nuevo Client Secret de producción |
+| `ENVIRONMENT` | `production` |
+
+> `APP_ID` no cambia. `REALM_ID` no necesitas cambiarlo manualmente — el OAuth lo captura automáticamente.
+
+### Dónde obtener las keys de producción
+
+En [developer.intuit.com](https://developer.intuit.com) → tu app → **Keys & OAuth** → sección Production.
+
+### Reconectar QuickBooks con la empresa real
+
+Después de actualizar las variables y hacer **Restart** en cPanel:
+
+**Si tú tienes acceso al QBO del cliente:**
+1. Ve a `https://app.excellentiafoods.com/api/qb/auth`
+2. Inicia sesión con la cuenta de QuickBooks de la empresa real
+3. Autoriza la app — los tokens y el `REALM_ID` real se guardan automáticamente en la DB
+
+**Si eres developer invitado y no tienes acceso al QBO:**
+1. Mándale al dueño del negocio el link: `https://app.excellentiafoods.com/api/qb/auth`
+2. El dueño inicia sesión con su cuenta de QuickBooks y autoriza
+3. El backend captura el `REALM_ID` y guarda todos los tokens automáticamente — no necesitas hacer nada más
+
+> El `REALM_ID` del sandbox que tengas en cPanel no importa — se sobreescribe en la DB cuando se completa el OAuth. El `.env` solo se usa como valor inicial si no hay tokens en la base de datos.
+
+### Después de reconectar
+
+1. Webapp → **Productos → Sincronizar QB** — importa los productos reales de QBO (los del sandbox no aparecen)
+2. Verifica en el dashboard que las órdenes se sincronizan correctamente
+
+---
+
 ## 8. Configurar la webapp (Next.js)
 
 La webapp (`excellentia-webapp`) es un **export estático** servido por el mismo Express en el mismo dominio (`https://tudominio.com`). No se despliega en Vercel.
@@ -322,15 +363,16 @@ Si alguno falla con error 500, revisa los logs en el Node.js App Manager de cPan
 ## 12. Checklist de despliegue
 
 ```
+[ ] Node.js version en cPanel → 20.x LTS (mínimo 18 — helmet@8 y express@5 lo requieren)
 [ ] bun build → dist/index.js generado sin errores
-[ ] dist/index.js + package.json subidos a cPanel (File Manager)
+[ ] dist/index.js + package.json subidos a cPanel (File Manager) — NO subir node_modules
 [ ] Webapp: NEXT_PUBLIC_API_URL=https://tudominio.com bun run build → carpeta out/ subida a cPanel
 [ ] Base de datos MySQL creada en cPanel → MySQL Databases
 [ ] Variables de entorno configuradas (DB, JWT_SECRET, JWT_REFRESH_SECRET, QB_TOKEN_KEY, QB, PORT)
 [ ] NODE_ENV=production en variables de entorno (activa Secure en la cookie JWT)
-[ ] ENVIRONMENT=production en variables de entorno (activa QuickBooks producción)
+[ ] ENVIRONMENT=production en variables de entorno (activa QuickBooks producción, no sandbox)
 [ ] SetEnv QB_TOKEN_KEY ... agregado al .htaccess del subdominio (igual al valor en Node.js App Manager)
-[ ] npm install corrido desde Node.js App Manager
+[ ] npm install corrido desde Node.js App Manager (obligatorio tras cada subida de package.json)
 [ ] App iniciada (Start) en Node.js App Manager
 [ ] Abrir https://tudominio.com/api/setup → respuesta ok: true
 [ ] QB OAuth: abrir https://tudominio.com/api/qb/auth → completar flujo (guarda tokens cifrados)
@@ -340,6 +382,9 @@ Si alguno falla con error 500, revisa los logs en el Node.js App Manager de cPan
 [ ] Login desde la webapp → cookie jwt aparece como HttpOnly en DevTools → Application → Cookies
 [ ] App Android apuntando a https://tudominio.com
 [ ] Test de login exitoso desde la app Android
+[ ] Intuit App Assessment Questionnaire completado y enviado (developer.intuit.com)
 ```
 
 > **Importante — primera vez con `QB_TOKEN_KEY`:** si ya tenías tokens guardados en la tabla `qb_tokens` sin cifrar, vuelve a hacer el flujo OAuth (`/api/qb/auth`) para que se sobrescriban cifrados. Los tokens antiguos en texto plano fallarán al intentar descifrarlos.
+
+> **Importante — nuevas dependencias:** cada vez que se agregue un paquete al `package.json`, correr **Run NPM Install** en cPanel → Node.js App Manager antes de reiniciar. Sin ese paso el servidor no arranca.
