@@ -100,7 +100,8 @@ export async function syncProducts(_req: Request, res: Response): Promise<void> 
     }
 
     await pool.query(
-      "UPDATE sync_meta SET last_sync_at = ? WHERE entity = 'product'",
+      `INSERT INTO sync_meta (entity, last_sync_at) VALUES ('product', ?)
+       ON DUPLICATE KEY UPDATE last_sync_at = VALUES(last_sync_at)`,
       [new Date().toISOString()]
     );
 
