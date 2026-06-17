@@ -1,6 +1,6 @@
 # Excellentia — Progreso del Proyecto
 
-> Estado actual: **Fase 56 ✅ — Seguridad Intuit App Store (Backend + Webapp + cPanel completados)**
+> Estado actual: **Fase 57 ✅ — QBO Sync confiable + Paginación + Búsqueda server-side (Backend + Webapp)**
 
 ---
 
@@ -107,6 +107,8 @@
 | **Fase 53** | Fix duración de sesión (Backend + Android) | **100%** ✅ |
 | **Fase 54** | Offline mode completo (Android) | **100%** ✅ |
 | **Fase 55** | Reorden flujo de firma (Android) | **100%** ✅ |
+| **Fase 56** | Seguridad Intuit App Store | **100%** ✅ |
+| **Fase 57** | QBO Sync confiable + Paginación + Búsqueda server-side | **100%** ✅ |
 
 ---
 
@@ -1501,7 +1503,7 @@ Red se restaura → NetworkCallback.onAvailable():
 
 ---
 
-## Fase 56: Seguridad Intuit App Store ✅ (código) / 🔄 organizacional
+## Fase 56: Seguridad Intuit App Store ✅ (código + deploy) / 🔄 organizacional
 
 Requisitos de seguridad obligatorios para publicar en el QuickBooks App Store. Revisados contra la documentación oficial de Intuit (`/go-live/publish-app/security-requirements`).
 
@@ -1573,6 +1575,48 @@ Requisitos de seguridad obligatorios para publicar en el QuickBooks App Store. R
 - Q5 ¿Captcha? → **No**
 - Q6 ¿WebSocket? → **No**
 - Q7: No, data only for original customer ✅
+
+---
+
+## Fase 57: QBO Sync confiable + Paginación + Búsqueda server-side ✅
+
+### Problemas resueltos
+
+- QBO API limita a 1000 registros por query sin paginación explícita — antes del fix, productos > 1000 se perdían al sincronizar
+- El patrón de sync parcial (50 productos por click) era porque el loop se rompía en un item problemático (datos inconsistentes de QBO) y el catch del for completo respondía 500
+- No existían filtros server-side en la tabla de productos (búsqueda, categoría, estado de sync, stock)
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 57.1 | `paginatedQuery()` — función genérica que itera QBO con `MAXRESULTS 1000 STARTPOSITION N` hasta obtener todos los registros | `src/services/qbAuth.ts` | ✅ |
+| 57.2 | `findAllItems()` y `findItemsUpdatedSince()` migrados de `makeQboApiCall` directo a `paginatedQuery` | `src/services/qbItems.ts` | ✅ |
+| 57.3 | `syncProducts` — try-catch por item en vez de try-catch de todo el batch. Contadores `inserted`, `updated`, `skipped` en respuesta | `src/controllers/qbController.ts` | ✅ |
+| 57.4 | `syncProductsFromQbo` — try-catch por item + logger en vez de catch general que abortaba todo | `src/services/syncEngine.ts` | ✅ |
+| 57.5 | `INSERT ... ON DUPLICATE KEY UPDATE` en `sync_meta` — evita error 500 si no existe el row al iniciar sync | `src/controllers/qbController.ts` | ✅ |
+| 57.6 | `listProducts` — filtros server-side: `search` (nombre/barcode), `category`, `qb` (synced/unsynced), `stock` (instock/outofstock/lowstock) | `src/controllers/productController.ts` | ✅ |
+| 57.7 | `GET /api/products/categories` — devuelve categorías distintas de productos | `src/routes/products.ts` | ✅ |
+| 57.8 | `listProducts` retorna `meta.totalPages` además de `page`, `limit`, `total` | `src/controllers/productController.ts` | ✅ |
+
+### Frontend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 57.9 | `ProductsClient.tsx` autocontenido — maneja fetch, filtros, paginación, sync y refresh sin depender de `page.tsx` | `app/products/_components/ProductsClient.tsx` | ✅ |
+| 57.10 | Búsqueda server-side con input de texto — resetea a página 1 al escribir (debounce 400ms) | `ProductsClient.tsx` | ✅ |
+| 57.11 | Paginación server-side con números de página, botones prev/next, page size selector (10/25/50/100) | `ProductsClient.tsx` | ✅ |
+| 57.12 | Botón Refresh (ícono recarga) visible para todos los roles — llama `loadProducts()` directamente | `ProductsClient.tsx` | ✅ |
+| 57.13 | Sync QB nunca muestra errores al usuario — solo `console.warn` + notificación de éxito | `ProductsClient.tsx` | ✅ |
+| 57.14 | `i18n.ts` — traducciones ES/EN para filtros (`prod_search`, `prod_category`, `prod_synced`, `prod_unsynced`, `prod_instock`, `prod_outofstock`, `prod_lowstock`, `prod_allCategories`, `prod_pagination`) | `app/lib/i18n.ts` | ✅ |
+| 57.15 | `page.tsx` simplificado — solo importa y renderiza `ProductsClient` sin estado propio | `app/products/page.tsx` | ✅ |
+
+### Key Decisions
+
+- Try-catch por item en sync en vez de transacción: si un item de QBO tiene datos inconsistentes, se omite y el resto se procesa sin fallar
+- Paginación QBO vía `paginatedQuery()` con loop `MAXRESULTS 1000 STARTPOSITION` en vez de URL params separados, para mantener consistencia con el formato actual de queries
+- `router.refresh()` reemplazado por llamada directa a `loadProducts()` porque static export (Next.js output: 'export') no soporta re-fetch de server components
+- Frontend calcula `totalPages` localmente si backend no lo retorna (`Math.ceil(total / limit)`), para no depender del deploy del backend
 
 ---
 
