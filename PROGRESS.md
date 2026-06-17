@@ -1667,12 +1667,7 @@ Requisitos de seguridad obligatorios para publicar en el QuickBooks App Store. R
 
 | Prioridad | Feature | Detalle |
 |---|---|---|
-| ✅ | ~~**Página de pedidos**~~ | Completado en Fase 14 |
-| ✅ | ~~**Página de usuarios**~~ | Completado en Fase 11 |
-| ✅ | ~~**Exportar CSV**~~ | Completado en Fase 16 |
-| ✅ | ~~**Página de clientes**~~ | Completado en Fase 16 |
-| ✅ | ~~**Ver ticket completo**~~ | Completado en Fase 16 |
-| ✅ | ~~**Configuración de empresa**~~ | Completado en Fase 17 |
+| Alta | **Imágenes de productos** | Agregar columna `image_url` a `products` en MySQL. Subir imágenes a Cloudinary/cPanel. Mostrar thumbnail en `ProductRow.tsx` y preview en `ProductModal.tsx`. Input para subir/pegar URL de imagen en el modal de edición. |
 | Alta | **Dashboard semi-realtime (polling)** | Polling cada 30s en KPIs, actividad reciente y gráfica de pedidos por hora. Top 5 y gráfica de 7 días solo se refrescan al cambiar filtro de período. Opción SSE descartada por limitaciones de cPanel/Passenger. |
 | Alta | **Dashboard — tabla de operadores del día** | Sección nueva en dashboard (solo admin) con tabla: Operador / Pedidos hoy / Total $ / Último pedido. Incluir "último visto" usando `activity_log`. Online en tiempo real descartado — requeriría heartbeat en Android y backend. |
 | Alta | **Unidades por caja en productos** | Agregar campo `units_per_case` a tabla `products` y al modal de edición de productos. Campo opcional, sin impacto en QB. Prerequisito para el sistema de créditos por damage. |
