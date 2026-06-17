@@ -9,33 +9,68 @@ export async function listProducts(req: Request, res: Response): Promise<void> {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 20;
     const search = req.query.search as string;
+    const category = req.query.category as string;
+    const qb = req.query.qb as string;
+    const stock = req.query.stock as string;
     const offset = (page - 1) * limit;
 
-    let query = 'SELECT * FROM products WHERE hidden = 0';
-    let countQuery = 'SELECT COUNT(*) as total FROM products WHERE hidden = 0';
+    const conditions: string[] = ['hidden = 0'];
     const params: any[] = [];
-    const countParams: any[] = [];
 
     if (search) {
-      const where = ' AND (name LIKE ? OR barcode LIKE ?)';
-      query += where;
-      countQuery += where;
+      conditions.push('(name LIKE ? OR barcode LIKE ?)');
       params.push(`%${search}%`, `%${search}%`);
-      countParams.push(`%${search}%`, `%${search}%`);
     }
 
-    query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
-    params.push(limit, offset);
+    if (category) {
+      conditions.push('category = ?');
+      params.push(category);
+    }
 
-    const [rows] = await pool.query(query, params) as any[];
-    const [countResult] = await pool.query(countQuery, countParams) as any[];
+    if (qb === 'synced') {
+      conditions.push('qb_item_id IS NOT NULL');
+    } else if (qb === 'unsynced') {
+      conditions.push('qb_item_id IS NULL');
+    }
+
+    if (stock === 'outofstock') {
+      conditions.push('stock = 0');
+    } else if (stock === 'lowstock') {
+      conditions.push('stock BETWEEN 1 AND 5');
+    } else if (stock === 'instock') {
+      conditions.push('stock > 5');
+    }
+
+    const where = 'WHERE ' + conditions.join(' AND ');
+    const query = `SELECT * FROM products ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`;
+    const countQuery = `SELECT COUNT(*) as total FROM products ${where}`;
+
+    const [rows] = await pool.query(query, [...params, limit, offset]) as any[];
+    const [countResult] = await pool.query(countQuery, params) as any[];
 
     res.json({
       data: rows,
-      meta: { page, limit, total: countResult[0].total },
+      meta: {
+        page,
+        limit,
+        total: countResult[0].total,
+        totalPages: Math.ceil(countResult[0].total / limit),
+      },
     });
   } catch (err) {
     logger.error('listProducts error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
+export async function listCategories(_req: Request, res: Response): Promise<void> {
+  try {
+    const [rows] = await pool.query(
+      'SELECT DISTINCT category FROM products WHERE hidden = 0 AND category IS NOT NULL ORDER BY category'
+    ) as any[];
+    res.json({ data: rows.map((r: any) => r.category) });
+  } catch (err) {
+    logger.error('listCategories error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 }

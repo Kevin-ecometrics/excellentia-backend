@@ -88,24 +88,35 @@ async function syncProductsFromQbo(): Promise<void> {
 
     if (items.length === 0) return;
 
-    for (const item of items) {
-      const [existing] = await pool.query(
-        'SELECT id FROM products WHERE qb_item_id = ?',
-        [item.Id]
-      ) as any[];
+    let upserted = 0;
+    let skipped = 0;
 
-      if (existing.length > 0) {
-        await pool.query(
-          'UPDATE products SET name = ?, price = ?, stock = ?, updated_at = NOW() WHERE qb_item_id = ?',
-          [item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, item.Id]
-        );
-      } else {
-        await pool.query(
-          'INSERT INTO products (barcode, name, price, stock, qb_item_id) VALUES (?, ?, ?, ?, ?)',
-          [null, item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, item.Id]
-        );
+    for (const item of items) {
+      try {
+        const [existing] = await pool.query(
+          'SELECT id FROM products WHERE qb_item_id = ?',
+          [item.Id]
+        ) as any[];
+
+        if (existing.length > 0) {
+          await pool.query(
+            'UPDATE products SET name = ?, price = ?, stock = ?, updated_at = NOW() WHERE qb_item_id = ?',
+            [item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, item.Id]
+          );
+        } else {
+          await pool.query(
+            'INSERT INTO products (barcode, name, price, stock, qb_item_id) VALUES (?, ?, ?, ?, ?)',
+            [null, item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, item.Id]
+          );
+        }
+        upserted++;
+      } catch (itemErr) {
+        skipped++;
+        logger.warn(`syncProductsFromQbo: item ${item.Id} (${item.Name}) omitido:`, itemErr);
       }
     }
+
+    logger.info(`syncProductsFromQbo: ${upserted} procesados, ${skipped} omitidos`);
 
     const latestTime = items.reduce((latest: string, item: any) => {
       return item.Metadata?.LastUpdatedTime > latest ? item.Metadata.LastUpdatedTime : latest;

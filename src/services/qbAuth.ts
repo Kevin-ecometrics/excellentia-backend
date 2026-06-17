@@ -288,4 +288,23 @@ async function handleCallback(reqUrl: string): Promise<{ access_token: string; r
   return { access_token: token.access_token ?? '', refresh_token: token.refresh_token ?? '', realmId };
 }
 
-export { oauthClient, refreshToken, makeQboApiCall, makeQboBatch, getAuthUri, handleCallback, loadTokensFromDb, loadTokensFromEnv, saveTokensToDb };
+async function paginatedQuery(baseQuery: string, maxResults = 1000): Promise<any[]> {
+  let allItems: any[] = [];
+  let startPosition = 1;
+  let totalCount = 0;
+
+  do {
+    const query = `${baseQuery} MAXRESULTS ${maxResults} STARTPOSITION ${startPosition}`;
+    const endpoint = `/v3/company/${process.env.REALM_ID ?? defaultTokens.realmId}/query?query=${query}`;
+    const data = await makeQboApiCall(endpoint);
+    const items = data.QueryResponse?.Item ?? [];
+    allItems = allItems.concat(items);
+
+    totalCount = data.QueryResponse?.totalCount ?? allItems.length;
+    startPosition += maxResults;
+  } while (allItems.length < totalCount);
+
+  return allItems;
+}
+
+export { oauthClient, refreshToken, makeQboApiCall, makeQboBatch, paginatedQuery, getAuthUri, handleCallback, loadTokensFromDb, loadTokensFromEnv, saveTokensToDb };

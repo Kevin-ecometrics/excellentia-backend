@@ -1,17 +1,11 @@
-import { makeQboApiCall, oauthClient, refreshToken } from './qbAuth.ts';
+import { paginatedQuery, oauthClient, refreshToken } from './qbAuth.ts';
 
 export async function findAllItems(): Promise<any[]> {
-  const data = await makeQboApiCall(
-    `/v3/company/${process.env.REALM_ID}/query?query=select * from Item`
-  );
-  return data.QueryResponse?.Item ?? [];
+  return paginatedQuery('select * from Item');
 }
 
 export async function findItemsUpdatedSince(since: string): Promise<any[]> {
-  const data = await makeQboApiCall(
-    `/v3/company/${process.env.REALM_ID}/query?query=select * from Item WHERE Metadata.LastUpdatedTime > '${since}'`
-  );
-  return data.QueryResponse?.Item ?? [];
+  return paginatedQuery(`select * from Item WHERE Metadata.LastUpdatedTime > '${since}'`);
 }
 
 async function getInventoryAccountRefs(): Promise<{ income: any; asset: any; expense: any } | null> {
