@@ -27,7 +27,7 @@ async function processPendingOrders(): Promise<void> {
   if (!hasQboTokens()) return;
   try {
     const [pending] = await pool.query(
-      "SELECT o.*, p.qb_item_id FROM orders o LEFT JOIN products p ON o.barcode = p.barcode WHERE o.status = 'PENDING'"
+      "SELECT o.*, p.qb_item_id, u.qb_class_id FROM orders o LEFT JOIN products p ON o.barcode = p.barcode LEFT JOIN users u ON o.user_id = u.id WHERE o.status = 'PENDING'"
     ) as any[];
 
     for (const order of pending) {
@@ -40,7 +40,7 @@ async function processPendingOrders(): Promise<void> {
           continue;
         }
 
-        const invoice = await createInvoice(order, order.qb_item_id);
+        const invoice = await createInvoice(order, order.qb_item_id, order.qb_class_id ?? null);
         const invoiceId = invoice.Invoice?.Id;
 
         await pool.query(

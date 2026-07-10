@@ -94,7 +94,7 @@ export async function refresh(req: Request, res: Response): Promise<void> {
 
 export async function register(req: Request, res: Response): Promise<void> {
   try {
-    const { email, password, role, name } = req.body;
+    const { email, password, role, name, qb_class_id } = req.body;
     if (!email || !password) {
       res.status(400).json({ error: 'Email y password requeridos' });
       return;
@@ -112,12 +112,12 @@ export async function register(req: Request, res: Response): Promise<void> {
 
     const hashed = await bcrypt.hash(password, 10);
     const [result] = await pool.query(
-      'INSERT INTO users (email, name, password, role) VALUES (?, ?, ?, ?)',
-      [email, name ?? null, hashed, role ?? 'operator']
+      'INSERT INTO users (email, name, password, role, qb_class_id) VALUES (?, ?, ?, ?, ?)',
+      [email, name ?? null, hashed, role ?? 'operator', qb_class_id ?? null]
     ) as any;
 
     logActivity({ userId: req.user?.id, userEmail: req.user?.email, action: 'USER_CREATED', entityType: 'user', entityId: result.insertId, details: `email: ${email}, name: ${name ?? ''}, role: ${role ?? 'operator'}`, ip: req.ip });
-    res.status(201).json({ id: result.insertId, email, name: name ?? null, role: role ?? 'operator' });
+    res.status(201).json({ id: result.insertId, email, name: name ?? null, role: role ?? 'operator', qb_class_id: qb_class_id ?? null });
   } catch (err) {
     logger.error('Register error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });

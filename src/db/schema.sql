@@ -19,8 +19,12 @@ CREATE TABLE IF NOT EXISTS `users` (
     `refresh_token`             TEXT NULL,
     `refresh_token_expires_at`  BIGINT NULL,
     `role`                      ENUM('admin', 'operator') NOT NULL DEFAULT 'operator',
+    `qb_class_id`               VARCHAR(50) NULL,
     `created_at`                TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Migración para DB existente (cPanel):
+-- ALTER TABLE users ADD COLUMN IF NOT EXISTS qb_class_id VARCHAR(50) NULL AFTER role;
 
 -- -----------------------------------------------------------------------------
 -- 2. products

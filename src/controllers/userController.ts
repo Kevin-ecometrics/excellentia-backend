@@ -7,7 +7,7 @@ import { logActivity } from '../services/activityLog.ts';
 export async function listUsers(req: Request, res: Response): Promise<void> {
   try {
     const [rows] = await pool.query(
-      'SELECT id, email, name, role, created_at FROM users ORDER BY created_at DESC'
+      'SELECT id, email, name, role, qb_class_id, created_at FROM users ORDER BY created_at DESC'
     ) as any[];
     res.json({ data: rows });
   } catch (err) {
@@ -19,9 +19,9 @@ export async function listUsers(req: Request, res: Response): Promise<void> {
 export async function updateUser(req: Request, res: Response): Promise<void> {
   try {
     const id = String(req.params.id);
-    const { email, name, role, password } = req.body;
+    const { email, name, role, password, qb_class_id } = req.body;
 
-    if (!email && !name && !role && !password) {
+    if (!email && !name && !role && !password && qb_class_id === undefined) {
       res.status(400).json({ error: 'Nada que actualizar' });
       return;
     }
@@ -48,6 +48,7 @@ export async function updateUser(req: Request, res: Response): Promise<void> {
     if (name !== undefined) { updates.push('name = ?'); params.push(name || null); }
     if (role)     { updates.push('role = ?');     params.push(role); }
     if (password) { updates.push('password = ?'); params.push(await bcrypt.hash(password, 10)); }
+    if (qb_class_id !== undefined) { updates.push('qb_class_id = ?'); params.push(qb_class_id || null); }
 
     params.push(id);
     await pool.query(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, params);

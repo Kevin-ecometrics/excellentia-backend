@@ -228,7 +228,7 @@ export async function convertPreOrder(req: Request, res: Response): Promise<void
     try {
       const validItems = inserted.filter(i => i.qb_item_id) as { id: number; qb_item_id: string; product_name: string; price: number; quantity: number; total: number }[];
       if (validItems.length > 0) {
-        const invoice = await createBatchInvoice(validItems, preOrder.customer_id, damage_items ?? [], payment_method ?? null);
+        const invoice = await createBatchInvoice(validItems, preOrder.customer_id, damage_items ?? [], payment_method ?? null, req.user?.qb_class_id ?? null);
         invoiceId = invoice.Invoice?.Id ?? null;
         await pool.query("UPDATE orders SET status = 'SENT', qb_invoice_id = ? WHERE batch_id = ?", [invoiceId, batchId]);
       }

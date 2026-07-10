@@ -1,6 +1,6 @@
 # Excellentia — Progreso del Proyecto
 
-> Estado actual: **Fase 57 ✅ — QBO Sync confiable + Paginación + Búsqueda server-side (Backend + Webapp)**
+> Estado actual: **Fase 58 ✅ — Class por vendedor en invoices QBO: selección + envío al invoice completos (Backend + Webapp). Falta reconectar OAuth sandbox local para probar con datos reales y correr migración en cPanel**
 
 ---
 
@@ -109,6 +109,7 @@
 | **Fase 55** | Reorden flujo de firma (Android) | **100%** ✅ |
 | **Fase 56** | Seguridad Intuit App Store | **100%** ✅ |
 | **Fase 57** | QBO Sync confiable + Paginación + Búsqueda server-side | **100%** ✅ |
+| **Fase 58** | Class por vendedor en invoices QBO — selección de vendedor + ClassRef en invoice (Backend + Webapp) | **100%** ✅ |
 
 ---
 
@@ -1620,6 +1621,72 @@ Requisitos de seguridad obligatorios para publicar en el QuickBooks App Store. R
 
 ---
 
+## Fase 58: Class por vendedor en invoices QBO 🔄
+
+QBO Plus ya tiene Class Tracking activo (modo "una clase por línea"). Objetivo: que cada invoice creado desde la app muestre en la columna Class (Hidden) el vendedor que inició sesión. Esto **no depende del tier Silver de Intuit** — `ClassRef` es parte de la Accounting API estándar (a diferencia del campo nativo "Sales Rep", que sí requiere Custom Fields API / tier Silver, $300/mes — bloqueado, ver sección Pendiente).
+
+### Backend ✅
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 58.1 | `findAllClasses()` — consulta `select * from Class` en QBO | `src/services/qbClasses.ts` (nuevo) | ✅ |
+| 58.2 | `GET /api/qb/classes` (auth + adminOnly) — devuelve `[{id, name, active}]` | `qbController.ts` + `routes/quickbooks.ts` | ✅ |
+| 58.3 | Columna `qb_class_id VARCHAR(50) NULL` en `users` | `schema.sql` + migración aplicada en MySQL local | ✅ |
+| 58.4 | `register()` acepta y guarda `qb_class_id` al crear usuario | `authController.ts` | ✅ |
+| 58.5 | `updateUser()` acepta y guarda `qb_class_id`; `listUsers()` lo incluye en el SELECT | `userController.ts` | ✅ |
+| 58.6 | CORS soporta múltiples orígenes separados por coma (`ALLOWED_ORIGIN`) — fix necesario para dev local (webapp en :3001 cuando :3000 ya lo usa el backend) | `src/index.ts` | ✅ |
+
+### Webapp ✅
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 58.7 | Selector "QBO Class (vendedor)" en formulario de crear usuario — carga opciones desde `GET /api/qb/classes` | `UsersClient.tsx` | ✅ |
+| 58.8 | Mismo selector en el formulario de editar usuario, precargado con la Class actual | `UsersClient.tsx` | ✅ |
+| 58.9 | Columna nueva en la tabla de usuarios — muestra el nombre de la Class asignada o "Unassigned" | `UsersClient.tsx` | ✅ |
+| 58.10 | `UserRow` incluye `qb_class_id` | `app/users/page.tsx` | ✅ |
+| 58.11 | Traducciones `usr_qbClass`, `usr_qbClassNone`, `usr_classesError` | `app/lib/i18n.ts` | ✅ |
+
+### 🔴 Era lo MÁS URGENTE — el paso que realmente manda la Class al invoice ✅
+
+Esto llena el campo **Class (Hidden)** dentro de QBO, en la pantalla/objeto de creación de Invoices — es un campo nativo de QBO (oculto por defecto en la vista de la transacción), no algo que se muestre en la webapp ni en Android. Se llena enviando `ClassRef` en cada línea del invoice vía la Accounting API al momento de crearlo.
+
+Solo backend — no requiere tocar la app Android (`AndroidStudioProjects/test`): Gson ignora campos desconocidos en el JSON de login y el JWT se trata ahí como string opaco, nunca se decodifica en el cliente. Tampoco requiere cambios en la webapp.
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 58.12 | JWT incluye `qb_class_id` del usuario al hacer login (mismo patrón que `name`, Fase 20). `User` interface y `JwtUser` actualizados | `jwtService.ts` + `types/index.ts` | ✅ |
+| 58.13 | `createBatch` lee `qb_class_id` del usuario logueado (`req.user`) y lo pasa a `createBatchInvoice` | `orderController.ts` | ✅ |
+| 58.14 | `createBatchInvoice` / `createInvoice` aceptan `classId?: string \| null` y agregan `ClassRef: { value: classId }` dentro de `SalesItemLineDetail` de cada línea. Si no hay `classId`, se omite — no rompe el invoice | `src/services/qbInvoices.ts` | ✅ |
+| 58.15 | **Propagado a los otros 3 flujos que también crean invoices** (no estaban en el alcance original pero usan la misma función): `createOrder` (pedido individual no-batch), `processPendingOrders` en `syncEngine.ts` (retry automático cada 5 min — requirió `LEFT JOIN users` para obtener `qb_class_id` del autor original del pedido), `convertPreOrder` en `preOrderController.ts` | `orderController.ts`, `syncEngine.ts`, `preOrderController.ts` | ✅ |
+
+`npx/bunx tsc --noEmit` no muestra errores nuevos introducidos por estos cambios (los 7 errores preexistentes en `qbController.ts`/`qbAuth.ts`/`qbItems.ts`/`middleware/auth.ts` son de código no tocado en esta fase).
+
+### Bloqueante operativo (no de código)
+
+- El token OAuth de QBO sandbox local expiró (`invalid_grant`) — hay que reconectar en `http://localhost:3000/api/qb/auth` antes de poder probar el selector con datos reales o las próximas tareas (58.12-58.14).
+- En producción (cPanel) falta correr la migración `ALTER TABLE users ADD COLUMN IF NOT EXISTS qb_class_id VARCHAR(50) NULL AFTER role;` y subir el build de backend + webapp.
+
+### Key Decisions
+
+- El vínculo usuario↔Class es por **Id**, no por nombre — el campo `name` del usuario no necesita coincidir con el nombre de la Class en QBO (aunque se recomienda para evitar confusión al revisar invoices).
+- Las Classes se crean manualmente en QBO (Configuración → Todas las listas → Clases) — no vale la pena un endpoint de creación para un setup de una sola vez por vendedor.
+- Si un usuario no tiene `qb_class_id` asignado, el invoice se crea igual sin `ClassRef` — nunca bloquea el flujo de venta.
+
+---
+
+## Fase 59: Fix crash en arranque — EncryptedSharedPreferences corrupta ✅
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 59.1 | App crasheaba al abrir (`RuntimeException: Unable to start activity LoginActivity` → `javax.crypto.AEADBadTagException` → `KeyStoreException: Signature/MAC verification failed`). Ocurría en `BaseActivity.attachBaseContext()` → `SecurePreferences.getLanguage()` → creación de `EncryptedSharedPreferences` | `SecurePreferences.kt` | ✅ |
+| 59.2 | `createEncryptedPrefs()` ahora envuelve `EncryptedSharedPreferences.create()` en try/catch por `GeneralSecurityException`. Si falla, borra el archivo `secure_prefs` corrupto (`context.deleteSharedPreferences`) y reintenta una vez, creando el archivo desde cero | `SecurePreferences.kt` | ✅ |
+
+**Causa raíz:** la clave AES en el Android Keystore que protege `secure_prefs` quedó inválida para el dispositivo (la operación de descifrado siempre falla con `VERIFICATION_FAILED`, código interno de Keystore -30), mientras que el archivo cifrado en disco seguía intacto. Pasa típicamente tras un restore de backup del sistema, cambio de firma de la app, o corrupción del Keystore tras una actualización de Android — el master key ya no puede descifrar el keyset de Tink que protege los valores guardados.
+
+**Efecto secundario esperado:** al recrear el archivo se pierde el JWT/refreshToken/backend URL/etc. guardados localmente — el usuario debe volver a iniciar sesión una vez. No hay forma de recuperar esos datos si la clave del Keystore está corrupta; la app simplemente ya no crashea en el arranque.
+
+---
+
 ## Pendiente / Mejoras futuras
 
 ### Android
@@ -1648,6 +1715,8 @@ Requisitos de seguridad obligatorios para publicar en el QuickBooks App Store. R
 
 | Prioridad | Feature | Detalle |
 |---|---|---|
+| ✅ | ~~**Class por vendedor en invoices QBO**~~ | Completado en Fase 58 — `ClassRef` se envía en cada línea de todo invoice creado (batch, individual, retry de SyncEngine, pre-órdenes). Pendiente solo reconectar OAuth sandbox local para probar con datos reales y correr la migración `qb_class_id` en cPanel. |
+| Bloqueado | **Sales Rep / vendedor en Bill To — invoices QBO** | Mostrar el nombre del vendedor en el campo nativo "Sales Rep" o como custom field dentro de la sección "Bill To" (ambos usan el mismo Custom Fields API, categoría "Transaction") requiere **Premium APIs**, disponible solo desde tier **Silver** ($300/mes) del Intuit App Partner Program — confirmado en el *Intuit App Partner Program Guide* oficial v1.2 (03/2026), tabla "Build Benefits": Premium APIs = N/A en Builder, ✔ desde Silver en adelante (no requiere Gold/Platinum). App actual en tier Builder; el dueño de la empresa debe activarlo en developer.intuit.com (nosotros solo tenemos rol "Developer" ahí, sin acceso a billing). **Workaround interino mientras se aprueba:** escribir el nombre del vendedor en `PrivateNote` del invoice (campo nativo del API, no visible al cliente). |
 | ✅ | ~~**Rate limiting en login**~~ | Completado en Fase 14 |
 | ✅ | ~~**Endpoint `/api/stats` dedicado**~~ | Completado en Fase 15 |
 | ✅ | ~~**Gestión de usuarios**~~ | Completado en Fase 11 |

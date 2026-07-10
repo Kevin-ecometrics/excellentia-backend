@@ -32,7 +32,7 @@ export async function createOrder(req: Request, res: Response): Promise<void> {
 
       if (qbItemId) {
         const [orderRows] = await pool.query('SELECT * FROM orders WHERE id = ?', [orderId]) as any[];
-        const invoice = await createInvoice(orderRows[0], qbItemId);
+        const invoice = await createInvoice(orderRows[0], qbItemId, req.user?.qb_class_id ?? null);
         const invoiceId = invoice.Invoice?.Id;
 
         await pool.query(
@@ -218,7 +218,7 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
       const validItems = inserted.filter(i => i.qb_item_id) as { id: number; qb_item_id: string; product_name: string; price: number; quantity: number; total: number }[];
 
       if (validItems.length > 0) {
-        const invoice = await createBatchInvoice(validItems, customer_id ?? null, damage_items ?? [], payment_method ?? null);
+        const invoice = await createBatchInvoice(validItems, customer_id ?? null, damage_items ?? [], payment_method ?? null, req.user?.qb_class_id ?? null);
         const invoiceId = invoice.Invoice?.Id;
 
         await pool.query(

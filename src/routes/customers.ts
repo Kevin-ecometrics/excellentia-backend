@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import pool from '../db/connection.ts';
-import { makeQboApiCall } from '../services/qbAuth.ts';
+import { paginatedQuery } from '../services/qbAuth.ts';
 import { auth } from '../middleware/auth.ts';
 import { adminOnly } from '../middleware/adminOnly.ts';
 import logger from '../services/logger.ts';
@@ -34,11 +34,7 @@ async function ensureTable() {
 }
 
 async function fetchFromQb(): Promise<any[]> {
-  const query = encodeURIComponent('select * from Customer where Active = true MAXRESULTS 200');
-  const data = await makeQboApiCall(
-    `/v3/company/${process.env.REALM_ID ?? ''}/query?query=${query}`
-  );
-  return (data as any)?.QueryResponse?.Customer ?? [];
+  return paginatedQuery('select * from Customer where Active = true', 'Customer');
 }
 
 async function refreshCache(customers: any[]) {

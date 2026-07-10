@@ -1,6 +1,7 @@
 import type { Request, Response } from 'express';
 import pool from '../db/connection.ts';
 import { findAllItems } from '../services/qbItems.ts';
+import { findAllClasses } from '../services/qbClasses.ts';
 import { oauthClient, getAuthUri, handleCallback, saveTokensToDb } from '../services/qbAuth.ts';
 import logger from '../services/logger.ts';
 
@@ -41,6 +42,18 @@ export async function qbCallback(req: Request, res: Response): Promise<void> {
   } catch (err) {
     logger.error('qbCallback error:', err);
     res.status(500).json({ error: 'Error en callback OAuth de QuickBooks' });
+  }
+}
+
+export async function listQbClasses(_req: Request, res: Response): Promise<void> {
+  try {
+    const classes = await findAllClasses();
+    res.json({
+      data: classes.map((c: any) => ({ id: c.Id, name: c.Name, active: c.Active })),
+    });
+  } catch (err) {
+    logger.error('listQbClasses error:', err);
+    res.status(500).json({ error: 'Error consultando Classes en QuickBooks' });
   }
 }
 

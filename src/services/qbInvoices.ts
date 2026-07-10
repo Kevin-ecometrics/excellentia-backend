@@ -3,11 +3,18 @@ import type { Order } from '../types/index.ts';
 
 const DEFAULT_CUSTOMER_REF = process.env.QB_DEFAULT_CUSTOMER_ID ?? '2';
 
-export async function createInvoice(order: Order, qbItemId: string): Promise<any> {
+export async function createInvoice(order: Order, qbItemId: string, classId?: string | null): Promise<any> {
   if (!oauthClient.isAccessTokenValid()) {
     await refreshToken();
   }
   const desc = `${order.product_name} - ${order.quantity} lb a $${Number(order.price).toFixed(2)}/lb`;
+  const salesItemLineDetail: Record<string, any> = {
+    ItemRef: { value: qbItemId },
+    Qty: 1,
+    UnitPrice: Number(order.total),
+  };
+  if (classId) salesItemLineDetail.ClassRef = { value: classId };
+
   const response = await oauthClient.makeApiCall({
     url: `/v3/company/${process.env.REALM_ID}/invoice`,
     method: 'POST',
@@ -17,11 +24,7 @@ export async function createInvoice(order: Order, qbItemId: string): Promise<any
           DetailType: 'SalesItemLineDetail',
           Amount: Number(order.total),
           Description: desc,
-          SalesItemLineDetail: {
-            ItemRef: { value: qbItemId },
-            Qty: 1,
-            UnitPrice: Number(order.total),
-          },
+          SalesItemLineDetail: salesItemLineDetail,
         },
       ],
       CustomerRef: { value: order.customer_id ?? DEFAULT_CUSTOMER_REF },
@@ -36,21 +39,26 @@ export async function createBatchInvoice(
   items: { qb_item_id: string; product_name: string; price: number; quantity: number; total: number }[],
   customerId?: string | null,
   damageItems: DamageItem[] = [],
-  paymentMethod?: string | null
+  paymentMethod?: string | null,
+  classId?: string | null
 ): Promise<any> {
   if (!oauthClient.isAccessTokenValid()) {
     await refreshToken();
   }
-  const lines: any[] = items.map(item => ({
-    DetailType: 'SalesItemLineDetail' as const,
-    Amount: Number(item.total),
-    Description: `${item.product_name} - ${item.quantity} lb a $${Number(item.price).toFixed(2)}/lb`,
-    SalesItemLineDetail: {
+  const lines: any[] = items.map(item => {
+    const salesItemLineDetail: Record<string, any> = {
       ItemRef: { value: item.qb_item_id },
       Qty: 1,
       UnitPrice: Number(item.total),
-    },
-  }));
+    };
+    if (classId) salesItemLineDetail.ClassRef = { value: classId };
+    return {
+      DetailType: 'SalesItemLineDetail' as const,
+      Amount: Number(item.total),
+      Description: `${item.product_name} - ${item.quantity} lb a $${Number(item.price).toFixed(2)}/lb`,
+      SalesItemLineDetail: salesItemLineDetail,
+    };
+  });
 
   const body: Record<string, any> = {
     Line: lines,

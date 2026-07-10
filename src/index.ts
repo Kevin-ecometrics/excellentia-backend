@@ -41,9 +41,9 @@ const port = parseInt(process.env.PORT ?? '3000');
 
 app.use(helmet());
 
-const allowedOrigin = process.env.ALLOWED_ORIGIN;
-app.use(cors(allowedOrigin
-  ? { origin: allowedOrigin, credentials: true }
+const allowedOrigins = process.env.ALLOWED_ORIGIN?.split(',').map(o => o.trim());
+app.use(cors(allowedOrigins
+  ? { origin: allowedOrigins, credentials: true }
   : { credentials: true }
 ));
 app.use(express.json({ limit: '10mb' }));
