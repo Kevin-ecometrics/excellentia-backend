@@ -3,7 +3,7 @@ import type { Order } from '../types/index.ts';
 
 const DEFAULT_CUSTOMER_REF = process.env.QB_DEFAULT_CUSTOMER_ID ?? '2';
 
-export async function createInvoice(order: Order, qbItemId: string, classId?: string | null): Promise<any> {
+export async function createInvoice(order: Order, qbItemId: string, classId?: string | null, docNumber?: number): Promise<any> {
   if (!oauthClient.isAccessTokenValid()) {
     await refreshToken();
   }
@@ -28,6 +28,7 @@ export async function createInvoice(order: Order, qbItemId: string, classId?: st
         },
       ],
       CustomerRef: { value: order.customer_id ?? DEFAULT_CUSTOMER_REF },
+      ...(docNumber && { DocNumber: String(docNumber) }),
     },
   });
   return response.json;
@@ -40,7 +41,8 @@ export async function createBatchInvoice(
   customerId?: string | null,
   damageItems: DamageItem[] = [],
   paymentMethod?: string | null,
-  classId?: string | null
+  classId?: string | null,
+  docNumber?: number
 ): Promise<any> {
   if (!oauthClient.isAccessTokenValid()) {
     await refreshToken();
@@ -63,6 +65,7 @@ export async function createBatchInvoice(
   const body: Record<string, any> = {
     Line: lines,
     CustomerRef: { value: customerId ?? DEFAULT_CUSTOMER_REF },
+    ...(docNumber && { DocNumber: String(docNumber) }),
   };
 
   const memoLines: string[] = [];

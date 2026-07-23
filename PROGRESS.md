@@ -1,6 +1,6 @@
 # Excellentia — Progreso del Proyecto
 
-> Estado actual: **Fase 58 ✅ — Class por vendedor en invoices QBO: selección + envío al invoice completos (Backend + Webapp). Falta reconectar OAuth sandbox local para probar con datos reales y correr migración en cPanel**
+> Estado actual: **Fase 62 ✅ — Case QTY (unidades por caja) en Android**
 
 ---
 
@@ -110,6 +110,18 @@
 | **Fase 56** | Seguridad Intuit App Store | **100%** ✅ |
 | **Fase 57** | QBO Sync confiable + Paginación + Búsqueda server-side | **100%** ✅ |
 | **Fase 58** | Class por vendedor en invoices QBO — selección de vendedor + ClassRef en invoice (Backend + Webapp) | **100%** ✅ |
+| **Fase 59** | Fix paginación customers QB — `fetchFromQb()` usa `paginatedQuery()` con `entityType='Customer'` y loop `MAXRESULTS 1000`, eliminando el límite de 200 | **100%** ✅ |
+
+---
+
+## Fase 59: Fix paginación customers QB ✅
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 59.1 | `paginatedQuery()` ahora acepta `entityType` (default `'Item'`) — `data.QueryResponse?.[entityType]` en vez de hardcodear `Item` | `src/services/qbAuth.ts:291` | ✅ |
+| 59.2 | `fetchFromQb()` simplificado a `paginatedQuery('select * from Customer where Active = true', 'Customer')` — sin límite fijo, trae todos los customers activos paginando de a 1000 | `src/routes/customers.ts:36-38` | ✅ |
 
 ---
 
@@ -123,7 +135,7 @@
 | 4.2 | `POST /api/orders/batch` acepta `customer_id` / `customer_name` | ✅ |
 | 4.3 | `createBatchInvoice` y `createInvoice` usan `customer_id` del pedido | ✅ |
 | 4.4 | `QB_DEFAULT_CUSTOMER_ID` en `.env` como fallback (default `'2'`) | ✅ |
-| 4.5 | `GET /api/customers` protegido con JWT, solo clientes activos (MAXRESULTS 200) | ✅ |
+| 4.5 | `GET /api/customers` protegido con JWT, solo clientes activos con paginación completa (MAXRESULTS 1000) | ✅ |
 | 4.6 | `Order` interface actualizada con `customer_id` y `customer_name` | ✅ |
 
 ### Android
@@ -1687,6 +1699,119 @@ Solo backend — no requiere tocar la app Android (`AndroidStudioProjects/test`)
 
 ---
 
+## Fase 60: Campo UNIT en productos (Lbs / Unit / Bucket / Case) ✅
+
+### DB
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 60.1 | `ALTER TABLE products ADD COLUMN unit VARCHAR(20) DEFAULT NULL AFTER stock` — columna para almacenar la unidad de medida del producto (Lbs, Unit, Bucket, Case). Default NULL hasta que se asigne manualmente | MySQL (producción) | ✅ |
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 60.2 | Interfaz `Product` — agregado campo `unit: string \| null` | `src/types/index.ts` | ✅ |
+| 60.3 | `createProduct` — recibe `unit` del body y lo guarda en INSERT | `src/controllers/productController.ts` | ✅ |
+| 60.4 | `updateProduct` — recibe `unit` del body y lo incluye en UPDATE dinámico | `src/controllers/productController.ts` | ✅ |
+| 60.5 | DDL tabla `products` — agregado `unit VARCHAR(20) DEFAULT NULL` | `src/db/schema.sql` | ✅ |
+
+### Webapp
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 60.6 | Interfaz `Product` en frontend — agregado `unit: string \| null` | `app/products/page.tsx` | ✅ |
+| 60.7 | Modal de producto — select desplegable con Lbs / Unit / Bucket / Case | `ProductModal.tsx` | ✅ |
+| 60.8 | Traducciones ES/EN para campo `unit` | `app/lib/i18n.ts` | ✅ |
+
+### SQL
+
+```sql
+ALTER TABLE products ADD COLUMN unit VARCHAR(20) DEFAULT NULL AFTER stock;
+```
+
+---
+
+## Fase 61: Campo QTY (unidades por empaque) + Simulador de Factura ✅
+
+### DB
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 61.1 | `ALTER TABLE products ADD COLUMN qty INT NOT NULL DEFAULT 0 AFTER weight_per_unit` — unidades por empaque (e.g., 6 yogurts per Case). Default 0. | `src/db/schema.sql`, `excellentia_schema.sql` | ✅ |
+| 61.2 | Misma columna en CREATE TABLE de setup | `src/routes/setup.ts` | ✅ |
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 61.3 | Interfaz `Product` — agregado `qty: number` | `src/types/index.ts` | ✅ |
+| 61.4 | `createProduct` — recibe `qty` del body y lo incluye en INSERT | `src/controllers/productController.ts` | ✅ |
+| 61.5 | `updateProduct` — recibe `qty` del body y lo incluye en UPDATE dinámico | `src/controllers/productController.ts` | ✅ |
+
+### Webapp
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 61.6 | Interfaz `Product` — agregado `qty: number` | `app/products/page.tsx` | ✅ |
+| 61.7 | Columna QTY fija en tabla de productos (muestra `product.qty`) | `ProductRow.tsx` | ✅ |
+| 61.8 | Input `qty` en modal de edición de producto | `ProductModal.tsx` | ✅ |
+| 61.9 | **Modo Factura** — botón toggle que activa inputs editables de QTY y Rate en cada fila, columna Amount calculada (QTY × Rate), step dinámico según UNIT (Lbs=0.01, otros=1) | `ProductsClient.tsx`, `ProductRow.tsx` | ✅ |
+| 61.10 | Barra azul de resumen — muestra cantidad de items y total $ en modo factura | `ProductsClient.tsx` | ✅ |
+| 61.11 | Traducciones ES/EN para `qty`, `rate`, `amount`, modo factura | `app/lib/i18n.ts` | ✅ |
+
+### SQL
+
+```sql
+ALTER TABLE products ADD COLUMN qty INT NOT NULL DEFAULT 0 AFTER weight_per_unit;
+```
+
+---
+
+## Fase 62: Case QTY (unidades por caja) en Android ✅
+
+### DB
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 62.1 | `case_qty INT DEFAULT NULL` en `products` — unidades dentro de una caja (e.g., 8 lalas per Case). | `src/db/schema.sql`, `excellentia_schema.sql`, `src/routes/setup.ts` | ✅ |
+| 62.2 | Interface `Product` — agregado `caseQty?: number` | `src/types/index.ts` | ✅ |
+
+### Android — Data layer
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 62.3 | `Product`, `ProductDto`, `CachedProductEntity` — campo `caseQty` con `@SerializedName("case_qty")` | `data/Models.kt`, `data/local/entities/CachedProductEntity.kt` | ✅ |
+| 62.4 | `ProductRepository` — mapear `caseQty` en cache y `fromCache()` | `data/repository/ProductRepository.kt` | ✅ |
+| 62.5 | `OrderRepository` — mapear `caseQty` en `syncAllProducts()` | `data/repository/OrderRepository.kt` | ✅ |
+| 62.6 | `ProductDao` — `case_qty` en `upsert()` y `cursorToEntity()` | `data/local/dao/ProductDao.kt` | ✅ |
+| 62.7 | `AppDatabase` — migration v10 + columna en `onCreate()` | `data/local/AppDatabase.kt` | ✅ |
+
+### Android — ProductDetailActivity
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 62.8 | Nuevo modo **Case**: `isCaseBased` cuando `unit == "Case"` y `caseQty > 0`. Prioridad: Case → Weight → Count | `ProductDetailActivity.kt` | ✅ |
+| 62.9 | Display: `"$X.XX / Case"` en precio, breakdown `"N case(s) = N×M units"` en subtítulo | `ProductDetailActivity.kt` | ✅ |
+| 62.10 | Cálculo: `baseTotal = productPrice × caseQty` (precio por caja). Total = `cases × casePrice` | `ProductDetailActivity.kt` | ✅ |
+| 62.11 | Fallback: si `caseQty` no viene del API, usa `product.qty` (default quantity) como inferencia | `ProductDetailActivity.kt` | ✅ |
+
+### Android — Intents
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 62.12 | `MainActivity` — `SuggestionItem` + `openDetail()` + `openSuggestion()` pasan `CASE_QTY` | `MainActivity.kt` | ✅ |
+| 62.13 | `CreatePreOrderActivity` — `launchProductDetail()` acepta y pasa `caseQty` | `CreatePreOrderActivity.kt` | ✅ |
+
+### SQL
+
+```sql
+ALTER TABLE products ADD COLUMN case_qty INT DEFAULT NULL AFTER unit;
+UPDATE products SET case_qty = 8 WHERE unit = 'Case' AND name LIKE '%Lala%';
+```
+
+---
+
 ## Pendiente / Mejoras futuras
 
 ### Android
@@ -1725,11 +1850,11 @@ Solo backend — no requiere tocar la app Android (`AndroidStudioProjects/test`)
 | ✅ | ~~**Log de actividad**~~ | Completado en Fase 16 |
 | ✅ | ~~**Exportar CSV**~~ | Completado en Fase 16 |
 | ✅ | ~~**Configuración de empresa dinámica**~~ | Completado en Fase 17 (backend + webapp) |
-| Alta | **Sistema de créditos por damage — backend** | Tabla `customer_credits` + endpoint para generar/aplicar créditos. Prerequisito: `units_per_case` en productos. Decidir si Credit Memos van a QB o solo en MySQL |
+| Alta | **Sistema de créditos por damage — backend** | Tabla `customer_credits` + endpoint para generar/aplicar créditos. Prerequisito: `case_qty` en productos ✅ (Fase 62). Decidir si Credit Memos van a QB o solo en MySQL |
 | Alta | **Endpoint stats operadores del día** | Query SQL sobre `orders` de hoy agrupada por `user_id` con total pedidos, ingresos y último pedido. Alimenta la tabla de operadores del dashboard |
 | Media | **Producción QBO** | Cambiar `ENVIRONMENT=production`, actualizar `REDIRECT_URI`/`DASHBOARD_URL`/`DISCONNECTED_URL`, registrar URLs en Intuit Developer Console, reconectar empresa real de QuickBooks via `/api/qb/auth` |
 | Media | **Webhook QB → backend** | Recibir notificaciones de QB cuando se crea/edita un producto directamente en QB. Elimina necesidad de "Sincronizar QB" manual. Requiere registrar endpoint en Intuit Developer Console |
-| Media | **Credit Memos QB** | Crear Credit Memos en QB cuando se registra damage. Parte del sistema de créditos por damage. Depende de `units_per_case` y tabla `customer_credits` |
+| Media | **Credit Memos QB** | Crear Credit Memos en QB cuando se registra damage. Parte del sistema de créditos por damage. Depende de `case_qty` ✅ (Fase 62) y tabla `customer_credits` |
 | Media | **Email resumen diario** | Enviar resumen automático al admin con pedidos del día, ingresos totales y operadores activos. Bloqueado hasta tener SMTP |
 
 ### Webapp
@@ -1739,7 +1864,7 @@ Solo backend — no requiere tocar la app Android (`AndroidStudioProjects/test`)
 | Alta | **Imágenes de productos** | Agregar columna `image_url` a `products` en MySQL. Subir imágenes a Cloudinary/cPanel. Mostrar thumbnail en `ProductRow.tsx` y preview en `ProductModal.tsx`. Input para subir/pegar URL de imagen en el modal de edición. |
 | Alta | **Dashboard semi-realtime (polling)** | Polling cada 30s en KPIs, actividad reciente y gráfica de pedidos por hora. Top 5 y gráfica de 7 días solo se refrescan al cambiar filtro de período. Opción SSE descartada por limitaciones de cPanel/Passenger. |
 | Alta | **Dashboard — tabla de operadores del día** | Sección nueva en dashboard (solo admin) con tabla: Operador / Pedidos hoy / Total $ / Último pedido. Incluir "último visto" usando `activity_log`. Online en tiempo real descartado — requeriría heartbeat en Android y backend. |
-| Alta | **Unidades por caja en productos** | Agregar campo `units_per_case` a tabla `products` y al modal de edición de productos. Campo opcional, sin impacto en QB. Prerequisito para el sistema de créditos por damage. |
+| ✅ | ~~**Unidades por caja en productos**~~ | Completado en Fase 62 — `case_qty` en backend + Android (ProductDetailActivity modo Case) |
 | Alta | **Sistema de créditos por damage** | Damage reportado genera crédito al cliente. Prerequisitos: (1) `units_per_case` en productos, (2) definir cálculo del crédito (¿por unidad? ¿por peso?), (3) decidir si Credit Memos van a QB o solo en MySQL. Requiere tabla `customer_credits` + endpoint nuevo. |
 | Media | **Alerta de stock bajo** | Badge/indicador rojo en productos con stock ≤ 5 en la página de productos. Ya existe el dato, mínimo esfuerzo. |
 | Media | **Historial de créditos por cliente** | Página o sección en `/customers` mostrando créditos generados, aplicados y saldo disponible por cliente. Depende del sistema de créditos. |

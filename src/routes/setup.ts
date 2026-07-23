@@ -37,6 +37,9 @@ router.get('/', async (_req: Request, res: Response) => {
         hidden          TINYINT(1) NOT NULL DEFAULT 0,
         description     TEXT NULL,
         weight_per_unit DECIMAL(10,2) NULL,
+        unit            VARCHAR(20) DEFAULT NULL,
+        case_qty        INT DEFAULT NULL,
+        qty             INT NOT NULL DEFAULT 0,
         qb_item_id      VARCHAR(50),
         created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -151,8 +154,9 @@ router.get('/', async (_req: Request, res: Response) => {
         subtitle     VARCHAR(255) NOT NULL DEFAULT 'Ticket de Venta',
         address      VARCHAR(255) DEFAULT NULL,
         phone        VARCHAR(50) DEFAULT NULL,
-        city         VARCHAR(100) DEFAULT NULL,
-        updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        city            VARCHAR(100) DEFAULT NULL,
+        invoice_counter INT NOT NULL DEFAULT 51551,
+        updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
       `CREATE TABLE IF NOT EXISTS pre_orders (
         id             INT AUTO_INCREMENT PRIMARY KEY,
@@ -185,7 +189,7 @@ router.get('/', async (_req: Request, res: Response) => {
     // ── 2. Fila única en company_settings ────────────────────────────────────
     const [[settingsRow]] = await pool.query('SELECT COUNT(*) as n FROM company_settings') as any[];
     if (settingsRow.n === 0) {
-      await pool.query("INSERT INTO company_settings (company_name, subtitle) VALUES ('EXCELLENTIA', 'Ticket de Venta')");
+      await pool.query("INSERT INTO company_settings (company_name, subtitle, invoice_counter) VALUES ('EXCELLENTIA', 'Ticket de Venta', 51551)");
       log.push('✅ company_settings inicializado');
     } else {
       log.push('ℹ️  company_settings ya existe');

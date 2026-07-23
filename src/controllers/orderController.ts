@@ -31,8 +31,12 @@ export async function createOrder(req: Request, res: Response): Promise<void> {
       const qbItemId = productRows[0]?.qb_item_id;
 
       if (qbItemId) {
+        const [[{ invoice_counter }]] = await pool.query(
+          'SELECT invoice_counter FROM company_settings WHERE id = 1'
+        ) as any[];
+
         const [orderRows] = await pool.query('SELECT * FROM orders WHERE id = ?', [orderId]) as any[];
-        const invoice = await createInvoice(orderRows[0], qbItemId, req.user?.qb_class_id ?? null);
+        const invoice = await createInvoice(orderRows[0], qbItemId, req.user?.qb_class_id ?? null, invoice_counter);
         const invoiceId = invoice.Invoice?.Id;
 
         await pool.query(
@@ -45,8 +49,14 @@ export async function createOrder(req: Request, res: Response): Promise<void> {
           [orderId, invoiceId ?? null]
         );
 
+        if (invoiceId) {
+          await pool.query(
+            'UPDATE company_settings SET invoice_counter = invoice_counter + 1 WHERE id = 1'
+          );
+        }
+
         status = 'SENT';
-        logger.info(`Pedido ${orderId} sincronizado a QBO al instante`);
+        logger.info(`Pedido ${orderId} sincronizado a QBO al instante (#${invoice_counter})`);
       } else {
         logger.warn(`Producto ${barcode} sin qb_item_id, pedido ${orderId} queda PENDING`);
       }
@@ -218,7 +228,16 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
       const validItems = inserted.filter(i => i.qb_item_id) as { id: number; qb_item_id: string; product_name: string; price: number; quantity: number; total: number }[];
 
       if (validItems.length > 0) {
-        const invoice = await createBatchInvoice(validItems, customer_id ?? null, damage_items ?? [], payment_method ?? null, req.user?.qb_class_id ?? null);
+        // Leer y reservar número de factura
+        const [[{ invoice_counter }]] = await pool.query(
+          'SELECT invoice_counter FROM company_settings WHERE id = 1'
+        ) as any[];
+        const docNumber = invoice_counter;
+
+        const invoice = await createBatchInvoice(
+          validItems, customer_id ?? null, damage_items ?? [],
+          payment_method ?? null, req.user?.qb_class_id ?? null, docNumber
+        );
         const invoiceId = invoice.Invoice?.Id;
 
         await pool.query(
@@ -233,7 +252,14 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
           );
         }
 
-        logger.info(`Batch ${batchId} enviado a QBO, invoice ${invoiceId}`);
+        // Incrementar contador SOLO si QBO respondió con Id
+        if (invoiceId) {
+          await pool.query(
+            'UPDATE company_settings SET invoice_counter = invoice_counter + 1 WHERE id = 1'
+          );
+        }
+
+        logger.info(`Batch ${batchId} enviado a QBO, invoice ${invoiceId} (#${docNumber})`);
       } else {
         logger.warn(`Batch ${batchId}: ningún item tiene qb_item_id, quedan PENDING`);
       }
@@ -246,14 +272,20 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
         [batchId]
       ) as any[];
 
+      // Leer el invoice_counter actual (ya incrementado si QBO ok)
+      const [[{ invoice_counter: currentCounter }]] = await pool.query(
+        'SELECT invoice_counter FROM company_settings WHERE id = 1'
+      ) as any[];
+
       res.status(201).json({
         batchId,
         invoiceId: firstOrder?.qb_invoice_id ?? null,
+        invoiceNumber: firstOrder?.qb_invoice_id ? currentCounter - 1 : null,
         orders: inserted.map(i => ({ id: i.id, barcode: i.barcode, status: i.qb_item_id ? 'SENT' : 'PENDING' })),
       });
     } catch (syncErr) {
       logger.warn(`Batch ${batchId}: sync falló, items quedan PENDING para SyncEngine:`, syncErr);
-      res.status(201).json({ batchId, invoiceId: null, orders: inserted.map(i => ({ id: i.id, barcode: i.barcode, status: 'PENDING' })) });
+      res.status(201).json({ batchId, invoiceId: null, invoiceNumber: null, orders: inserted.map(i => ({ id: i.id, barcode: i.barcode, status: 'PENDING' })) });
     }
   } catch (err) {
     logger.error('createBatch error:', err);

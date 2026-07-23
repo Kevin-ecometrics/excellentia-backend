@@ -21,6 +21,9 @@ export interface Product {
   stock: number;
   hidden: number;
   description: string | null;
+  unit: string | null;
+  caseQty: number | null;
+  qty: number;
   weight_per_unit: number | null;
   qb_item_id: string | null;
   created_at: Date;

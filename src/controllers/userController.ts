@@ -60,6 +60,18 @@ export async function updateUser(req: Request, res: Response): Promise<void> {
   }
 }
 
+export async function listSalespersons(_req: Request, res: Response): Promise<void> {
+  try {
+    const [rows] = await pool.query(
+      'SELECT id, name FROM users WHERE name IS NOT NULL ORDER BY name'
+    ) as any[];
+    res.json({ data: rows });
+  } catch (err) {
+    logger.error('listSalespersons error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
 export async function deleteUser(req: Request, res: Response): Promise<void> {
   try {
     const id = String(req.params.id);

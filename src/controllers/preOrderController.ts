@@ -4,7 +4,7 @@ import logger from '../services/logger.ts';
 import { createBatchInvoice } from '../services/qbInvoices.ts';
 
 async function ensureTables() {
-  await pool.query("CREATE TABLE IF NOT EXISTS pre_orders (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, customer_id VARCHAR(100) NOT NULL, customer_name VARCHAR(255) NOT NULL, scheduled_date DATE, notes TEXT, status ENUM('DRAFT','CONFIRMED','CONVERTED','CANCELLED') DEFAULT 'DRAFT', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
+  await pool.query("CREATE TABLE IF NOT EXISTS pre_orders (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, customer_id VARCHAR(100) NOT NULL, customer_name VARCHAR(255) NOT NULL, salesperson_name VARCHAR(255) DEFAULT NULL, scheduled_date DATE, notes TEXT, status ENUM('DRAFT','CONFIRMED','CONVERTED','CANCELLED') DEFAULT 'DRAFT', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pre_order_items (
       id           INT AUTO_INCREMENT PRIMARY KEY,
@@ -22,15 +22,15 @@ async function ensureTables() {
 export async function createPreOrder(req: Request, res: Response): Promise<void> {
   await ensureTables();
   try {
-    const { customer_id, customer_name, scheduled_date, notes, items } = req.body;
+    const { customer_id, customer_name, salesperson_name, scheduled_date, notes, items } = req.body;
     if (!customer_id || !customer_name || !Array.isArray(items) || items.length === 0) {
       res.status(400).json({ error: 'customer_id, customer_name e items son requeridos' });
       return;
     }
 
     const [result] = await pool.query(
-      'INSERT INTO pre_orders (user_id, customer_id, customer_name, scheduled_date, notes) VALUES (?, ?, ?, ?, ?)',
-      [req.user?.id ?? null, customer_id, customer_name, scheduled_date ?? null, notes ?? null]
+      'INSERT INTO pre_orders (user_id, customer_id, customer_name, salesperson_name, scheduled_date, notes) VALUES (?, ?, ?, ?, ?, ?)',
+      [req.user?.id ?? null, customer_id, customer_name, salesperson_name ?? null, scheduled_date ?? null, notes ?? null]
     ) as any;
     const preOrderId = result.insertId;
 
@@ -59,7 +59,7 @@ export async function listPreOrders(req: Request, res: Response): Promise<void> 
     const offset = (pageNum - 1) * limitNum;
 
     let query = `
-      SELECT p.id, p.user_id, p.customer_id, p.customer_name, p.scheduled_date,
+      SELECT p.id, p.user_id, p.customer_id, p.customer_name, p.salesperson_name, p.scheduled_date,
              p.notes, p.status, p.created_at, p.updated_at,
              COUNT(pi.id) AS item_count,
              COALESCE(SUM(pi.total), 0) AS total
@@ -108,12 +108,13 @@ export async function updatePreOrder(req: Request, res: Response): Promise<void>
   await ensureTables();
   try {
     const { id } = req.params;
-    const { scheduled_date, notes, items, status } = req.body;
+    const { scheduled_date, notes, items, status, salesperson_name } = req.body;
 
     const updates: string[] = ['updated_at = NOW()'];
     const updateParams: any[] = [];
-    if (scheduled_date !== undefined) { updates.push('scheduled_date = ?'); updateParams.push(scheduled_date); }
-    if (notes       !== undefined)   { updates.push('notes = ?');           updateParams.push(notes); }
+    if (scheduled_date    !== undefined) { updates.push('scheduled_date = ?');    updateParams.push(scheduled_date); }
+    if (notes             !== undefined) { updates.push('notes = ?');             updateParams.push(notes); }
+    if (salesperson_name  !== undefined) { updates.push('salesperson_name = ?');  updateParams.push(salesperson_name); }
     if (status      !== undefined)   { updates.push('status = ?');          updateParams.push(status); }
     updateParams.push(id);
 
@@ -225,18 +226,27 @@ export async function convertPreOrder(req: Request, res: Response): Promise<void
     await pool.query("UPDATE pre_orders SET status = 'CONVERTED' WHERE id = ?", [id]);
 
     let invoiceId: string | null = null;
+    let invoiceNumber: number | null = null;
     try {
       const validItems = inserted.filter(i => i.qb_item_id) as { id: number; qb_item_id: string; product_name: string; price: number; quantity: number; total: number }[];
       if (validItems.length > 0) {
-        const invoice = await createBatchInvoice(validItems, preOrder.customer_id, damage_items ?? [], payment_method ?? null, req.user?.qb_class_id ?? null);
+        const [[{ invoice_counter }]] = await pool.query(
+          'SELECT invoice_counter FROM company_settings WHERE id = 1'
+        ) as any[];
+
+        const invoice = await createBatchInvoice(validItems, preOrder.customer_id, damage_items ?? [], payment_method ?? null, req.user?.qb_class_id ?? null, invoice_counter);
         invoiceId = invoice.Invoice?.Id ?? null;
+        if (invoiceId) {
+          invoiceNumber = invoice_counter;
+          await pool.query('UPDATE company_settings SET invoice_counter = invoice_counter + 1 WHERE id = 1');
+        }
         await pool.query("UPDATE orders SET status = 'SENT', qb_invoice_id = ? WHERE batch_id = ?", [invoiceId, batchId]);
       }
     } catch (syncErr) {
       logger.warn(`convertPreOrder batch ${batchId}: sync a QBO falló, queda PENDING`, syncErr);
     }
 
-    res.status(201).json({ batchId, invoiceId, preOrderId: id });
+    res.status(201).json({ batchId, invoiceId, invoiceNumber, preOrderId: id });
   } catch (err) {
     logger.error('convertPreOrder error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });

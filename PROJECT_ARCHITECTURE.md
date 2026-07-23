@@ -138,6 +138,9 @@ CREATE TABLE products (
     brand           VARCHAR(100),
     stock           INT DEFAULT 0,
     weight_per_unit DECIMAL(10,2) NULL,
+    unit            VARCHAR(20) DEFAULT NULL,
+    case_qty        INT DEFAULT NULL,
+    qty             INT NOT NULL DEFAULT 0,
     qb_item_id      VARCHAR(50),
     hidden          TINYINT(1) NOT NULL DEFAULT 0,  -- 1 = oculto (no aparece en lista ni scanner)
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

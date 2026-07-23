@@ -40,7 +40,10 @@ CREATE TABLE IF NOT EXISTS `products` (
     `stock`           INT DEFAULT 0,
     `hidden`          TINYINT(1) NOT NULL DEFAULT 0,
     `description`     TEXT NULL,
+    `unit`            VARCHAR(20) DEFAULT NULL,
+    `case_qty`        INT DEFAULT NULL,
     `weight_per_unit` DECIMAL(10,2) NULL,
+    `qty`             INT NOT NULL DEFAULT 0,
     `qb_item_id`      VARCHAR(50),
     `created_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     `updated_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -196,36 +199,39 @@ CREATE TABLE IF NOT EXISTS `cached_customers` (
 
 -- -----------------------------------------------------------------------------
 -- 13. company_settings
--- Fila única (id=1) — nombre empresa, subtítulo, dirección, tel, ciudad
+-- Fila única (id=1) — nombre empresa, subtítulo, dirección, tel, ciudad, disclaimer
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `company_settings` (
-    `id`           INT AUTO_INCREMENT PRIMARY KEY,
-    `company_name` VARCHAR(255) NOT NULL DEFAULT 'EXCELLENTIA',
-    `subtitle`     VARCHAR(255) NOT NULL DEFAULT 'Ticket de Venta',
-    `address`      VARCHAR(255) DEFAULT NULL,
-    `phone`        VARCHAR(50) DEFAULT NULL,
-    `city`         VARCHAR(100) DEFAULT NULL,
-    `updated_at`   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    `id`              INT AUTO_INCREMENT PRIMARY KEY,
+    `company_name`    VARCHAR(255) NOT NULL DEFAULT 'EXCELLENTIA',
+    `subtitle`        VARCHAR(255) NOT NULL DEFAULT 'Ticket de Venta',
+    `address`         VARCHAR(255) DEFAULT NULL,
+    `phone`           VARCHAR(50) DEFAULT NULL,
+    `city`            VARCHAR(100) DEFAULT NULL,
+    `disclaimer`      TEXT DEFAULT NULL,
+    `invoice_counter` INT NOT NULL DEFAULT 51551,
+    `updated_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Fila por defecto
-INSERT IGNORE INTO `company_settings` (`id`, `company_name`, `subtitle`)
-VALUES (1, 'EXCELLENTIA', 'Ticket de Venta');
+INSERT IGNORE INTO `company_settings` (`id`, `company_name`, `subtitle`, `invoice_counter`)
+VALUES (1, 'EXCELLENTIA', 'Ticket de Venta', 51551);
 
 -- -----------------------------------------------------------------------------
 -- 14. pre_orders
 -- (depende de users por user_id, sin FK para evitar restricciones en conversión)
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `pre_orders` (
-    `id`             INT AUTO_INCREMENT PRIMARY KEY,
-    `user_id`        INT,
-    `customer_id`    VARCHAR(100) NOT NULL,
-    `customer_name`  VARCHAR(255) NOT NULL,
-    `scheduled_date` DATE,
-    `notes`          TEXT,
-    `status`         ENUM('DRAFT','CONFIRMED','CONVERTED','CANCELLED') DEFAULT 'DRAFT',
-    `created_at`     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    `updated_at`     TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    `id`               INT AUTO_INCREMENT PRIMARY KEY,
+    `user_id`          INT,
+    `customer_id`      VARCHAR(100) NOT NULL,
+    `customer_name`    VARCHAR(255) NOT NULL,
+    `salesperson_name` VARCHAR(255) DEFAULT NULL,
+    `scheduled_date`   DATE,
+    `notes`            TEXT,
+    `status`           ENUM('DRAFT','CONFIRMED','CONVERTED','CANCELLED') DEFAULT 'DRAFT',
+    `created_at`       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`       TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- -----------------------------------------------------------------------------
@@ -263,7 +269,14 @@ ALTER TABLE orders DROP COLUMN IF EXISTS signature;
 ALTER TABLE products ADD COLUMN IF NOT EXISTS hidden TINYINT(1) NOT NULL DEFAULT 0 AFTER stock;
 
 -- =============================================================================
--- Fin del schema — 15 tablas + migración Fase 48
+-- Migración — Fase 61: secuencia de factura
+-- Para bases existentes (ejecutar una sola vez)
+-- =============================================================================
+
+ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS invoice_counter INT NOT NULL DEFAULT 51551;
+
+-- =============================================================================
+-- Fin del schema — 15 tablas + migración Fase 48 + Fase 61
 -- =============================================================================
 SET FOREIGN_KEY_CHECKS = 1;
 SET FOREIGN_KEY_CHECKS = 1;

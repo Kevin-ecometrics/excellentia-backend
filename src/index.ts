@@ -136,7 +136,7 @@ app.use((req, res, next) => {
 // Frontend estático (Next.js export)
 const webappDir = process.env.WEBAPP_DIR
   ? path.resolve(process.env.WEBAPP_DIR)
-  : path.resolve('../excellentia-webapp/out');
+  : path.resolve('../excellentia-webapp/out_build');
 
 if (fs.existsSync(webappDir)) {
   app.use(express.static(webappDir, { extensions: ['html'] }));

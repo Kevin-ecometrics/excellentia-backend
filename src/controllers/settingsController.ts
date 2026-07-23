@@ -12,6 +12,7 @@ async function ensureTable() {
       address VARCHAR(255) DEFAULT NULL,
       phone VARCHAR(50) DEFAULT NULL,
       city VARCHAR(100) DEFAULT NULL,
+      disclaimer TEXT DEFAULT NULL,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     )
   `);
@@ -36,14 +37,14 @@ export async function getSettings(_req: Request, res: Response): Promise<void> {
 export async function updateSettings(req: Request, res: Response): Promise<void> {
   try {
     await ensureTable();
-    const { company_name, subtitle, address, phone, city } = req.body;
+    const { company_name, subtitle, address, phone, city, disclaimer } = req.body;
     if (!company_name?.trim()) {
       res.status(400).json({ error: 'El nombre de la empresa es requerido' });
       return;
     }
     await pool.query(
       `UPDATE company_settings SET
-        company_name = ?, subtitle = ?, address = ?, phone = ?, city = ?
+        company_name = ?, subtitle = ?, address = ?, phone = ?, city = ?, disclaimer = ?
        WHERE id = 1`,
       [
         company_name.trim(),
@@ -51,6 +52,7 @@ export async function updateSettings(req: Request, res: Response): Promise<void>
         address?.trim() || null,
         phone?.trim() || null,
         city?.trim() || null,
+        disclaimer?.trim() || null,
       ]
     );
     logActivity({
