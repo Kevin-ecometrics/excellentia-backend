@@ -94,6 +94,7 @@ export async function syncProducts(_req: Request, res: Response): Promise<void> 
         const barcode = item.Sku?.trim() || `QBO-${item.Id}`;
         const category = item.IncomeAccountRef?.name ?? null;
         const description = item.Description ?? null;
+        const active = item.Active === false ? 0 : 1;
         const [existing] = await pool.query(
           'SELECT id FROM products WHERE qb_item_id = ?',
           [item.Id]
@@ -101,14 +102,14 @@ export async function syncProducts(_req: Request, res: Response): Promise<void> 
 
         if (existing.length > 0) {
           await pool.query(
-            'UPDATE products SET name = ?, price = ?, stock = ?, category = ?, description = ?, updated_at = NOW() WHERE qb_item_id = ?',
-            [item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, category, description, item.Id]
+            'UPDATE products SET name = ?, price = ?, stock = ?, category = ?, description = ?, qb_active = ?, updated_at = NOW() WHERE qb_item_id = ?',
+            [item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, category, description, active, item.Id]
           );
           updated++;
         } else {
           await pool.query(
-            'INSERT INTO products (barcode, name, price, stock, qb_item_id, category, description) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            [barcode, item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, item.Id, category, description]
+            'INSERT INTO products (barcode, name, price, stock, qb_item_id, category, description, qb_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            [barcode, item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, item.Id, category, description, active]
           );
           inserted++;
         }

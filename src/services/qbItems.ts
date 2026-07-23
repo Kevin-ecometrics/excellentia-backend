@@ -1,11 +1,14 @@
 import { paginatedQuery, oauthClient, refreshToken } from './qbAuth.ts';
 
+// QBO por defecto excluye los items inactivos de las consultas — sin
+// "Active IN (true, false)" explícito, un item desactivado simplemente deja
+// de aparecer en los resultados, en vez de venir con Active = false.
 export async function findAllItems(): Promise<any[]> {
-  return paginatedQuery('select * from Item');
+  return paginatedQuery('select * from Item WHERE Active IN (true, false)');
 }
 
 export async function findItemsUpdatedSince(since: string): Promise<any[]> {
-  return paginatedQuery(`select * from Item WHERE Metadata.LastUpdatedTime > '${since}'`);
+  return paginatedQuery(`select * from Item WHERE Metadata.LastUpdatedTime > '${since}' AND Active IN (true, false)`);
 }
 
 async function getInventoryAccountRefs(): Promise<{ income: any; asset: any; expense: any } | null> {

@@ -60,7 +60,8 @@ export async function getStats(req: Request, res: Response): Promise<void> {
           (SELECT COALESCE(SUM(total),0) FROM orders WHERE status='SENT' ${userFilter}) AS revenue_total,
           (SELECT COUNT(*) FROM orders WHERE status='PENDING' ${userFilter}) AS pending,
           (SELECT COUNT(*) FROM orders WHERE status='SENT' ${userFilter}) AS sent,
-          (SELECT COUNT(*) FROM orders WHERE status='FAILED' ${userFilter}) AS failed
+          (SELECT COUNT(*) FROM orders WHERE status='FAILED' ${userFilter}) AS failed,
+          (SELECT COALESCE(SUM(amount),0) FROM customer_credits WHERE DATE(created_at) BETWEEN '${from}' AND '${to}') AS credits_period
       `),
       // Pedidos por hora
       pool.query(`
@@ -140,6 +141,7 @@ export async function getStats(req: Request, res: Response): Promise<void> {
         pending:       Number(k.pending),
         sent:          Number(k.sent),
         failed:        Number(k.failed),
+        creditsPeriod: Number(k.credits_period),
       },
       byHour: byHourFull,
       byDay:  byDayFull,

@@ -2,6 +2,7 @@ import type { Request, Response } from 'express';
 import pool from '../db/connection.ts';
 import logger from '../services/logger.ts';
 import { createBatchInvoice } from '../services/qbInvoices.ts';
+import { computeDamageCredit } from '../services/creditCalculator.ts';
 
 async function ensureTables() {
   await pool.query("CREATE TABLE IF NOT EXISTS pre_orders (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, customer_id VARCHAR(100) NOT NULL, customer_name VARCHAR(255) NOT NULL, salesperson_name VARCHAR(255) DEFAULT NULL, scheduled_date DATE, notes TEXT, status ENUM('DRAFT','CONFIRMED','CONVERTED','CANCELLED') DEFAULT 'DRAFT', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
@@ -214,12 +215,26 @@ export async function convertPreOrder(req: Request, res: Response): Promise<void
       }
     }
 
+    let creditsTotal = 0;
     if (Array.isArray(damage_items)) {
-      for (const dmg of (damage_items as any[]).filter(d => Number(d.qty) > 0)) {
-        await pool.query(
-          'INSERT INTO batch_damage (batch_id, barcode, product_name, qty) VALUES (?, ?, ?, ?)',
-          [batchId, String(dmg.barcode), String(dmg.product_name), Number(dmg.qty)]
+      const toInsert = (damage_items as any[]).filter(d => Number(d.qty) > 0);
+      if (toInsert.length > 0) {
+        const { rows: computed, creditsTotal: total } = await computeDamageCredit(
+          toInsert.map(d => ({ barcode: String(d.barcode), product_name: String(d.product_name), qty: Number(d.qty) }))
         );
+        creditsTotal = total;
+        for (const dmg of computed) {
+          await pool.query(
+            'INSERT INTO batch_damage (batch_id, barcode, product_name, qty, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?)',
+            [batchId, dmg.barcode, dmg.product_name, dmg.qty, dmg.unit_price, dmg.amount]
+          );
+        }
+        if (creditsTotal > 0) {
+          await pool.query(
+            'INSERT INTO customer_credits (customer_id, customer_name, batch_id, amount) VALUES (?, ?, ?, ?)',
+            [preOrder.customer_id ?? null, preOrder.customer_name ?? null, batchId, creditsTotal]
+          );
+        }
       }
     }
 
@@ -234,7 +249,7 @@ export async function convertPreOrder(req: Request, res: Response): Promise<void
           'SELECT invoice_counter FROM company_settings WHERE id = 1'
         ) as any[];
 
-        const invoice = await createBatchInvoice(validItems, preOrder.customer_id, damage_items ?? [], payment_method ?? null, req.user?.qb_class_id ?? null, invoice_counter);
+        const invoice = await createBatchInvoice(validItems, preOrder.customer_id, damage_items ?? [], payment_method ?? null, req.user?.qb_class_id ?? null, invoice_counter, creditsTotal);
         invoiceId = invoice.Invoice?.Id ?? null;
         if (invoiceId) {
           invoiceNumber = invoice_counter;
@@ -246,7 +261,7 @@ export async function convertPreOrder(req: Request, res: Response): Promise<void
       logger.warn(`convertPreOrder batch ${batchId}: sync a QBO falló, queda PENDING`, syncErr);
     }
 
-    res.status(201).json({ batchId, invoiceId, invoiceNumber, preOrderId: id });
+    res.status(201).json({ batchId, invoiceId, invoiceNumber, preOrderId: id, creditsTotal });
   } catch (err) {
     logger.error('convertPreOrder error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });

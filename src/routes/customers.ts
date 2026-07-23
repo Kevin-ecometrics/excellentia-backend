@@ -119,7 +119,7 @@ router.post('/refresh', auth, adminOnly, async (_req: Request, res: Response) =>
   }
 });
 
-// GET /api/customers/stats — clientes con totales de pedidos enviados
+// GET /api/customers/stats — clientes con totales de pedidos enviados + créditos emitidos
 router.get('/stats', auth, adminOnly, async (_req: Request, res: Response) => {
   try {
     await ensureTable();
@@ -129,12 +129,43 @@ router.get('/stats', auth, adminOnly, async (_req: Request, res: Response) => {
         o.customer_name,
         COUNT(DISTINCT o.batch_id) AS batch_count,
         COALESCE(SUM(o.total), 0) AS total_spent,
-        MAX(o.created_at) AS last_order_at
+        MAX(o.created_at) AS last_order_at,
+        COALESCE(cc.total_credits, 0) AS total_credits
       FROM orders o
+      LEFT JOIN (
+        SELECT customer_id, SUM(amount) AS total_credits
+        FROM customer_credits
+        WHERE customer_id IS NOT NULL
+        GROUP BY customer_id
+      ) cc ON cc.customer_id = o.customer_id
       WHERE o.customer_id IS NOT NULL AND o.status = 'SENT'
-      GROUP BY o.customer_id, o.customer_name
+      GROUP BY o.customer_id, o.customer_name, cc.total_credits
       ORDER BY total_spent DESC
     `) as any[];
+    res.json({ data: rows });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Error';
+    res.status(500).json({ error: message });
+  }
+});
+
+// GET /api/customers/:customerId/credits — historial de créditos por daño de un cliente
+router.get('/:customerId/credits', auth, async (req: Request, res: Response) => {
+  try {
+    const { customerId } = req.params;
+    const [rows] = await pool.query(
+      `SELECT cc.batch_id, cc.amount, cc.created_at, o.invoice_id
+       FROM customer_credits cc
+       LEFT JOIN (
+         SELECT batch_id, MAX(qb_invoice_id) AS invoice_id
+         FROM orders
+         WHERE qb_invoice_id IS NOT NULL
+         GROUP BY batch_id
+       ) o ON o.batch_id = cc.batch_id
+       WHERE cc.customer_id = ?
+       ORDER BY cc.created_at DESC`,
+      [customerId]
+    ) as any[];
     res.json({ data: rows });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Error';

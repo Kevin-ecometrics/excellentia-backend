@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS `products` (
     `weight_per_unit` DECIMAL(10,2) NULL,
     `qty`             INT NOT NULL DEFAULT 0,
     `qb_item_id`      VARCHAR(50),
+    `qb_active`       TINYINT(1) NULL DEFAULT NULL,
     `created_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     `updated_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -97,6 +98,8 @@ CREATE TABLE IF NOT EXISTS `orders` (
     `status`        ENUM('PENDING', 'SENT', 'FAILED', 'CANCELLED') DEFAULT 'PENDING',
     `error_log`     TEXT,
     `retry_count`   INT DEFAULT 0,
+    `unit`          VARCHAR(20) NULL,
+    `case_qty`      INT NULL,
     `created_at`    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     `updated_at`    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (`device_id`) REFERENCES `devices`(`id`),
@@ -141,8 +144,27 @@ CREATE TABLE IF NOT EXISTS `batch_damage` (
     `barcode`      VARCHAR(100) NOT NULL,
     `product_name` VARCHAR(255) NOT NULL,
     `qty`          INT NOT NULL DEFAULT 0,
+    `unit_price`   DECIMAL(10,2) NULL,
+    `amount`       DECIMAL(10,2) NULL,
     `created_at`   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     INDEX `idx_batch_damage_batch_id` (`batch_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- -----------------------------------------------------------------------------
+-- 8b. customer_credits
+-- Ledger de créditos generados por daño — una fila por batch con crédito.
+-- Fundamento para reportes/saldo por cliente a futuro; el crédito de esta
+-- fase siempre se aplica de inmediato al mismo batch que lo generó.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `customer_credits` (
+    `id`            INT AUTO_INCREMENT PRIMARY KEY,
+    `customer_id`   VARCHAR(64) NULL,
+    `customer_name` VARCHAR(255) NULL,
+    `batch_id`      VARCHAR(100) NOT NULL,
+    `amount`        DECIMAL(10,2) NOT NULL,
+    `created_at`    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX `idx_customer_credits_batch` (`batch_id`),
+    INDEX `idx_customer_credits_customer` (`customer_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- -----------------------------------------------------------------------------

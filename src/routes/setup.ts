@@ -111,8 +111,20 @@ router.get('/', async (_req: Request, res: Response) => {
         barcode      VARCHAR(100) NOT NULL,
         product_name VARCHAR(255) NOT NULL,
         qty          INT NOT NULL DEFAULT 0,
+        unit_price   DECIMAL(10,2) NULL,
+        amount       DECIMAL(10,2) NULL,
         created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         INDEX idx_batch_damage_batch_id (batch_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+      `CREATE TABLE IF NOT EXISTS customer_credits (
+        id            INT AUTO_INCREMENT PRIMARY KEY,
+        customer_id   VARCHAR(64) NULL,
+        customer_name VARCHAR(255) NULL,
+        batch_id      VARCHAR(100) NOT NULL,
+        amount        DECIMAL(10,2) NOT NULL,
+        created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_customer_credits_batch (batch_id),
+        INDEX idx_customer_credits_customer (customer_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
       `CREATE TABLE IF NOT EXISTS batch_signatures (
         batch_id   VARCHAR(100) PRIMARY KEY,
@@ -221,6 +233,11 @@ router.get('/', async (_req: Request, res: Response) => {
       ["ALTER TABLE users ADD COLUMN IF NOT EXISTS refresh_token_expires_at BIGINT NULL",               "users.refresh_token_expires_at agregada"],
       ["ALTER TABLE qb_tokens ADD COLUMN IF NOT EXISTS realm_id VARCHAR(50)",                           "qb_tokens.realm_id agregada"],
       ["ALTER TABLE qb_tokens ADD COLUMN IF NOT EXISTS token_created_at BIGINT NULL",                   "qb_tokens.token_created_at agregada"],
+      ["ALTER TABLE products ADD COLUMN IF NOT EXISTS qb_active TINYINT(1) NULL DEFAULT NULL AFTER qb_item_id", "products.qb_active agregada"],
+      ["ALTER TABLE orders ADD COLUMN IF NOT EXISTS unit VARCHAR(20) NULL", "orders.unit agregada"],
+      ["ALTER TABLE orders ADD COLUMN IF NOT EXISTS case_qty INT NULL", "orders.case_qty agregada"],
+      ["ALTER TABLE batch_damage ADD COLUMN IF NOT EXISTS unit_price DECIMAL(10,2) NULL", "batch_damage.unit_price agregada"],
+      ["ALTER TABLE batch_damage ADD COLUMN IF NOT EXISTS amount DECIMAL(10,2) NULL", "batch_damage.amount agregada"],
     ];
     for (const [sql, label] of migrations) {
       try {

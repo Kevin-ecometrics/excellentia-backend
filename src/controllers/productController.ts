@@ -4,6 +4,14 @@ import { AppError } from '../types/index.ts';
 import logger from '../services/logger.ts';
 import { updateItemQtyOnHand, updateItemMeta } from '../services/qbItems.ts';
 
+// mysql2 devuelve TINYINT(1) como number (0/1), no como boolean JS/JSON.
+// Android (Gson, Boolean estricto) tira excepción al parsear un número donde
+// espera true/false — rompe silenciosamente cualquier response que incluya
+// qb_active sin normalizar (findByBarcode, búsqueda por nombre, etc).
+function normalizeQbActive<T extends { qb_active?: unknown }>(row: T): T {
+  return { ...row, qb_active: row.qb_active == null ? null : !!row.qb_active };
+}
+
 export async function listProducts(req: Request, res: Response): Promise<void> {
   try {
     const page = parseInt(req.query.page as string) || 1;
@@ -14,7 +22,9 @@ export async function listProducts(req: Request, res: Response): Promise<void> {
     const stock = req.query.stock as string;
     const offset = (page - 1) * limit;
 
-    const conditions: string[] = ['hidden = 0'];
+    // qb_active = 0 → el item está inactivo/borrado en QuickBooks. NULL significa
+    // "nunca sincronizado desde que existe este campo" y no se excluye.
+    const conditions: string[] = ['hidden = 0', '(qb_active IS NULL OR qb_active = 1)'];
     const params: any[] = [];
 
     if (search) {
@@ -49,7 +59,7 @@ export async function listProducts(req: Request, res: Response): Promise<void> {
     const [countResult] = await pool.query(countQuery, params) as any[];
 
     res.json({
-      data: rows,
+      data: (rows as any[]).map(normalizeQbActive),
       meta: {
         page,
         limit,
@@ -66,7 +76,7 @@ export async function listProducts(req: Request, res: Response): Promise<void> {
 export async function listCategories(_req: Request, res: Response): Promise<void> {
   try {
     const [rows] = await pool.query(
-      'SELECT DISTINCT category FROM products WHERE hidden = 0 AND category IS NOT NULL ORDER BY category'
+      "SELECT DISTINCT category FROM products WHERE hidden = 0 AND (qb_active IS NULL OR qb_active = 1) AND category IS NOT NULL ORDER BY category"
     ) as any[];
     res.json({ data: rows.map((r: any) => r.category) });
   } catch (err) {
@@ -78,12 +88,15 @@ export async function listCategories(_req: Request, res: Response): Promise<void
 export async function getProductByBarcode(req: Request, res: Response): Promise<void> {
   try {
     const { barcode } = req.params;
-    const [rows] = await pool.query('SELECT * FROM products WHERE barcode = ? AND hidden = 0', [barcode]) as any[];
+    const [rows] = await pool.query(
+      'SELECT * FROM products WHERE barcode = ? AND hidden = 0 AND (qb_active IS NULL OR qb_active = 1)',
+      [barcode]
+    ) as any[];
     if (rows.length === 0) {
       res.status(404).json({ error: 'Producto no encontrado' });
       return;
     }
-    res.json({ data: rows[0] });
+    res.json({ data: normalizeQbActive(rows[0]) });
   } catch (err) {
     logger.error('getProductByBarcode error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });

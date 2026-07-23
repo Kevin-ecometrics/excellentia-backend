@@ -54,6 +54,8 @@ export interface Order {
   status: 'PENDING' | 'SENT' | 'FAILED' | 'CANCELLED';
   error_log: string | null;
   retry_count: number;
+  unit: string | null;
+  case_qty: number | null;
   created_at: Date;
   updated_at: Date;
 }

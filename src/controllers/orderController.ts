@@ -1,8 +1,23 @@
 import type { Request, Response } from 'express';
 import pool from '../db/connection.ts';
 import { createInvoice, createBatchInvoice } from '../services/qbInvoices.ts';
+import { computeDamageCredit } from '../services/creditCalculator.ts';
 import logger from '../services/logger.ts';
 import { logActivity } from '../services/activityLog.ts';
+
+// intuit-oauth solo expone en `.message` el texto genérico de QBO
+// ("A business validation error has occurred..."). El motivo real queda en
+// `.description` (o `.fault.errors[0].detail`), que es lo que de verdad sirve
+// para diagnosticar (factura duplicada, item inactivo, cliente inválido, etc).
+function extractQboErrorMessage(err: unknown): string {
+  if (err && typeof err === 'object') {
+    const e = err as any;
+    const detail = e.fault?.errors?.[0]?.detail || e.description;
+    const base = e.message || 'Error desconocido';
+    return detail && detail !== base ? `${base} — ${detail}` : base;
+  }
+  return 'Error desconocido';
+}
 
 export async function createOrder(req: Request, res: Response): Promise<void> {
   try {
@@ -78,7 +93,7 @@ export async function listOrders(req: Request, res: Response): Promise<void> {
     const limitNum = parseInt(limit as string) || 20;
     const offset = (pageNum - 1) * limitNum;
 
-    let query = 'SELECT o.id, o.barcode, o.product_name, o.price, o.quantity, o.total, o.status, o.batch_id, o.qb_invoice_id, o.device_id, o.user_id, o.customer_id, o.customer_name, o.created_at, u.email AS user_email, u.name AS user_name FROM orders o LEFT JOIN users u ON o.user_id = u.id WHERE 1=1';
+    let query = 'SELECT o.id, o.barcode, o.product_name, o.price, o.quantity, o.total, o.status, o.batch_id, o.qb_invoice_id, o.device_id, o.user_id, o.customer_id, o.customer_name, o.unit, o.case_qty, o.created_at, u.email AS user_email, u.name AS user_name FROM orders o LEFT JOIN users u ON o.user_id = u.id WHERE 1=1';
     const params: any[] = [];
 
     if (req.user?.role === 'operator') { query += ' AND o.user_id = ?'; params.push(req.user.id); }
@@ -157,7 +172,7 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
     const inserted: { id: number; barcode: string; product_name: string; price: number; quantity: number; total: number; qb_item_id: string | null }[] = [];
 
     for (const item of items) {
-      const { barcode, product_name, price, quantity, total } = item;
+      const { barcode, product_name, price, quantity, total, unit, case_qty } = item;
       const [productRows] = await pool.query('SELECT qb_item_id, min_price, weight_per_unit FROM products WHERE barcode = ?', [barcode]) as any[];
       const product = productRows[0];
       const qbItemId = product?.qb_item_id ?? null;
@@ -174,8 +189,8 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
       }
 
       const [result] = await pool.query(
-        "INSERT INTO orders (barcode, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')",
-        [barcode, product_name, price, quantity, total ?? price * quantity, batchId, req.user?.id ?? null, customer_id ?? null, customer_name ?? null]
+        "INSERT INTO orders (barcode, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name, unit, case_qty, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')",
+        [barcode, product_name, price, quantity, total ?? price * quantity, batchId, req.user?.id ?? null, customer_id ?? null, customer_name ?? null, unit ?? null, case_qty ?? null]
       ) as any;
       inserted.push({ id: result.insertId, barcode, product_name, price, quantity, total: total ?? price * quantity, qb_item_id: qbItemId });
     }
@@ -203,19 +218,32 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
       }
     }
 
-    // Guardar damage items en batch_damage
+    // Guardar damage items en batch_damage — calcula el crédito en dólares
+    // (fresco desde products, nunca desde un precio mandado por el cliente),
+    // lo persiste por línea, y deja un registro agregado en customer_credits.
     logger.info(`[damage] batch=${batchId} damage_items recibidos: ${JSON.stringify(damage_items)}`);
+    let creditsTotal = 0;
     if (Array.isArray(damage_items) && damage_items.length > 0) {
       const toInsert = (damage_items as any[]).filter(d => Number(d.qty) > 0);
       logger.info(`[damage] a insertar: ${toInsert.length} items con qty>0`);
       try {
-        for (const dmg of toInsert) {
+        const { rows: computed, creditsTotal: total } = await computeDamageCredit(
+          toInsert.map(d => ({ barcode: String(d.barcode), product_name: String(d.product_name), qty: Number(d.qty) }))
+        );
+        creditsTotal = total;
+        for (const dmg of computed) {
           await pool.query(
-            'INSERT INTO batch_damage (batch_id, barcode, product_name, qty) VALUES (?, ?, ?, ?)',
-            [batchId, String(dmg.barcode), String(dmg.product_name), Number(dmg.qty)]
+            'INSERT INTO batch_damage (batch_id, barcode, product_name, qty, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?)',
+            [batchId, dmg.barcode, dmg.product_name, dmg.qty, dmg.unit_price, dmg.amount]
           );
         }
-        logger.info(`[damage] ${toInsert.length} damage item(s) guardados en batch_damage`);
+        if (creditsTotal > 0) {
+          await pool.query(
+            'INSERT INTO customer_credits (customer_id, customer_name, batch_id, amount) VALUES (?, ?, ?, ?)',
+            [customer_id ?? null, customer_name ?? null, batchId, creditsTotal]
+          );
+        }
+        logger.info(`[damage] ${computed.length} damage item(s) guardados en batch_damage, credit total $${creditsTotal.toFixed(2)}`);
       } catch (dmgErr: any) {
         logger.warn(`[damage] ERROR al guardar: ${dmgErr.message}`);
       }
@@ -236,7 +264,7 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
 
         const invoice = await createBatchInvoice(
           validItems, customer_id ?? null, damage_items ?? [],
-          payment_method ?? null, req.user?.qb_class_id ?? null, docNumber
+          payment_method ?? null, req.user?.qb_class_id ?? null, docNumber, creditsTotal
         );
         const invoiceId = invoice.Invoice?.Id;
 
@@ -282,10 +310,11 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
         invoiceId: firstOrder?.qb_invoice_id ?? null,
         invoiceNumber: firstOrder?.qb_invoice_id ? currentCounter - 1 : null,
         orders: inserted.map(i => ({ id: i.id, barcode: i.barcode, status: i.qb_item_id ? 'SENT' : 'PENDING' })),
+        creditsTotal,
       });
     } catch (syncErr) {
       logger.warn(`Batch ${batchId}: sync falló, items quedan PENDING para SyncEngine:`, syncErr);
-      res.status(201).json({ batchId, invoiceId: null, invoiceNumber: null, orders: inserted.map(i => ({ id: i.id, barcode: i.barcode, status: 'PENDING' })) });
+      res.status(201).json({ batchId, invoiceId: null, invoiceNumber: null, orders: inserted.map(i => ({ id: i.id, barcode: i.barcode, status: 'PENDING' })), creditsTotal });
     }
   } catch (err) {
     logger.error('createBatch error:', err);
@@ -340,7 +369,7 @@ export async function getBatchDamage(req: Request, res: Response): Promise<void>
   try {
     const { batchId } = req.params;
     const [damageRows] = await pool.query(
-      'SELECT barcode, product_name, qty FROM batch_damage WHERE batch_id = ? AND qty > 0 ORDER BY id',
+      'SELECT barcode, product_name, qty, unit_price, amount FROM batch_damage WHERE batch_id = ? AND qty > 0 ORDER BY id',
       [batchId]
     ) as any[];
     const [sigRows] = await pool.query(
@@ -350,6 +379,141 @@ export async function getBatchDamage(req: Request, res: Response): Promise<void>
     res.json({ data: damageRows, signature: sigRows[0]?.signature ?? null });
   } catch (err) {
     res.json({ data: [], signature: null });
+  }
+}
+
+// Reintento manual desde la app: reenvía a QBO los items de un batch que
+// quedaron PENDING/FAILED. Disponible para el operador dueño del batch (no
+// solo admin), a diferencia de forceSync que solo re-encola para el
+// SyncEngine automático.
+export async function retryBatchSync(req: Request, res: Response): Promise<void> {
+  try {
+    const { batchId } = req.params;
+
+    const [orderRows] = await pool.query(
+      `SELECT o.*, p.qb_item_id, p.qb_active FROM orders o
+       LEFT JOIN products p ON o.barcode = p.barcode
+       WHERE o.batch_id = ?`,
+      [batchId]
+    ) as any[];
+
+    if (orderRows.length === 0) {
+      res.status(404).json({ error: 'Pedido no encontrado' });
+      return;
+    }
+
+    if (req.user?.role === 'operator' && orderRows.some((o: any) => o.user_id !== req.user!.id)) {
+      res.status(403).json({ error: 'No autorizado' });
+      return;
+    }
+
+    const toRetry = orderRows.filter((o: any) => o.status !== 'SENT');
+    if (toRetry.length === 0) {
+      res.json({ batchId, status: 'SENT', invoiceId: orderRows[0].qb_invoice_id ?? null });
+      return;
+    }
+
+    const missingQbItem = toRetry.filter((o: any) => !o.qb_item_id);
+    if (missingQbItem.length > 0) {
+      await pool.query(
+        "UPDATE orders SET status = 'FAILED', error_log = ? WHERE id IN (?)",
+        ['Producto sin qb_item_id en QBO', missingQbItem.map((o: any) => o.id)]
+      );
+    }
+
+    // qb_active = 0 es un estado que ya conocemos con certeza (viene del último
+    // sync); qb_active NULL significa "todavía no lo sabemos" (producto nunca
+    // re-sincronizado desde que se agregó esta columna) y no bloquea el envío.
+    const inactiveInQbo = toRetry.filter((o: any) => o.qb_item_id && o.qb_active === 0);
+    if (inactiveInQbo.length > 0) {
+      await pool.query(
+        "UPDATE orders SET status = 'FAILED', error_log = ? WHERE id IN (?)",
+        ['Item inactivo en QuickBooks — hay que reactivarlo en QBO antes de reintentar', inactiveInQbo.map((o: any) => o.id)]
+      );
+    }
+
+    const validItems = toRetry.filter((o: any) => o.qb_item_id && o.qb_active !== 0);
+    if (validItems.length === 0) {
+      if (inactiveInQbo.length > 0) {
+        res.status(400).json({ error: 'El producto está inactivo en QuickBooks. Reactivalo en QBO (Products and Services) y volvé a intentar.' });
+      } else {
+        res.status(400).json({ error: 'Ningún producto de este pedido está vinculado a QuickBooks (falta qb_item_id). Contactá al administrador.' });
+      }
+      return;
+    }
+
+    const [[{ invoice_counter }]] = await pool.query(
+      'SELECT invoice_counter FROM company_settings WHERE id = 1'
+    ) as any[];
+
+    const [damageRows] = await pool.query(
+      'SELECT barcode, product_name, qty, unit_price, amount FROM batch_damage WHERE batch_id = ? AND qty > 0',
+      [batchId]
+    ) as any[];
+    // Reusa el monto ya calculado y persistido al crear el batch — no se
+    // recalcula, para que el crédito no derive si el precio del catálogo
+    // cambió después de la venta original.
+    const creditAmount = (damageRows as any[]).reduce((sum, r) => sum + (Number(r.amount) || 0), 0);
+
+    const items = validItems.map((o: any) => ({
+      qb_item_id: o.qb_item_id,
+      product_name: o.product_name,
+      price: o.price,
+      quantity: o.quantity,
+      total: o.total,
+    }));
+
+    try {
+      const invoice = await createBatchInvoice(
+        items, validItems[0].customer_id ?? null, damageRows, null, req.user?.qb_class_id ?? null, invoice_counter, creditAmount
+      );
+      const invoiceId = invoice.Invoice?.Id;
+
+      await pool.query(
+        "UPDATE orders SET status = 'SENT', qb_invoice_id = ?, error_log = NULL WHERE id IN (?)",
+        [invoiceId ?? null, validItems.map((o: any) => o.id)]
+      );
+
+      if (invoiceId) {
+        await pool.query('UPDATE company_settings SET invoice_counter = invoice_counter + 1 WHERE id = 1');
+      }
+
+      for (const o of validItems) {
+        await pool.query(
+          "INSERT INTO sync_log (entity_type, entity_id, action, qb_status, qb_id) VALUES ('order', ?, 'create_invoice', 'SUCCESS', ?)",
+          [o.id, invoiceId ?? null]
+        );
+      }
+
+      logActivity({ userId: req.user?.id, userEmail: req.user?.email, action: 'BATCH_RETRY_SUCCESS', entityType: 'batch', entityId: String(batchId), details: `${validItems.length} items reenviados a QBO`, ip: req.ip });
+
+      res.json({
+        batchId,
+        status: 'SENT',
+        invoiceId: invoiceId ?? null,
+        invoiceNumber: invoiceId ? invoice_counter : null,
+      });
+    } catch (syncErr) {
+      const message = extractQboErrorMessage(syncErr);
+
+      await pool.query(
+        "UPDATE orders SET status = 'PENDING', error_log = ?, retry_count = 0 WHERE id IN (?)",
+        [message, validItems.map((o: any) => o.id)]
+      );
+
+      for (const o of validItems) {
+        await pool.query(
+          "INSERT INTO sync_log (entity_type, entity_id, action, qb_status, error) VALUES ('order', ?, 'create_invoice', 'FAILED', ?)",
+          [o.id, message]
+        );
+      }
+
+      logger.warn(`retryBatchSync: batch ${batchId} falló:`, syncErr);
+      res.status(502).json({ error: message });
+    }
+  } catch (err) {
+    logger.error('retryBatchSync error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
   }
 }
 

@@ -27,6 +27,11 @@ REDIRECT_URI=http://localhost:3000/api/qb/callback
 # QuickBooks — cliente por defecto para facturas sin customer seleccionado
 QB_DEFAULT_CUSTOMER_ID=2
 
+# QuickBooks — item usado para la línea negativa de créditos por daño.
+# Sin esto, el crédito se sigue calculando y guardando localmente, pero la
+# factura de QBO no incluye la línea negativa (solo el memo de texto).
+QB_CREDIT_ITEM_ID=
+
 # MySQL
 DB_HOST=localhost
 DB_PORT=3306
@@ -260,7 +265,8 @@ App → POST /api/orders/batch → MySQL
 | GET | `/api/orders` | JWT | Listar con filtros |
 | GET | `/api/orders/:id` | JWT | Detalle |
 | PUT | `/api/orders/:id/status` | JWT (admin) | Cambiar status |
-| POST | `/api/orders/:id/sync` | JWT (admin) | Forzar sync a QBO |
+| POST | `/api/orders/:id/sync` | JWT (admin) | Forzar sync a QBO (re-encola para SyncEngine, cada 5 min) |
+| POST | `/api/orders/batch/:batchId/retry` | JWT | Reintenta el envío a QBO de un batch PENDING/FAILED al instante. Disponible para el operador dueño del batch |
 
 ### Escaneos / Dispositivos / QuickBooks / Clientes
 

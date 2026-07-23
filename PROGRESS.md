@@ -1791,6 +1791,381 @@ UPDATE products SET qty = 8 WHERE unit = 'Case' AND name LIKE '%Lala%' AND (qty 
 
 ---
 
+## Fase 63: Estabilidad de carrito, impresión y migraciones (Android) ✅
+
+### Contexto
+El usuario reportó que el carrito (productos escaneados, sin finalizar) desaparecía al cerrar la app y reabrirla. La causa real no era falta de persistencia (`pending_orders` ya vive en SQLite) sino que `SyncWorker` trataba esa misma tabla como una cola de reintento legacy y la vaciaba sola en segundo plano.
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 63.1 | `SyncWorker` — eliminado el paso que reenviaba cada fila de `pending_orders` (el carrito actual) individualmente vía el endpoint legacy `createOrder()` y la borraba al tener éxito. Corría cada 15 min o al recuperar conexión, **incluso con la app cerrada**, vaciando pedidos que el usuario todavía no había finalizado (sin cliente, sin firma, sin batch). Ahora solo se sincronizan `pending_batches` (pedidos ya finalizados que no llegaron a enviarse por falta de red) | `data/sync/SyncWorker.kt` | ✅ |
+| 63.2 | `AppDatabase.onUpgrade` — el bloque `oldVersion < 3` (recrea `pending_orders` con el esquema base) corría *después* de los `ALTER TABLE` que le agregaban `customer_id`/`customer_name`/`unit` (`oldVersion < 4` y `< 8`). Un dispositivo actualizando desde una versión muy vieja directo a la actual podía crashear la migración completa (columnas desparejadas en `INSERT INTO ... SELECT *`). Reordenado para que la recreación corra primero | `data/local/AppDatabase.kt` | ✅ |
+| 63.3 | `PrintService` — la dirección del cliente en el ticket impreso se partía en la primera coma y cada mitad se truncaba con `.take(32)` en vez de hacer salto de línea; direcciones largas quedaban cortadas sin aviso. Reemplazado por el mismo `wrapText(28)` que ya usa el resto del ticket | `data/print/PrintService.kt` | ✅ |
+| 63.4 | Corregido typo `caseQtyrevisa` → `caseQty` que rompía la compilación (encontrado sin commitear en el working tree) | `ProductDetailActivity.kt` | ✅ |
+
+### SQL
+Ninguno — todos los cambios son de código Android (Kotlin), sin impacto en MySQL.
+
+---
+
+## Fase 64: Reintento manual de envío a QuickBooks (retry batch) ✅
+
+### Contexto
+En Historial no había forma de ver por qué un pedido quedaba en PENDING/FAILED ni de reintentar el envío a QBO manualmente — solo se podía esperar al `SyncEngine` automático (cada 5 min) o hacer otro pedido nuevo.
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 64.1 | `POST /api/orders/batch/:batchId/retry` — reintenta el envío a QBO de los items PENDING/FAILED de un batch. A diferencia de `forceSync` (admin-only, solo re-encola para el SyncEngine), este está disponible para el operador dueño del batch e intenta la factura al instante (mismo `createBatchInvoice` que la creación normal) | `src/controllers/orderController.ts` (`retryBatchSync`), `src/routes/orders.ts` | ✅ |
+| 64.2 | Si algún item no tiene `qb_item_id`, se marca `FAILED` con motivo explícito sin bloquear el resto del batch | `orderController.ts` | ✅ |
+| 64.3 | `extractQboErrorMessage()` — la librería `intuit-oauth` solo expone en `.message` el texto genérico de QBO ("A business validation error has occurred..."); el motivo real vive en `.description`/`.fault.errors[0].detail`, que se descartaba. Ahora se combina `mensaje — detalle` tanto en `retryBatchSync` como al guardar `error_log` | `orderController.ts` | ✅ |
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 64.4 | `ApiService.retryBatchSync` + modelo `RetryBatchResponse` + `ApiErrorBody` (parseo del mensaje de error del backend) | `data/network/ApiService.kt`, `data/Models.kt` | ✅ |
+| 64.5 | `OrderRepository.retryBatchSync(batchId)` | `data/repository/OrderRepository.kt` | ✅ |
+| 64.6 | Botón **"Resend to QuickBooks"** en `TicketDetailActivity`, junto a "Reprint ticket" — visible solo si el batch no está `SENT`. Éxito → actualiza el ticket en pantalla al instante (estado, invoice #); error → **modal** con botón "Got it" (no Snackbar) | `TicketDetailActivity.kt`, `activity_ticket_detail.xml`, `ic_sync.xml` | ✅ |
+
+### SQL
+Ninguno — no se agregaron columnas en esta fase.
+
+### Nota — causa raíz de "PENDING" en casos reales
+Durante las pruebas se identificaron dos causas de fondo, documentadas pero **no resueltas** (requieren decisión de negocio, no son bugs de código):
+1. **Productos sin barcode**: `orders.barcode = products.barcode` es un JOIN por igualdad de string. Si el producto no tiene barcode (`NULL`), el JOIN nunca matchea — ni con el retry ni con el SyncEngine — sin importar que el producto sí tenga `qb_item_id`. Origen: `syncProductsFromQbo` (sync automático, `syncEngine.ts`) inserta productos nuevos con `barcode = NULL` a secas, a diferencia del sync manual (`qbController.ts`) que sí usa `item.Sku || 'QBO-{id}'` como fallback.
+2. **Reintentar el mismo pedido tras corregir el barcode**: no alcanza con ponerle barcode al producto — hay que actualizar también `orders.barcode` de esa orden puntual para que coincida, porque quedó grabado con el valor del momento del escaneo (ej. `"unknown"`, el placeholder que usa Android cuando el producto no tiene barcode).
+
+---
+
+## Fase 65: Estado Active/Inactive de QuickBooks en productos + filtrado de productos ocultos ✅
+
+### Contexto
+Un producto puede estar **inactivo dentro de QuickBooks mismo** (distinto del campo `hidden` local) — QBO rechaza la factura con "Business validation error: you need to activate this item before updating the quantity" si se intenta facturar un item inactivo. No había forma de saber esto desde la app antes de intentar el envío. Además, la app Android mostraba productos ocultos/inactivos desde un cache local que nunca se limpiaba.
+
+### DB
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 65.1 | `ALTER TABLE products ADD COLUMN qb_active TINYINT(1) NULL DEFAULT NULL AFTER qb_item_id` — `NULL` = nunca sincronizado desde que existe la columna (no bloquea nada); `1`/`0` = estado real conocido desde el último sync | MySQL (vía `/api/setup` o SQL manual) | ✅ |
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 65.2 | `qbItems.ts` — las consultas a QBO (`findAllItems`, `findItemsUpdatedSince`) agregan `Active IN (true, false)`. Sin esto, QBO **excluye los items inactivos por defecto** de los resultados — nunca nos enterábamos de una desactivación | `src/services/qbItems.ts` | ✅ |
+| 65.3 | `syncProducts` (botón manual "Sincronizar QB") y `syncProductsFromQbo` (automático, cada 5 min en `syncEngine.ts`) — ambos capturan `item.Active` y lo guardan en `qb_active` en INSERT y UPDATE | `src/controllers/qbController.ts`, `src/services/syncEngine.ts` | ✅ |
+| 65.4 | `retryBatchSync` y `processPendingOrders` (SyncEngine) — detectan `qb_active = 0` **antes** de llamar a QBO y marcan `FAILED` con mensaje claro ("Item inactivo en QuickBooks — hay que reactivarlo...") en vez de esperar el rechazo genérico | `orderController.ts`, `syncEngine.ts` | ✅ |
+
+### Webapp
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 65.5 | `Product.qb_active` agregado a la interfaz | `app/products/page.tsx` | ✅ |
+| 65.6 | Badge QB en la tabla — 3 estados: sin vincular (gris "—"), vinculado e inactivo (rojo "QB inactivo"), vinculado y activo (verde "QB") | `ProductRow.tsx` | ✅ |
+| 65.7 | Mismo criterio en el modal de edición, con mensaje explicativo | `ProductModal.tsx` | ✅ |
+| 65.8 | Traducciones ES/EN (`prod_qbInactive`, `modal_qbInactive`) | `app/lib/i18n.ts` | ✅ |
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 65.9 | `ProductRepository.findByBarcode` — distinguía mal un 404 real (producto oculto/inexistente) de un error de red: en ambos casos caía al cache local viejo, sirviendo productos ya ocultos aunque el backend respondiera 404 fresco. Ahora un 404 limpio no cae al cache (y lo borra si estaba ahí); solo errores de red/servidor usan el cache como respaldo | `data/repository/ProductRepository.kt` | ✅ |
+| 65.10 | `OrderRepository.prefetchAllProducts` — el pre-caché offline se cortaba en los primeros 500 productos y nunca podaba productos que dejaban de venir (ocultados después). Ahora pagina el catálogo completo y, si termina sin errores, borra del cache local cualquier producto no tocado en ese barrido | `data/repository/OrderRepository.kt` | ✅ |
+| 65.11 | `cached_products` (SQLite local, v10→v11) — nuevas columnas `qb_item_id`/`qb_active`, migradas con `ALTER TABLE ... ADD COLUMN` | `data/local/AppDatabase.kt`, `data/local/dao/ProductDao.kt`, `data/local/entities/CachedProductEntity.kt` | ✅ |
+| 65.12 | `qbItemId`/`qbActive` enhebrados desde la API hasta `ProductDetailActivity`, pasando por el cache offline (online y offline se comportan igual) | `data/Models.kt`, `ProductRepository.kt`, `OrderRepository.kt`, `MainActivity.kt` (`SuggestionItem` + 5 sitios de construcción + `openDetail`/`openSuggestion`) | ✅ |
+| 65.13 | `ProductDetailActivity` — botón "Agregar al pedido" deshabilitado (mismo patrón visual que "sin stock") cuando el producto no está vinculado a QBO o está inactivo ahí, con mensaje distinto para cada caso. **No aplica en modo pre-orden** (son borradores; el vínculo a QBO solo importa al convertir) | `ProductDetailActivity.kt`, `activity_product_detail.xml` | ✅ |
+
+### SQL
+
+```sql
+ALTER TABLE products
+  ADD COLUMN IF NOT EXISTS qb_active TINYINT(1) NULL DEFAULT NULL AFTER qb_item_id;
+```
+
+### Pendiente relacionado (no resuelto en esta fase)
+- `syncProductsFromQbo` (automático) sigue insertando productos nuevos con `barcode = NULL` — inconsistente con el sync manual, que usa `item.Sku || 'QBO-{id}'`. Deja productos sin barcode que nunca pueden facturarse (ver nota en Fase 64).
+- El link `orders.barcode = products.barcode` es frágil por diseño (string equality) — un arreglo de fondo sería vincular por `product_id` en vez de barcode. Discutido, no implementado.
+
+---
+
+## Fase 66: Ocultar productos inactivos/borrados en QBO (webapp + Android) ✅
+
+### Contexto
+Tras la Fase 65, el sync trae también los items marcados "(Deleted)"/inactivos en QBO (`qb_active = 0`) — pero seguían apareciendo en la lista de productos de la webapp y en las búsquedas de la app Android (con el botón de agregar deshabilitado, per Fase 65). El usuario pidió que directamente **no se muestren en ningún lado**, ni webapp ni Android.
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 66.1 | `listProducts` — agregada condición `(qb_active IS NULL OR qb_active = 1)` junto a `hidden = 0`. `NULL` (nunca sincronizado desde que existe el campo) no se excluye | `src/controllers/productController.ts` | ✅ |
+| 66.2 | `getProductByBarcode` — misma condición. Ahora un producto con `qb_active = 0` da 404, igual que uno oculto | `productController.ts` | ✅ |
+| 66.3 | `listCategories` — misma condición, para que categorías con solo productos inactivos no aparezcan como filtro | `productController.ts` | ✅ |
+
+### Efecto en cascada (sin cambios de código adicionales)
+- **Webapp**: como `listProducts` ya no los devuelve, desaparecen solos de la tabla. El badge rojo "QB inactivo" (Fase 65) queda como código defensivo sin uso activo — no se rompe nada si en algún momento sí llega uno (ej. lag de cache).
+- **Android**: mismo efecto — `searchProducts`/`getAllProducts`/`getProductByBarcode` ya no los traen. Los fixes de la Fase 65 (`ProductRepository.findByBarcode` purga el cache en 404, `prefetchAllProducts` poda lo que no vuelve a aparecer en el barrido) hacen que además se limpien solos del cache offline en el próximo sync exitoso. El gating del botón "Agregar al pedido" (Fase 65) también queda como respaldo defensivo para la ventana entre que un producto se desactiva en QBO y el próximo sync/pruning.
+
+### SQL
+Ninguno — cambios solo en las consultas `SELECT`, no en el esquema.
+
+### Bug encontrado y arreglado — `qb_active` rompía toda búsqueda/detalle en Android
+`mysql2` devuelve `TINYINT(1)` como `number` (`0`/`1`), no como `boolean`. Android (`ProductDto.qbActive: Boolean?`, parseado con Gson estricto) tiraba excepción al recibir un número donde esperaba `true`/`false` — como esa excepción quedaba atrapada en un `try/catch` silencioso, rompía **toda la respuesta**, no solo el campo: la búsqueda por nombre no devolvía nada, y el detalle de producto caía al cache local viejo (por eso siempre mostraba "Not linked to QuickBooks" aunque el producto sí estuviera vinculado).
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 66.4 | `normalizeQbActive()` — convierte `qb_active` a booleano real (`true`/`false`/`null`) antes de responder, en vez de dejar pasar el número crudo de MySQL | `productController.ts` (`listProducts`, `getProductByBarcode`) | ✅ |
+
+---
+
+## Fase 67: Barcode obligatorio para agregar al pedido (Android) ✅
+
+### Contexto
+El matching `orders.barcode = products.barcode` (retry a QBO, SyncEngine) es la razón de fondo por la que un pedido puede quedar PENDING para siempre (ver Fase 64) — un producto sin barcode nunca puede facturarse, sin importar su `qb_item_id`/`qb_active`. Se agregó una validación proactiva en la app para bloquear el problema en el origen, en vez de descubrirlo después con el pedido ya hecho.
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 67.1 | `ProductDetailActivity` — si el producto no tiene barcode real (`barcode` vacío o `"unknown"`, el placeholder que usan `MainActivity`/`CreatePreOrderActivity` cuando no hay barcode), el botón "Agregar al pedido" se deshabilita con mensaje "No barcode assigned" — mismo patrón visual que "sin stock"/"no vinculado a QBO". **Bloquea en cualquier modo, incluido pre-orden** (a diferencia del gating de `qb_active`/`qb_item_id`, que no aplica en pre-orden) — es un problema estructural, no un estado transitorio de QBO que se pueda resolver antes de convertir | `ProductDetailActivity.kt` | ✅ |
+| 67.2 | Strings `label_no_barcode`, `btn_no_barcode` | `strings.xml` | ✅ |
+
+### SQL
+Ninguno.
+
+---
+
+## Fase 68: Ticket agrupado por categoría (LBS / CASE / UNIT / BUCKET) ✅
+
+### Contexto
+El renglón de detalle de cada ítem en el ticket (impreso y "Ver ticket" en pantalla) usaba el mismo formato decimal para todo tipo de unidad — un producto por Case mostraba `"1.00 Case x $56.00/Case"`, con decimales que no tienen sentido para algo que se vende en cajas/unidades enteras. Tampoco había ninguna separación visual entre productos por peso, por caja o por unidad cuando un pedido mezclaba tipos.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 68.1 | `ticketCategoryFor()`, `isWeightTicketCategory()`, `byTicketCategory()` — helpers compartidos que agrupan `GroupedTicketItem` por categoría (LBS, CASE, UNIT, BUCKET, u otro valor de `unit` en mayúsculas), en ese orden fijo | `data/Models.kt` | ✅ |
+| 68.2 | Renglón de detalle: **LBS** mantiene el formato con decimales (`"22.80 lb x $0.18/lb"`); **CASE/UNIT/BUCKET** usa cantidad entera con guion (`"1 - Case x $56.00"`, `"3 - Unit x $12.00"`) | `PrintService.buildCpcl()`, `TicketDetailActivity.buildReceipt()` | ✅ |
+| 68.3 | Encabezado de categoría (ej. `"CASE"`) antes de cada grupo — **solo se muestra si el pedido mezcla más de un tipo de unidad**; un ticket con un solo tipo queda igual que antes, sin encabezados de más | `PrintService.buildCpcl()`, `TicketDetailActivity.buildReceipt()` | ✅ |
+| 68.4 | Línea de cantidad total al pie: con una sola categoría sigue sumando cantidad + unidad (`"22.80 lb total"`); mezclando categorías (no tiene sentido sumar lb + case + unit) muestra cantidad de productos en su lugar (`"3 items total"`) | `PrintService.buildCpcl()`, `TicketDetailActivity.buildReceipt()` | ✅ |
+
+### SQL
+Ninguno.
+
+---
+
+## Fase 69: Desglose de unidades por caja en el ticket ✅
+
+### Contexto
+Una caja puede traer 1 artículo o varios (ej. "Case of 8"), y el ticket no distinguía — mostraba `"1 - Case x $56.00"` sin decir cuántas unidades hay adentro. Ese dato (`products.qty` cuando `unit = "Case"`) nunca se guardaba con el pedido: se calculaba en `ProductDetailActivity` al escanear y se descartaba después. Al investigar se encontró que **`orders` tampoco guardaba `unit`** — el ticket recién impreso funcionaba porque usa los datos locales del carrito, pero reimprimir un pedido viejo desde Historial perdía el tipo de unidad (y por lo tanto el agrupamiento de la Fase 68) porque el backend nunca la devolvía. Se arregló todo junto.
+
+### DB
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 69.1 | `ALTER TABLE orders ADD COLUMN unit VARCHAR(20) NULL` | MySQL (vía `/api/setup` o SQL manual) | ✅ |
+| 69.2 | `ALTER TABLE orders ADD COLUMN case_qty INT NULL` | MySQL (vía `/api/setup` o SQL manual) | ✅ |
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 69.3 | `createBatch` — ahora guarda `unit`/`case_qty` de cada item (antes se recibían y se ignoraban) | `orderController.ts` | ✅ |
+| 69.4 | `listOrders` — agregadas `o.unit, o.case_qty` al `SELECT` explícito (antes faltaban, así que `OrderDto.unit` siempre volvía `null` en reimpresiones/historial) | `orderController.ts` | ✅ |
+| 69.5 | `Order` (tipo TS) — agregados `unit`, `case_qty` | `types/index.ts` | ✅ |
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 69.6 | `BatchItem`, `OrderDto`, `GroupedTicketItem` — agregado `caseQty: Int?` (`case_qty`). `PendingOrderEntity` + `pending_orders` (SQLite v11→v12) también, para que el carrito local lo retenga | `data/Models.kt`, `data/local/entities/PendingOrderEntity.kt`, `data/local/AppDatabase.kt`, `data/local/dao/OrderDao.kt` | ✅ |
+| 69.7 | `ProductDetailActivity` → `OrderRepository.savePendingOrder()` → `CurrentOrderActivity` (batch + preview) — hilvanado extremo a extremo desde el escaneo hasta el ticket | `ProductDetailActivity.kt`, `OrderRepository.kt`, `CurrentOrderActivity.kt` | ✅ |
+| 69.8 | Renglón CASE con desglose: `"N - Case of Q x $XX.XX"` (Q = unidades por caja) cuando `caseQty` está disponible; sin el dato, cae al formato simple de la Fase 68 (`"N - Case x $XX.XX"`) — no rompe pedidos viejos sin este campo | `PrintService.buildCpcl()`, `TicketDetailActivity.buildReceipt()` | ✅ |
+
+### Pendiente relacionado (no resuelto en esta fase)
+- **Pre-órdenes**: `PreOrderItem` no tiene `caseQty` — un pedido convertido desde una pre-orden imprime el ticket sin el desglose "of Q" (cae al formato simple, no rompe nada, pero no muestra el detalle). No se extendió el pipeline de pre-órdenes en esta fase.
+
+### SQL
+
+```sql
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS unit VARCHAR(20) NULL;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS case_qty INT NULL;
+```
+
+---
+
+## Fase 70: Agrupar re-escaneos del mismo producto en el carrito ✅
+
+### Contexto
+Escanear el mismo producto dos veces en visitas separadas a `ProductDetailActivity` (ej. cantidad 2, después cantidad 1) creaba dos filas separadas en el carrito (`CurrentOrderActivity`) en vez de sumarse en una — `CurrentOrderActivity` nunca agrupó a propósito (cada escaneo editable individualmente), pero el usuario quería que el mismo producto no apareciera duplicado, sin perder la posibilidad de editarlo.
+
+### Decisión de diseño (confirmada con el usuario)
+Se agrupan **Case y Unit** (cantidades enteras — "2 Case" + "1 Case" = "3 Case" en una sola fila). Los productos **por peso NO se agrupan** — cada unidad pesada individualmente sigue quedando en su propia fila editable, para no mezclar el peso de artículos físicos distintos en un solo número (esto además es coherente con la mejora pendiente "Almacenar pesos individuales").
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 70.1 | `OrderDao.findActiveByBarcodeAndPrice(barcode, price)` — busca una fila activa (no fallida) del mismo producto **y mismo precio** en el carrito. El precio se incluye a propósito en el match: si cambió entre un escaneo y otro, no se mezclan en la misma fila | `data/local/dao/OrderDao.kt` | ✅ |
+| 70.2 | `OrderRepository.savePendingOrder(..., merge: Boolean = true)` — con `merge=true` (default), si existe una fila activa que matchea, suma la cantidad ahí en vez de insertar una fila nueva | `data/repository/OrderRepository.kt` | ✅ |
+| 70.3 | `ProductDetailActivity.saveOrder()` — el loop de productos por peso pasa `merge = false` explícitamente (preserva una fila por unidad pesada); Case y el modo de cantidad simple usan el default (`merge = true`) | `ProductDetailActivity.kt` | ✅ |
+
+### SQL
+Ninguno.
+
+---
+
+## Fase 71: Editar ítem del carrito reabriendo ProductDetailActivity ✅
+
+### Contexto
+El botón "editar" en `CurrentOrderActivity` abría un diálogo genérico (`dialog_edit_order.xml`) con dos campos: "Cantidad total (lb)" y "Precio/lb" — hablaba de libras aunque el producto fuera Case, Unit o Bucket. El usuario pidió que editar reabra la misma pantalla que se usa al escanear/agregar (`ProductDetailActivity`), para que la edición respete el modo real del producto.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 71.1 | `ProductDetailActivity` — nuevo modo edición vía extra `EDIT_ORDER_ID`: precarga cantidad existente (`resetCount()` ya no reinicia a 1 para Case cuando se está editando), botón pasa a decir "Save changes", y `saveOrder()` llama `orderRepository.updatePendingOrder(id, price, quantity)` sobre la fila existente en vez de insertar/mezclar una nueva | `ProductDetailActivity.kt` | ✅ |
+| 71.2 | Productos por peso en edición: el stepper superior (+/-, que agrega/quita unidades enteras) se deshabilita — la fila representa una sola unidad ya pesada, se ajusta con los controles finos ±0.1 o tocando el número, no agregando más unidades | `ProductDetailActivity.kt` | ✅ |
+| 71.3 | El chequeo de "vinculado a QBO" (Fase 65) se salta en modo edición — `CurrentOrderActivity.editItem()` no manda `QB_ITEM_ID`/`QB_ACTIVE` (no se guardan en `pending_orders`) y el ítem ya pasó esa validación al agregarse la primera vez; sin este ajuste el botón "Save changes" quedaba siempre bloqueado por error. El chequeo de barcode obligatorio (Fase 67) sí se mantiene activo — el barcode viaja completo en cualquier caso | `ProductDetailActivity.kt` | ✅ |
+| 71.4 | `CurrentOrderActivity.editItem()` reemplaza al diálogo — arma el intent con los datos de la fila (`PRODUCT_PRICE` como precio **por unidad**: para Case se reconstruye dividiendo `order.price / caseQty`, así `ProductDetailActivity` puede volver a multiplicar con su lógica normal sin casos especiales) | `CurrentOrderActivity.kt` | ✅ |
+| 71.5 | Eliminado el diálogo genérico y su layout (`dialog_edit_order.xml`, `showEditDialog()`) — sin más referencias | `CurrentOrderActivity.kt` | ✅ |
+
+### SQL
+Ninguno.
+
+---
+
+## Fase 72: Disclaimer con saltos de línea rotos al imprimir ✅
+
+### Contexto
+El disclaimer que se guarda en la webapp (`/settings`) tiene un Enter (salto de línea real) entre cada punto numerado — "(1)...", "(2)...", etc. Al imprimir el ticket físico, el texto después del primer salto de línea se perdía/rompía; en la vista "Ver ticket" en pantalla se veía bien porque ahí es un `TextView` normal, que sí entiende saltos de línea.
+
+### Causa
+`wrapText()` (`PrintService.kt`) parte el texto en líneas dividiendo únicamente por espacios — nunca por saltos de línea. Una "palabra" como `"contrato.\n(2)"` (fin de una oración + salto de línea + inicio del siguiente punto, sin espacio entre medio) quedaba pegada como un solo token con un carácter de salto de línea crudo adentro. El comando CPCL `T` que imprime cada línea es de una sola línea de texto — ese salto de línea crudo en medio del comando lo rompía al mandarlo a la impresora.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 72.1 | `wrapText()` — ahora parte primero por `\n` (párrafos) y recién dentro de cada uno divide por palabras, así ningún "word" arrastra un salto de línea crudo. Un párrafo en blanco (`\n\n` seguido) genera una línea vacía en el ticket para conservar el espaciado entre puntos | `data/print/PrintService.kt` | ✅ |
+
+### SQL
+Ninguno.
+
+---
+
+## Fase 73: Fix — edición de productos por peso (Fase 71) ✅
+
+### Contexto
+La Fase 71 (editar reabriendo `ProductDetailActivity`) se pasó de restrictiva con productos por peso: deshabilitaba el stepper +/- superior asumiendo que cada fila era siempre "una unidad físicamente pesada" — pero varios productos del catálogo no tienen `unit` asignado (caen en peso por default) sin ser realmente pesados a mano, y el usuario no podía incrementar la cantidad al editarlos. También se veía "2.00" en vez de "2" cuando la cantidad era un número entero.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 73.1 | Se sacó el bloqueo del stepper +/- en modo edición para productos por peso — vuelve a funcionar igual que al agregar | `ProductDetailActivity.kt` | ✅ |
+| 73.2 | `saveOrder()` en modo edición para peso: ahora suma **todos** los valores de `weights` (por si se usó el stepper durante la edición) en vez de tomar solo el primero — antes se perdían silenciosamente unidades agregadas mientras se editaba | `ProductDetailActivity.kt` | ✅ |
+| 73.3 | `formatQty()` — nuevo helper que muestra cantidades sin decimales de sobra ("2" en vez de "2.00"), conservando la precisión real cuando sí hay parte fraccionaria ("6.5"). Aplicado a los labels de cantidad/peso en `ProductDetailActivity` (no afecta el ticket, que mantiene 2 decimales siempre por convención de recibo) | `ProductDetailActivity.kt`, `strings.xml` (`label_weight_display` pasó de `%.2f` a `%s`) | ✅ |
+| 73.4 | **Fix crash** — `values-es/strings.xml` tenía su propia copia de `label_weight_display` con el formato viejo (`"Peso: %.2f lb"`), nunca actualizada junto con la de `values/`. En dispositivo en español, Android usa esa versión — `getString(id, formatQty(...))` le pasaba un `String` a un placeholder `%.2f` (espera número) → `IllegalFormatConversionException`, crash inmediato al abrir `ProductDetailActivity` en modo edición para cualquier producto por peso. Sincronizada con `%s` | `values-es/strings.xml` | ✅ |
+
+### SQL
+Ninguno.
+
+---
+
+## Fase 74: Cantidad de unidades pesadas en el renglón LBS del ticket ✅
+
+### Contexto
+En el ticket, un renglón LBS solo mostraba el peso total agrupado (ej. "2.00 lb x $6.50/lb" para 2 chicharrones pesados por separado), sin decir cuántas unidades físicas se combinaron en ese peso — a diferencia de Case, que sí muestra la cantidad ("N - Case x $XX.XX").
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 74.1 | `GroupedTicketItem.count` — cuenta cuántas filas (escaneos/pesadas individuales) se combinaron en una línea agrupada del ticket. Se incrementa en `groupedForTicket()` cada vez que una fila nueva se suma a un grupo existente por barcode | `data/Models.kt` | ✅ |
+| 74.2 | Renglón LBS: `"N - X.XX lb x $X.XX/lb"` (antes `"X.XX lb x $X.XX/lb"`, sin decir cuántas unidades) — mismo criterio que Case, siempre muestra el conteo aunque sea 1 | `PrintService.buildCpcl()`, `TicketDetailActivity.buildReceipt()` | ✅ |
+
+### SQL
+Ninguno.
+
+---
+
+## Fase 75: Créditos por daño — Subtotal / Créditos / Total (app + backend + webapp) ✅
+
+### Contexto
+El flujo de "artículos dañados" (modal ya existente en `CurrentOrderActivity`) solo producía texto descriptivo — "Negative Sale Summary" en el ticket y un `CustomerMemo` en QBO — sin ningún cálculo de dinero real en ningún lado. Se agregó un crédito en dólares de verdad: aparece en el ticket como `Subtotal / Créditos / Total`, reduce el total real de la factura de QuickBooks con una línea negativa, y queda auditado en una tabla nueva. No se agregó ningún botón/UI nuevo — se reusa el modal de daño existente, que ya elige productos + cantidad de la orden actual.
+
+### Regla de cálculo (autoritativa, backend, al crear el batch)
+- **Case**: `unitValue = products.price` (ya es el precio por unidad individual dentro de la caja).
+- **Lbs / sin unit**: `unitValue = products.price * (products.weight_per_unit || 1.0)`.
+- **Unit / Bucket**: `unitValue = products.price` directo.
+- `amount = unitValue * qty`. Se calcula una sola vez al crear el batch (nunca se confía en un precio del cliente); los reintentos reusan el `amount` ya guardado, no lo recalculan.
+
+### DB
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 75.1 | `ALTER TABLE batch_damage ADD COLUMN unit_price DECIMAL(10,2) NULL, ADD COLUMN amount DECIMAL(10,2) NULL` — detalle de crédito por línea, para reconstruir el ticket en cualquier reimpresión | MySQL (vía `/api/setup` o SQL manual) | ✅ |
+| 75.2 | `CREATE TABLE customer_credits (id, customer_id, customer_name, batch_id, amount, created_at)` — ledger de auditoría, una fila por batch con crédito. Base para reportes/saldo futuro; el crédito de esta fase siempre se aplica de inmediato al mismo batch que lo generó | MySQL (vía `/api/setup` o SQL manual) | ✅ |
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 75.3 | `computeDamageCredit()` — calcula el crédito por línea consultando `products` fresco, según la regla de arriba | `src/services/creditCalculator.ts` (nuevo) | ✅ |
+| 75.4 | `createBatchInvoice()` — nuevo parámetro `creditAmount`; si es > 0 y `QB_CREDIT_ITEM_ID` está configurado, agrega una línea negativa real (`SalesItemLineDetail`, `Amount: -creditAmount`) a la factura — no solo el memo de texto. Sin la env var configurada, sigue funcionando igual que antes (memo únicamente), con un warning logueado | `src/services/qbInvoices.ts` | ✅ |
+| 75.5 | `createBatch()` — calcula el crédito, guarda `unit_price`/`amount` por línea en `batch_damage`, inserta en `customer_credits`, pasa `creditsTotal` a `createBatchInvoice`, lo devuelve en la respuesta JSON | `src/controllers/orderController.ts` | ✅ |
+| 75.6 | `retryBatchSync()` — trae `unit_price`/`amount` ya guardados de `batch_damage` y los reusa (no recalcula) | `src/controllers/orderController.ts` | ✅ |
+| 75.7 | `getBatchDamage()` (`GET /api/orders/damage/:batchId`) — el SELECT ahora incluye `unit_price`/`amount`. Un solo cambio arregla las reimpresiones tanto en Android como en la webapp, porque ambos leen de este mismo endpoint | `src/controllers/orderController.ts` | ✅ |
+| 75.8 | `convertPreOrder()` — mismo patrón que `createBatch`: calcula, guarda, pasa a `createBatchInvoice`, devuelve `creditsTotal` | `src/controllers/preOrderController.ts` | ✅ |
+| 75.9 | `QB_CREDIT_ITEM_ID` documentada en `.env`/`INSTRUCTIONS.md` (mismo patrón que `QB_DEFAULT_CUSTOMER_ID`) | `INSTRUCTIONS.md` | ✅ |
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 75.10 | `DamageItem.unitPrice`, `BatchResponse.creditsTotal`, helper `creditsTotalOf(damageItems, authoritative)` — prioriza el total autoritativo del backend cuando está disponible, si no suma `qty * unitPrice` local (aproximación, solo para preview antes de finalizar y ticket impreso offline) | `data/Models.kt` | ✅ |
+| 75.11 | `askDamagedItems()` calcula `unitPrice` por producto con `unitValueOf()` (misma regla que el backend; para Case divide `order.price / caseQty` porque ahí `order.price` ya es el precio de la caja completa) | `CurrentOrderActivity.kt` | ✅ |
+| 75.12 | `PrintService.printTicket()`/`buildCpcl()` — nuevo parámetro `creditsTotal`; el call site online lo manda desde `response.creditsTotal` (autoritativo), el offline cae a la aproximación local. Línea de "Negative Sale Summary" ahora incluye el monto por producto; bloque de total pasa a `Subtotal:` / `Credits:` / `TOTAL:` solo si hay crédito — sin daño, el ticket queda idéntico a antes | `data/print/PrintService.kt` | ✅ |
+| 75.13 | `TicketDetailActivity.buildReceipt()` — mismo tratamiento que el ticket impreso; siempre suma desde el `unitPrice` de cada `DamageItem` (que ya viene poblado, sea de la finalización reciente o de `getBatchDamage` en una reimpresión) | `TicketDetailActivity.kt` | ✅ |
+
+### Webapp
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 75.14 | Modal de ticket — mismo bloque `Subtotal` / `Créditos` / `Total` que Android, solo si hay crédito. Chips de "Negative Sale" en la fila expandible también muestran el monto | `app/orders/_components/OrdersClient.tsx` | ✅ |
+| 75.15 | Traducciones `tkt_subtotal`/`tkt_credits` agregadas en **los dos** bloques (`es`/`en`) | `app/lib/i18n.ts` | ✅ |
+
+### Fuera de esta ronda (documentado explícitamente)
+- Sin UI para "aplicar" el saldo de `customer_credits` en un pedido futuro distinto — la tabla existe como base, pero el crédito siempre se aplica de inmediato al mismo pedido que lo generó.
+- Sin página de historial de créditos por cliente en la webapp.
+- No se toca stock por artículos dañados.
+- Pre-órdenes: `PreOrderItem` no tiene `caseQty`/`unitPrice` — un pedido convertido desde pre-orden no calcula el desglose de crédito (cae a formato simple, no rompe nada).
+- `createInvoice()` (endpoint legacy de un solo ítem, sin caller real) no se tocó.
+
+### Configuración manual requerida
+Crear/identificar un Item en QuickBooks para representar el crédito (ej. "Store Credit / Damaged Goods") y poner su Id en `.env` como `QB_CREDIT_ITEM_ID=...`. Sin esto, todo funciona igual (ticket, ledger) pero la factura de QBO no incluye la línea negativa — solo el memo de texto, como hasta ahora.
+
+### SQL
+
+```sql
+ALTER TABLE batch_damage
+  ADD COLUMN IF NOT EXISTS unit_price DECIMAL(10,2) NULL,
+  ADD COLUMN IF NOT EXISTS amount DECIMAL(10,2) NULL;
+
+CREATE TABLE IF NOT EXISTS customer_credits (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  customer_id VARCHAR(64) NULL,
+  customer_name VARCHAR(255) NULL,
+  batch_id VARCHAR(100) NOT NULL,
+  amount DECIMAL(10,2) NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_customer_credits_batch (batch_id),
+  INDEX idx_customer_credits_customer (customer_id)
+);
+```
+
+---
+
 ## Pendiente / Mejoras futuras
 
 ### Android
@@ -1829,12 +2204,14 @@ UPDATE products SET qty = 8 WHERE unit = 'Case' AND name LIKE '%Lala%' AND (qty 
 | ✅ | ~~**Log de actividad**~~ | Completado en Fase 16 |
 | ✅ | ~~**Exportar CSV**~~ | Completado en Fase 16 |
 | ✅ | ~~**Configuración de empresa dinámica**~~ | Completado en Fase 17 (backend + webapp) |
-| Alta | **Sistema de créditos por damage — backend** | Tabla `customer_credits` + endpoint para generar/aplicar créditos. Prerequisito: `case_qty` en productos ✅ (Fase 62). Decidir si Credit Memos van a QB o solo en MySQL |
+| ✅ | ~~**Sistema de créditos por damage — backend**~~ | Completado en Fase 75 — tabla `customer_credits` + cálculo automático desde el modal de daño existente. El crédito se aplica siempre al mismo batch que lo genera, no hay endpoint para "aplicar" saldo en un pedido futuro distinto (ver fila de saldo/historial más abajo) |
 | Alta | **Endpoint stats operadores del día** | Query SQL sobre `orders` de hoy agrupada por `user_id` con total pedidos, ingresos y último pedido. Alimenta la tabla de operadores del dashboard |
 | Media | **Producción QBO** | Cambiar `ENVIRONMENT=production`, actualizar `REDIRECT_URI`/`DASHBOARD_URL`/`DISCONNECTED_URL`, registrar URLs en Intuit Developer Console, reconectar empresa real de QuickBooks via `/api/qb/auth` |
 | Media | **Webhook QB → backend** | Recibir notificaciones de QB cuando se crea/edita un producto directamente en QB. Elimina necesidad de "Sincronizar QB" manual. Requiere registrar endpoint en Intuit Developer Console |
-| Media | **Credit Memos QB** | Crear Credit Memos en QB cuando se registra damage. Parte del sistema de créditos por damage. Depende de `case_qty` ✅ (Fase 62) y tabla `customer_credits` |
+| Media | **Credit Memos QB** | La Fase 75 resuelve el caso común con una línea negativa en la misma factura (más simple, ya reduce el total). Un Credit Memo separado en QB seguiría siendo útil para créditos que no se aplican en la misma venta (ver saldo/historial abajo) — no implementado |
 | Media | **Email resumen diario** | Enviar resumen automático al admin con pedidos del día, ingresos totales y operadores activos. Bloqueado hasta tener SMTP |
+| Alta | **`syncProductsFromQbo` inserta productos sin barcode** | El sync automático (`syncEngine.ts`) inserta `barcode = NULL` para items nuevos, a diferencia del sync manual (`qbController.ts`) que usa `item.Sku \|\| 'QBO-{id}'`. Un producto sin barcode nunca puede facturarse (ver Fase 64) — unificar el fallback en ambos sync paths |
+| Media | **Vincular `orders` a `products` por id, no por barcode** | `orders.barcode = products.barcode` es un JOIN por string equality — frágil si el barcode cambia después de la venta o el producto no tiene barcode. Agregar `product_id` a `orders` eliminaría la clase entera de bugs de "PENDING sin razón aparente" (ver Fase 64) |
 
 ### Webapp
 
@@ -1844,7 +2221,7 @@ UPDATE products SET qty = 8 WHERE unit = 'Case' AND name LIKE '%Lala%' AND (qty 
 | Alta | **Dashboard semi-realtime (polling)** | Polling cada 30s en KPIs, actividad reciente y gráfica de pedidos por hora. Top 5 y gráfica de 7 días solo se refrescan al cambiar filtro de período. Opción SSE descartada por limitaciones de cPanel/Passenger. |
 | Alta | **Dashboard — tabla de operadores del día** | Sección nueva en dashboard (solo admin) con tabla: Operador / Pedidos hoy / Total $ / Último pedido. Incluir "último visto" usando `activity_log`. Online en tiempo real descartado — requeriría heartbeat en Android y backend. |
 | Alta | **Unidades por caja en productos** | Agregar campo `units_per_case` a tabla `products` y al modal de edición de productos. Workaround: Android infiere desde `qty` vía fallback en Fase 62. |
-| Alta | **Sistema de créditos por damage** | Damage reportado genera crédito al cliente. Prerequisitos: (1) `units_per_case` en productos, (2) definir cálculo del crédito (¿por unidad? ¿por peso?), (3) decidir si Credit Memos van a QB o solo en MySQL. Requiere tabla `customer_credits` + endpoint nuevo. |
+| ✅ | ~~**Sistema de créditos por damage**~~ | Completado en Fase 75 (Android + backend + webapp) — Subtotal/Créditos/Total en el ticket, línea negativa real en la factura de QBO, ledger `customer_credits` |
 | Media | **Alerta de stock bajo** | Badge/indicador rojo en productos con stock ≤ 5 en la página de productos. Ya existe el dato, mínimo esfuerzo. |
-| Media | **Historial de créditos por cliente** | Página o sección en `/customers` mostrando créditos generados, aplicados y saldo disponible por cliente. Depende del sistema de créditos. |
+| Media | **Historial/saldo de créditos por cliente** | Página o sección en `/customers` mostrando créditos generados y saldo disponible, más la capacidad de "aplicar" ese saldo en un pedido futuro distinto al que lo generó. La tabla `customer_credits` ya existe (Fase 75) como ledger de auditoría — falta la UI de saldo/aplicación |
 | Media | **Reporte de damage por período** | Sección en dashboard con: total perdido por damage por semana/mes, top productos más dañados, qué operador reporta más damage. Útil para decisiones de compra. |

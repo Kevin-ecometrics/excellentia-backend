@@ -1,5 +1,6 @@
 import { oauthClient, refreshToken } from './qbAuth.ts';
 import type { Order } from '../types/index.ts';
+import logger from './logger.ts';
 
 const DEFAULT_CUSTOMER_REF = process.env.QB_DEFAULT_CUSTOMER_ID ?? '2';
 
@@ -42,7 +43,8 @@ export async function createBatchInvoice(
   damageItems: DamageItem[] = [],
   paymentMethod?: string | null,
   classId?: string | null,
-  docNumber?: number
+  docNumber?: number,
+  creditAmount: number = 0
 ): Promise<any> {
   if (!oauthClient.isAccessTokenValid()) {
     await refreshToken();
@@ -61,6 +63,30 @@ export async function createBatchInvoice(
       SalesItemLineDetail: salesItemLineDetail,
     };
   });
+
+  // Línea negativa por crédito de daño — reduce el total real de la factura,
+  // no solo el memo de texto. Requiere un item de QBO configurado en
+  // QB_CREDIT_ITEM_ID; si no está configurado, se omite la línea y el crédito
+  // queda solo como memo (comportamiento anterior), sin romper la factura.
+  const creditItemId = process.env.QB_CREDIT_ITEM_ID;
+  if (creditAmount > 0) {
+    if (creditItemId) {
+      const creditLineDetail: Record<string, any> = {
+        ItemRef: { value: creditItemId },
+        Qty: 1,
+        UnitPrice: -creditAmount,
+      };
+      if (classId) creditLineDetail.ClassRef = { value: classId };
+      lines.push({
+        DetailType: 'SalesItemLineDetail' as const,
+        Amount: -creditAmount,
+        Description: 'Store Credit / Damaged Goods',
+        SalesItemLineDetail: creditLineDetail,
+      });
+    } else {
+      logger.warn(`createBatchInvoice: crédito de $${creditAmount.toFixed(2)} calculado pero QB_CREDIT_ITEM_ID no está configurado — la factura no incluye la línea negativa, solo el memo`);
+    }
+  }
 
   const body: Record<string, any> = {
     Line: lines,

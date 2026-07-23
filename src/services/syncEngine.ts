@@ -27,7 +27,7 @@ async function processPendingOrders(): Promise<void> {
   if (!hasQboTokens()) return;
   try {
     const [pending] = await pool.query(
-      "SELECT o.*, p.qb_item_id, u.qb_class_id FROM orders o LEFT JOIN products p ON o.barcode = p.barcode LEFT JOIN users u ON o.user_id = u.id WHERE o.status = 'PENDING'"
+      "SELECT o.*, p.qb_item_id, p.qb_active, u.qb_class_id FROM orders o LEFT JOIN products p ON o.barcode = p.barcode LEFT JOIN users u ON o.user_id = u.id WHERE o.status = 'PENDING'"
     ) as any[];
 
     for (const order of pending) {
@@ -36,6 +36,14 @@ async function processPendingOrders(): Promise<void> {
           await pool.query(
             "UPDATE orders SET status = 'FAILED', error_log = ? WHERE id = ?",
             ['Producto sin qb_item_id en QBO', order.id]
+          );
+          continue;
+        }
+
+        if (order.qb_active === 0) {
+          await pool.query(
+            "UPDATE orders SET status = 'FAILED', error_log = ? WHERE id = ?",
+            ['Item inactivo en QuickBooks — hay que reactivarlo en QBO antes de reintentar', order.id]
           );
           continue;
         }
@@ -103,6 +111,7 @@ async function syncProductsFromQbo(): Promise<void> {
 
     for (const item of items) {
       try {
+        const active = item.Active === false ? 0 : 1;
         const [existing] = await pool.query(
           'SELECT id FROM products WHERE qb_item_id = ?',
           [item.Id]
@@ -110,13 +119,13 @@ async function syncProductsFromQbo(): Promise<void> {
 
         if (existing.length > 0) {
           await pool.query(
-            'UPDATE products SET name = ?, price = ?, stock = ?, updated_at = NOW() WHERE qb_item_id = ?',
-            [item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, item.Id]
+            'UPDATE products SET name = ?, price = ?, stock = ?, qb_active = ?, updated_at = NOW() WHERE qb_item_id = ?',
+            [item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, active, item.Id]
           );
         } else {
           await pool.query(
-            'INSERT INTO products (barcode, name, price, stock, qb_item_id) VALUES (?, ?, ?, ?, ?)',
-            [null, item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, item.Id]
+            'INSERT INTO products (barcode, name, price, stock, qb_item_id, qb_active) VALUES (?, ?, ?, ?, ?, ?)',
+            [null, item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, item.Id, active]
           );
         }
         upserted++;
