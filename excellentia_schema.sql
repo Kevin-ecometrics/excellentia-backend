@@ -38,7 +38,6 @@ CREATE TABLE IF NOT EXISTS `products` (
     `description`     TEXT NULL,
     `weight_per_unit` DECIMAL(10,2) NULL,
     `unit`            VARCHAR(20) DEFAULT NULL,
-    `case_qty`        INT DEFAULT NULL,
     `qty`             INT NOT NULL DEFAULT 0,
     `qb_item_id`      VARCHAR(50),
     `created_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

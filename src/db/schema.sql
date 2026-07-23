@@ -41,7 +41,6 @@ CREATE TABLE IF NOT EXISTS `products` (
     `hidden`          TINYINT(1) NOT NULL DEFAULT 0,
     `description`     TEXT NULL,
     `unit`            VARCHAR(20) DEFAULT NULL,
-    `case_qty`        INT DEFAULT NULL,
     `weight_per_unit` DECIMAL(10,2) NULL,
     `qty`             INT NOT NULL DEFAULT 0,
     `qb_item_id`      VARCHAR(50),
