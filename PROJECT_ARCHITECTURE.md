@@ -132,6 +132,7 @@ CREATE TABLE products (
     id              INT AUTO_INCREMENT PRIMARY KEY,
     barcode         VARCHAR(50) UNIQUE,
     name            VARCHAR(255) NOT NULL,
+    short_name      VARCHAR(255) NULL,               -- nombre corto opcional, se muestra en el ticket en vez de name (Fase 94)
     price           DECIMAL(10,2) NOT NULL,
     min_price       DECIMAL(10,2) NULL,
     category        VARCHAR(100),
@@ -231,6 +232,7 @@ UPDATE products SET hidden = 1 WHERE barcode IN ('QBO-1', 'QBO-2');  -- Services
 | Método | Ruta | Auth | Descripción |
 |---|---|---|---|
 | POST | `/api/orders/batch` | JWT | Batch con customer + `signature` (base64 PNG opcional) |
+| PUT | `/api/orders/batch/:batchId/payment` | JWT | Fase 82 — adjunta `payment_method`/`check_number` a un batch ya creado (Android lo manda antes de conocer el método de pago, para tener el invoice real en el ticket #1). Solo MySQL, no toca QBO |
 | GET | `/api/orders` | JWT | Listar con filtros (status, barcode, device_id, **customer_id**, date_from, date_to). Operadores ven solo sus pedidos. **No retorna `signature`** (excluida para evitar TransactionTooLargeException en Android) |
 | GET | `/api/orders/:id` | JWT | Detalle |
 | GET | `/api/orders/damage/:batchId` | JWT | Damage items del batch + `signature` del batch en `{ data: [...], signature: "..." }` |
@@ -252,6 +254,16 @@ UPDATE products SET hidden = 1 WHERE barcode IN ('QBO-1', 'QBO-2');  -- Services
 | GET | `/api/customers` | JWT | Cache-first (MySQL TTL 1h) → QB → cache expirado si QB falla |
 | POST | `/api/customers/refresh` | JWT (admin) | Forzar actualización del cache desde QB |
 | GET | `/api/customers/:customerId/orders` | JWT | Batches agrupados por cliente (paginado, newest first) |
+| GET | `/api/customers/stats` | JWT (admin) | Webapp `/customers` — un cliente por fila con `batch_count`/`total_spent` (de `orders` SENT) + `total_credits`/`available_credit` (de `credit_transactions`). `FROM` es la unión de customer_ids con pedido SENT y customer_ids con alguna fila en `credit_transactions` (Fase 79) — así un cliente con **solo** un crédito standalone (sin pedido) también aparece |
+
+### Créditos
+
+| Método | Ruta | Auth | Descripción |
+|---|---|---|---|
+| GET | `/api/customers/:customerId/credit-balance` | JWT | Balance disponible (SUM EARNED - SUM USED en `credit_transactions`) |
+| GET | `/api/customers/:customerId/credits` | JWT | Historial de créditos (EARNED + USED) + balance |
+| GET | `/api/credits` | JWT (admin) | Reporte paginado de todos los créditos EARNED emitidos |
+| POST | `/api/credits/issue` | JWT | Fase 76 — agenda crédito para un cliente sin venta asociada (`customer_id`, `items[]` con barcode/product_name/qty). Reusa `computeDamageCredit()`, inserta en `batch_damage`/`credit_transactions` con un `batch_id` sintético. No toca QuickBooks |
 
 ### Pre-órdenes
 

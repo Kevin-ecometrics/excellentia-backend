@@ -5,6 +5,7 @@ import { paginatedQuery } from '../services/qbAuth.ts';
 import { auth } from '../middleware/auth.ts';
 import { adminOnly } from '../middleware/adminOnly.ts';
 import logger from '../services/logger.ts';
+import { getCustomerBalance, getCustomerCreditHistory } from '../services/creditController.ts';
 
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hora
 
@@ -119,27 +120,58 @@ router.post('/refresh', auth, adminOnly, async (_req: Request, res: Response) =>
   }
 });
 
-// GET /api/customers/stats — clientes con totales de pedidos enviados + créditos emitidos
+// GET /api/customers/stats — clientes con totales de pedidos enviados + créditos
 router.get('/stats', auth, adminOnly, async (_req: Request, res: Response) => {
   try {
     await ensureTable();
+    // FROM es la unión de clientes con al menos un pedido enviado y clientes
+    // con al menos una transacción de crédito — necesario porque un crédito
+    // standalone (POST /api/credits/issue, sin venta detrás) no deja ninguna
+    // fila en `orders`. Antes el FROM era solo `orders`, así que un cliente
+    // sin pedidos pero con crédito agendado no aparecía en esta lista y su
+    // crédito quedaba invisible aquí (aunque sí se veía en /api/credits, que
+    // no depende de `orders`).
     const [rows] = await pool.query(`
       SELECT
-        o.customer_id,
-        o.customer_name,
-        COUNT(DISTINCT o.batch_id) AS batch_count,
-        COALESCE(SUM(o.total), 0) AS total_spent,
-        MAX(o.created_at) AS last_order_at,
-        COALESCE(cc.total_credits, 0) AS total_credits
-      FROM orders o
+        ci.customer_id,
+        COALESCE(o_agg.customer_name, ct_names.customer_name, ci.customer_id) AS customer_name,
+        COALESCE(o_agg.batch_count, 0) AS batch_count,
+        COALESCE(o_agg.total_spent, 0) AS total_spent,
+        o_agg.last_order_at,
+        COALESCE(credit_totals.total_credits, 0) AS total_credits,
+        COALESCE(credit_totals.available_credit, 0) AS available_credit
+      FROM (
+        SELECT DISTINCT customer_id FROM orders WHERE customer_id IS NOT NULL AND status = 'SENT'
+        UNION
+        SELECT DISTINCT customer_id FROM credit_transactions WHERE customer_id IS NOT NULL
+      ) ci
       LEFT JOIN (
-        SELECT customer_id, SUM(amount) AS total_credits
-        FROM customer_credits
+        SELECT
+          customer_id,
+          customer_name,
+          COUNT(DISTINCT batch_id) AS batch_count,
+          SUM(total) AS total_spent,
+          MAX(created_at) AS last_order_at
+        FROM orders
+        WHERE customer_id IS NOT NULL AND status = 'SENT'
+        GROUP BY customer_id, customer_name
+      ) o_agg ON o_agg.customer_id = ci.customer_id
+      LEFT JOIN (
+        SELECT customer_id, MAX(customer_name) AS customer_name
+        FROM credit_transactions
         WHERE customer_id IS NOT NULL
         GROUP BY customer_id
-      ) cc ON cc.customer_id = o.customer_id
-      WHERE o.customer_id IS NOT NULL AND o.status = 'SENT'
-      GROUP BY o.customer_id, o.customer_name, cc.total_credits
+      ) ct_names ON ct_names.customer_id = ci.customer_id
+      LEFT JOIN (
+        SELECT
+          customer_id,
+          SUM(CASE WHEN type = 'EARNED' THEN amount ELSE 0 END) AS total_credits,
+          SUM(CASE WHEN type = 'EARNED' THEN amount ELSE 0 END)
+            - SUM(CASE WHEN type = 'USED' THEN amount ELSE 0 END) AS available_credit
+        FROM credit_transactions
+        WHERE customer_id IS NOT NULL
+        GROUP BY customer_id
+      ) credit_totals ON credit_totals.customer_id = ci.customer_id
       ORDER BY total_spent DESC
     `) as any[];
     res.json({ data: rows });
@@ -149,24 +181,61 @@ router.get('/stats', auth, adminOnly, async (_req: Request, res: Response) => {
   }
 });
 
-// GET /api/customers/:customerId/credits — historial de créditos por daño de un cliente
+// GET /api/customers/:customerId — un solo cliente (cache-first, fallback a QB).
+// Usado por el ticket en Android para resolver la dirección cuando no viene en
+// el intent (reprint desde Historial/ClientHistory — `orders` no guarda
+// customer_address, solo customer_id, así que el cliente se resuelve al vuelo).
+router.get('/:customerId', auth, async (req: Request, res: Response) => {
+  await ensureTable();
+  const { customerId } = req.params;
+  try {
+    const [[cached]] = await pool.query(
+      'SELECT id AS Id, display_name AS DisplayName, active AS Active, address_line1 AS AddressLine1, city AS City, state_code AS StateCode, postal_code AS PostalCode FROM cached_customers WHERE id = ?',
+      [customerId]
+    ) as any[];
+    if (cached) {
+      return res.json({ ...cached, Active: cached.Active === 1 || cached.Active === true });
+    }
+    if (!/^[0-9]+$/.test(customerId)) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+    const results = await paginatedQuery(`select * from Customer where Id = '${customerId}'`, 'Customer');
+    const c = results[0];
+    if (!c) return res.status(404).json({ error: 'Customer not found' });
+    return res.json({
+      Id: c.Id,
+      DisplayName: c.DisplayName,
+      Active: c.Active,
+      AddressLine1: c.BillAddr?.Line1 ?? null,
+      City: c.BillAddr?.City ?? null,
+      StateCode: c.BillAddr?.CountrySubDivisionCode ?? null,
+      PostalCode: c.BillAddr?.PostalCode ?? null,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Error';
+    return res.status(500).json({ error: message });
+  }
+});
+
+// GET /api/customers/:customerId/credit-balance — saldo disponible de créditos
+router.get('/:customerId/credit-balance', auth, async (req: Request, res: Response) => {
+  try {
+    const { customerId } = req.params;
+    const balance = await getCustomerBalance(customerId);
+    res.json(balance);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Error';
+    res.status(500).json({ error: message });
+  }
+});
+
+// GET /api/customers/:customerId/credits — historial de créditos (EARNED + USED)
 router.get('/:customerId/credits', auth, async (req: Request, res: Response) => {
   try {
     const { customerId } = req.params;
-    const [rows] = await pool.query(
-      `SELECT cc.batch_id, cc.amount, cc.created_at, o.invoice_id
-       FROM customer_credits cc
-       LEFT JOIN (
-         SELECT batch_id, MAX(qb_invoice_id) AS invoice_id
-         FROM orders
-         WHERE qb_invoice_id IS NOT NULL
-         GROUP BY batch_id
-       ) o ON o.batch_id = cc.batch_id
-       WHERE cc.customer_id = ?
-       ORDER BY cc.created_at DESC`,
-      [customerId]
-    ) as any[];
-    res.json({ data: rows });
+    const rows = await getCustomerCreditHistory(customerId);
+    const balance = await getCustomerBalance(customerId);
+    res.json({ data: rows, balance });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Error';
     res.status(500).json({ error: message });

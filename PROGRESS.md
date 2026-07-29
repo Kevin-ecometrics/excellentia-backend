@@ -1,6 +1,6 @@
 # Excellentia — Progreso del Proyecto
 
-> Estado actual: **Fase 62 ✅ — Case QTY (unidades por caja) en Android**
+> Estado actual: **Fase 101 ✅ — Ticket: indicador corto de unidad en Qty/W para Case/Unit ("cs/unt") y Bucket ("bkt")**
 
 ---
 
@@ -2163,6 +2163,621 @@ CREATE TABLE IF NOT EXISTS customer_credits (
   INDEX idx_customer_credits_customer (customer_id)
 );
 ```
+
+---
+
+## Fase 76: Botón "Agregar crédito" — crédito standalone sin venta ✅
+
+### Contexto
+Hasta ahora un crédito (`credit_transactions` tipo `EARNED`) solo podía nacer como efecto secundario de un pedido real — el modal de "artículos dañados" en `CurrentOrderActivity` pide cantidades de los productos que ya están en el carrito de esa venta. El usuario necesitaba poder agendarle crédito a un cliente **sin que exista una venta** (ej. el camión encuentra producto dañado/caducado que no se va a vender ese día). Se agregó un botón nuevo en `MainActivity` ("Agregar crédito") que abre un flujo independiente: elegir cliente, agregar productos (escaneo DataWedge o búsqueda manual) con cantidad dañada/caducada, y guardar. No toca QuickBooks ni requiere firma/ticket — el crédito queda disponible de inmediato en el balance del cliente (mismo ledger `credit_transactions` EARNED/USED que ya usa el flujo "Apply Credit" al finalizar un pedido).
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 76.1 | `POST /api/credits/issue` — recibe `customer_id`/`customer_name`/`items[]`, reusa `computeDamageCredit()` (misma regla de valuación que el crédito por daño de un batch) para calcular el monto real desde `products`, inserta el detalle en `batch_damage` y el total en `credit_transactions` (`type='EARNED'`) con un `batch_id` sintético (prefijo `cr`, sin fila real en `orders` detrás — ambas tablas usan `VARCHAR` libre, sin FK). No crea ningún invoice/documento en QBO | `src/routes/credits.ts` | ✅ |
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 76.2 | `IssueCreditRequest`/`CreditItemRequest`/`IssueCreditResponse` + `issueCredit()` en el `ApiService` | `data/Models.kt`, `data/network/ApiService.kt` | ✅ |
+| 76.3 | Nueva `IssueCreditActivity` — calco del esqueleto de `CreatePreOrderActivity` (customer picker, receiver DataWedge, diálogo de búsqueda manual) sin fecha/notas/vendedor; al elegir un producto (escaneado o buscado) pide cantidad dañada/caducada con un diálogo simple (entero, no peso) y arma la lista a guardar. Muestra un estimado de crédito en pantalla replicando `unitValueOf()` del backend en Kotlin — el monto real autoritativo lo sigue calculando el servidor | `IssueCreditActivity.kt`, `activity_issue_credit.xml` | ✅ |
+| 76.4 | Botón "Agregar crédito" en `MainActivity`, mismo estilo que "Pre-órdenes" | `MainActivity.kt`, `activity_main.xml` | ✅ |
+| 76.5 | Activity registrada en el manifest; strings nuevos agregados en `values/` y `values-es/` | `AndroidManifest.xml`, `strings.xml` (ambos locales) | ✅ |
+
+### Fuera de esta ronda (confirmado con el usuario)
+- Sin documento/factura en QuickBooks al agendar el crédito — se refleja ahí recién cuando se aplique en una venta real (flujo "Apply Credit" ya existente, sin cambios).
+- Sin firma ni impresión de ticket — es una acción interna simple.
+- No se tocó el flujo de "Apply Credit" (`askApplyCredit()` en `CurrentOrderActivity`, `GET /api/customers/:id/credit-balance`) — el crédito agendado aquí solo aumenta el balance disponible que ese flujo ya consulta.
+
+### Nota de documentación
+Este documento tenía como último crédito registrado la Fase 75 (tabla `customer_credits`, ledger simple sin "aplicar" saldo). El código ya había evolucionado a un ledger `credit_transactions` (EARNED/USED) con balance consultable y un flujo de aplicación de crédito (`askApplyCredit()`, `applyCustomerCredit()`) antes de esta fase, sin quedar documentado en su momento — la Fase 76 se apoya en ese sistema ya existente tal cual está en el código, no en la tabla `customer_credits` descrita en la Fase 75.
+
+## Fase 77: Balance de crédito visible + monto de aplicación editable (Android) ✅
+
+### Contexto
+Dos ajustes al sistema de crédito ya existente, sin cambios de backend: (1) el saldo de crédito del cliente no se veía en ningún lado hasta que aparecía el modal de "Apply Credit" al finalizar un pedido — ahora se muestra proactivamente; (2) ese modal era todo-o-nada (un solo botón que aplicaba el máximo posible, o no aplicar nada) — ahora es un monto editable.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 77.1 | `refreshCustomerCredit()` — consulta `GET /api/customers/:id/credit-balance` y muestra "Crédito disponible: $X.XX" (oculto si balance = 0) junto al cliente activo | `MainActivity.kt` (`updateCustomerUi()`), `activity_main.xml` (`tvCustomerCredit`) | ✅ |
+| 77.2 | Mismo patrón junto al cliente elegido en el flujo de agendar crédito | `IssueCreditActivity.kt`, `activity_issue_credit.xml` (`tvCustomerCredit`) | ✅ |
+| 77.3 | `askApplyCredit()` — el diálogo pasa de un solo botón "Apply $max" a un `EditText` prellenado con `min(balance, total del pedido)` pero editable; al confirmar, el valor se recorta con `coerceIn(0.0, maxApply)` (no se puede aplicar más del saldo ni más del total del pedido); si queda en 0, equivale a "No aplicar" | `CurrentOrderActivity.kt`, `PreOrderDetailActivity.kt` (mismo bloque duplicado en ambos) | ✅ |
+| 77.4 | String `btn_apply_credit` (con monto embebido) eliminada — el botón ahora usa el genérico `btn_apply` ("Apply"/"Aplicar"); `msg_credit_apply` reescrito para describir un rango en vez de pedir confirmar un monto fijo; nuevos strings `hint_credit_amount`, `label_available_credit` en `values/` y `values-es/` | `strings.xml` (ambos locales) | ✅ |
+
+### Fuera de esta ronda
+- Sin cambios de backend — reusa `GET /api/customers/:customerId/credit-balance` y `apply_credit` en `createBatch`/`convertPreOrder`, ya existentes.
+- No se agregó validación con mensaje de error si el usuario escribe un monto mayor al máximo — se recorta en silencio (`coerceIn`).
+
+## Fase 78: Fix — total de `OrderSuccessActivity` no restaba créditos ✅
+
+### Contexto
+Reporte del usuario: la pantalla de "Pedido completado" mostraba el total crudo del pedido incluso cuando había artículos dañados/caducados o crédito aplicado — mientras que el ticket (`TicketDetailActivity`/impresión) sí restaba ambos correctamente (`Subtotal` / `Credits` / `TOTAL`, Fase 75). El bug era que `OrderSuccessActivity` nunca recibía `creditsTotal`/`creditApplied` por intent — solo el `total` bruto (`items.sumOf { it.total }`).
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 78.1 | Extras nuevos `credits_total` (sentinel `-1.0` si no hay valor autoritativo del backend — pasa `null` a `creditsTotalOf()` para que use la suma local de `damageItems`) y `credit_applied` al lanzar `OrderSuccessActivity` | `CurrentOrderActivity.kt`, `PreOrderDetailActivity.kt` | ✅ |
+| 78.2 | `displayTotal = total - credits - creditApplied` (misma fórmula que `TicketDetailActivity.buildReceipt()`); fila "Credits" nueva (oculta si no hay crédito) mostrando el monto combinado en negativo | `OrderSuccessActivity.kt`, `activity_order_success.xml` | ✅ |
+| 78.3 | String `label_credits_field` en `values/` y `values-es/` | `strings.xml` (ambos locales) | ✅ |
+
+### Fuera de esta ronda
+- Sin cambios de backend.
+- La fila "Credits" muestra el combinado daño+aplicado en una sola línea (a diferencia del ticket, que los separa en "Credits:"/"Credit Applied:") — es una pantalla de resumen, no el recibo; el detalle completo sigue disponible en "Ver ticket".
+
+## Fase 79: Fix — créditos standalone invisibles en la página de Clientes (webapp) ✅
+
+### Contexto
+Reporte del usuario: en la webapp, la página de Clientes solo mostraba el crédito de un cliente si venía acompañado de un pedido/factura real (el caso "damage credit" clásico) — un cliente que solo tuviera un crédito standalone (agendado vía `POST /api/credits/issue`, Fase 76, sin ninguna venta detrás) no aparecía en la lista en absoluto, con su crédito invisible ahí. La página `/credits` (reporte de todos los créditos) ya funcionaba bien porque consulta `credit_transactions` directo, sin pasar por `orders`.
+
+### Causa raíz
+`GET /api/customers/stats` — el `FROM` de la query era `orders o ... WHERE o.status = 'SENT'`, con el balance de crédito unido después vía `LEFT JOIN`. Un cliente sin ninguna fila en `orders` (porque su único crédito es standalone) nunca entraba al `FROM`, así que ni el cliente ni su crédito aparecían en la tabla, sin importar que `credit_transactions` tuviera el registro correcto.
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 79.1 | `GET /api/customers/stats` reescrita: el `FROM` ahora es la unión (`UNION`) de customer_ids con pedido `SENT` y customer_ids con alguna fila en `credit_transactions`, con los agregados de `orders`/`credit_transactions` unidos por separado vía `LEFT JOIN`. `customer_name` cae a `credit_transactions.customer_name` y, en último caso, al propio `customer_id` (nunca queda vacío, evita romper el avatar de iniciales en el frontend) | `src/routes/customers.ts` | ✅ |
+
+### Webapp
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 79.2 | `last_order_at` ahora puede ser `null` (cliente sin pedidos, solo crédito standalone) — tipo actualizado y `fmtDate()` devuelve cadena vacía en vez de `new Date(null)` (que renderizaba 1970) | `app/customers/page.tsx`, `app/customers/_components/CustomersClient.tsx` | ✅ |
+
+### Fuera de esta ronda
+- `/api/credits` (reporte general) y `/api/customers/:id/credits` (historial por cliente) no se tocaron — ya funcionaban bien, ninguno depende de `orders`.
+
+### Fase 79b: label "Sin factura" en vez de guion vacío en columna Invoice (webapp)
+Un crédito standalone nunca va a tener `invoice_id` (por diseño, Fase 76 — no toca QBO al agendar), así que la columna Invoice en `/credits` y en el modal de historial de `/customers` siempre le va a mostrar un guion vacío. Para que se lea como "esto no tiene factura porque no hubo venta" y no como un dato roto, el guion se reemplazó por un label explícito (`crd_noInvoice`: "No invoice"/"Sin factura", ambos locales) en `CreditsClient.tsx` y `CustomersClient.tsx`.
+
+## Fase 80: Fix — doble impresión (Fase 76) nunca se llamaba desde ningún lado ✅
+
+### Contexto
+Reporte del usuario: quería que el ticket se imprimiera una vez justo después de firmar, y una segunda vez después de elegir el método de pago. La Fase 76 ya documentaba exactamente ese comportamiento (`printFirstTicketThenAskPayment()`), pero al revisar el código esa función **no existía** — `checkPrinterThenFinalize()` saltaba directo a `askPaymentMethod()`, y `sendBatchAndPrint()` imprimía los dos tickets (sin pago, con pago) seguidos, ambos **después** de mandar el batch al servidor. El usuario nunca veía salir un ticket entre firmar y elegir el método de pago — la doble impresión existía como texto en `PROGRESS.md`/`CLAUDE.md`, pero no como código.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 80.1 | Nueva `printFirstTicketThenAskPayment(skipPrint)` — corre entre `checkPrinterThenFinalize()` y `askPaymentMethod()`; si hay impresora y no se saltó, imprime el primer ticket con `paymentMethod = null`, `invoiceId = null`, `batchId = ""`, `creditsTotal = null` (nada de esto existe todavía en este punto del flujo) usando `pendingSignature`/`pendingDamageItems`/`pendingApplyCredit` ya conocidos | `CurrentOrderActivity.kt` | ✅ |
+| 80.2 | `sendBatchAndPrint()` — se eliminó el primer print duplicado (el que se llamaba "Ticket #1" en el código); ahora solo imprime el segundo ticket (con `Payment:` y, si hubo conexión, el invoice real) después de mandar el batch | `CurrentOrderActivity.kt` | ✅ |
+| 80.3 | Error del primer print usa `error_print_generic` ("Print error: %s") en vez de `error_order_sent_print_fail` ("Order sent · Print error: %s") — en ese punto el pedido todavía no se mandó al servidor, así que el mensaje viejo era incorrecto | `CurrentOrderActivity.kt` | ✅ |
+
+### Fuera de esta ronda
+- Sin cambios de backend.
+- No aplica a `PreOrderDetailActivity` (conversión de pre-órdenes) — sigue con una sola impresión, como documentado desde la Fase 76.
+
+## Fase 81: Reordenar diálogo de impresora antes del diálogo de crédito ✅
+
+### Contexto
+Tras la Fase 80, el orden post-firma en `CurrentOrderActivity` quedó: firma → diálogo de crédito disponible → diálogo de confirmar impresora → ticket #1 → método de pago → ticket #2. El usuario probó el flujo y pidió que el diálogo de impresora aparezca **antes** del diálogo de crédito, no después.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 81.1 | Orden invertido: `signatureLauncher` ahora llama `checkPrinterThenFinalize()` directo (antes llamaba `askApplyCredit()`); `checkPrinterThenFinalize()` llama `askApplyCredit(skipPrint)` (antes llamaba `printFirstTicketThenAskPayment(skipPrint)` directo); `askApplyCredit()` ahora recibe `skipPrint: Boolean` y llama `printFirstTicketThenAskPayment(skipPrint)` en sus tres salidas (sin cliente, crédito aplicado, sin crédito/error). Nuevo orden: firma → impresora → crédito → ticket #1 → pago → ticket #2 | `CurrentOrderActivity.kt` | ✅ |
+
+### Fuera de esta ronda
+- Sin cambios de backend ni de `PreOrderDetailActivity` (mantiene su propio orden: firma → dañados → crédito → pago → impresora → convertir).
+
+## Fase 82: Batch (e invoice de QBO) se manda antes del ticket #1, método de pago se adjunta después ✅
+
+### Contexto
+El usuario quería el número de factura real ya en el ticket #1 — hasta ahora `sendBatch()` (que crea las filas en `orders` y la factura en QBO) corría recién después de elegir el método de pago, así que el primer ticket imprimía sin invoice. Se movió el envío del batch a justo antes del ticket #1 (con `payment_method`/`check_number` en `null`, todavía no se conocen), y se agregó una forma de "pegarle" el método de pago al pedido ya creado una vez que el usuario lo elige, sin tocar el `CustomerMemo` de la factura en QBO (decisión explícita: alcanza con que el ticket impreso lo diga).
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 82.1 | Nuevo `PUT /api/orders/batch/:batchId/payment` (`updateBatchPayment`) — `UPDATE orders SET payment_method = ?, check_number = ? WHERE batch_id = ?`. Sin llamada a QuickBooks | `src/controllers/orderController.ts`, `src/routes/orders.ts` | ✅ |
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 82.2 | `BatchResponse.localPendingId` (nunca lo manda el servidor) — permite identificar la fila en `pending_batches` cuando el batch se mandó offline, para poder actualizarla después | `data/Models.kt` | ✅ |
+| 82.3 | `UpdatePaymentRequest` + `ApiService.updateBatchPayment()` (`PUT`) | `data/Models.kt`, `data/network/ApiService.kt` | ✅ |
+| 82.4 | `PendingBatchDao.insert()` ahora devuelve el `Long` id generado; nuevo `updateBatchJson(id, newJson)` | `data/local/dao/PendingBatchDao.kt` | ✅ |
+| 82.5 | `OrderRepository.saveOfflineBatch()` propaga el id local en `localPendingId`; nuevos `attachPaymentMethod()` (caso online, llama al endpoint nuevo) y `attachPaymentMethodOffline()` (caso offline, re-serializa el `BatchRequest` ya encolado en `pending_batches` con el `payment_method`/`check_number` correctos, para que `SyncWorker` lo mande bien más tarde vía el `createBatch` de siempre — sin endpoint especial para offline) | `data/repository/OrderRepository.kt` | ✅ |
+| 82.6 | `CurrentOrderActivity` reordenada: `printFirstTicketThenAskPayment()` ahora manda el batch de verdad (antes solo imprimía un preview local) y guarda la respuesta en `sentBatch` (batchId/invoiceId/invoiceNumber/creditsTotal/items) para reusarla después. `sendBatchAndPrint()` ya no manda el batch — solo adjunta el método de pago (`attachPaymentMethod`/`attachPaymentMethodOffline` según corresponda) e imprime el segundo ticket con el mismo invoice + `Payment:` | `CurrentOrderActivity.kt` | ✅ |
+| 82.7 | String `loading_saving_payment` en ambos locales | `strings.xml` | ✅ |
+
+### Fuera de esta ronda
+- No se actualiza el `CustomerMemo` de la factura en QBO con el método de pago — decisión explícita del usuario, el ticket impreso alcanza.
+- `PreOrderDetailActivity` no se toca — sigue mandando el batch después de elegir el método de pago (una sola impresión).
+
+## Fase 83: Mover el diálogo de crédito antes de la firma (no después del ticket #1) ✅
+
+### Contexto
+Después de la Fase 82, el usuario pidió que el crédito se decidiera *después* de imprimir el ticket #1 (junto con el método de pago). Se le explicó la diferencia clave: el método de pago es puro memo en QBO, pero el crédito aplicado (`apply_credit`) es una **línea real de descuento** en la factura (`qbInvoices.ts`, `Discount line`) — si se decide después de crear la factura, o se hace una llamada extra a QBO para agregarlo, o la factura queda con el total mal. El usuario decidió, en cambio, mover el diálogo de crédito **antes de la firma** (en vez de entre impresora y ticket #1) — así el crédito siempre queda resuelto antes de mandar cualquier cosa a QBO, sin necesitar una segunda llamada a QuickBooks.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 83.1 | Nuevo orden: `askDamagedItems()` → `askApplyCredit()` (ya sin parámetro `skipPrint`) → `launchSignature()` → `signatureLauncher` → `checkPrinterThenFinalize()` → `printFirstTicketThenAskPayment(skipPrint)` → `askPaymentMethod(skipPrint)` → `sendBatchAndPrint(skipPrint)` | `CurrentOrderActivity.kt` | ✅ |
+| 83.2 | Fix de un bug que este reorden habría expuesto: `signatureLauncher` reseteaba `pendingApplyCredit = null` justo después de la firma — inofensivo antes (el crédito se preguntaba después de la firma), pero con el crédito ahora resuelto *antes* de firmar, ese reset borraba la elección del usuario. Se movió el reset a `btnFinalize.setOnClickListener` (el verdadero inicio del flujo) | `CurrentOrderActivity.kt` | ✅ |
+
+### Fuera de esta ronda
+- Sin cambios de backend — no hizo falta ninguna llamada extra a QBO gracias al reorden.
+
+## Fase 84: Disclaimer impreso → QR (Android, sin cambios de backend) ✅
+
+### Contexto
+El usuario ya no quiere el texto legal completo impreso/mostrado en el ticket — pidió reemplazarlo por un QR (imagen provista por el usuario) que apunta a una página web con el disclaimer.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 84.1 | QR embebido en la APK (`disclaimer_qr.png`, 1200×1200, `drawable-nodpi` para que no se escale por densidad) | `app/src/main/res/drawable-nodpi/disclaimer_qr.png` | ✅ |
+| 84.2 | `bitmapToEg()` — extraído de lo que antes era solo `buildSignatureEg()` (conversión Bitmap → comando CPCL `EG`, 1-bit MSB-first), ahora compartido; `buildSignatureEg()` (firma, base64) y nuevo `buildQrEg()` (QR, `BitmapFactory.decodeResource`) delegan en él. El bloque de "Términos y condiciones" (texto completo wrappeado) se reemplazó por una línea de caption + el QR impreso vía `EG`, centrado en la página | `data/print/PrintService.kt` | ✅ |
+| 84.3 | Vista en pantalla ("Ver ticket") — mismo reemplazo: el bloque de texto del disclaimer pasa a un `ImageView` con el mismo QR | `TicketDetailActivity.kt` | ✅ |
+
+### Fuera de esta ronda
+- Sin cambios de backend.
+- `SecurePreferences.getDisclaimer()`/`saveDisclaimer()` y el campo editable en `SettingsActivity` (`etDisclaimer`) no se tocaron — la infraestructura de disclaimer configurable (Android + webapp `/settings`) sigue existiendo, solo dejó de imprimirse/mostrarse en el ticket. Si en algún momento se quiere retirar esa infraestructura por completo (Settings del device, `company_settings.disclaimer` en el backend, campo en la webapp), es una ronda aparte.
+
+## Fase 85: Botón "+ Agregar crédito" en CurrentOrderActivity — crédito para un producto fuera del carrito ✅
+
+### Contexto
+Hasta ahora, marcar un producto como dañado/caducado (crédito) dentro de un pedido en curso solo era posible para productos que ya estaban en el carrito (`askDamagedItems()`, limitado a `pending_orders`). El usuario pidió un botón aparte en `CurrentOrderActivity` que abra una búsqueda de productos normal, y que lo elegido ahí se agregue como línea negativa (crédito) al pedido — sin necesidad de que ese producto esté en el carrito.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 85.1 | Botón `btnAddCreditItem` ("+ Agregar crédito") arriba de "Ver ticket"/"Finalizar pedido" | `activity_current_order.xml` | ✅ |
+| 85.2 | `showAddCreditItemDialog()` — diálogo de búsqueda por nombre (mismo patrón que `IssueCreditActivity`, sin escaneo DataWedge) → `askCreditQtyThenAdd()` pide cantidad → agrega/mergea un `DamageItem` a `pendingDamageItems` (mismo campo que ya usa `askDamagedItems()`, así que reusa toda la lógica de cálculo/impresión/envío sin tocar el backend) | `CurrentOrderActivity.kt` | ✅ |
+| 85.3 | `loadOrder()` renderiza `pendingDamageItems` como filas extra en la lista del carrito (mismo layout, tag "CREDIT", total en rojo, solo botón borrar) | `CurrentOrderActivity.kt` | ✅ |
+| 85.4 | `askDamagedItems()` ajustado para no pisar las entradas agregadas a mano — solo reemplaza las entradas cuyo barcode está en el carrito actual, preserva el resto | `CurrentOrderActivity.kt` | ✅ |
+| 85.5 | Strings `btn_add_credit_item`, `label_credit_item_tag` en ambos locales (reusa `title_credit_qty`/`hint_credit_qty`/`hint_product_name_search`/etc. ya existentes) | `strings.xml` | ✅ |
+
+### Fuera de esta ronda
+- Sin cambios de backend — reusa `damage_items` en `createBatch`, ya existente desde la Fase 75.
+- Sin escaneo DataWedge en el diálogo de búsqueda — solo búsqueda por nombre, `CurrentOrderActivity` no tenía infraestructura de scanner propia.
+
+### Fase 85b: Fix — ORDER TOTAL no descontaba los créditos agregados
+Reporte del usuario, mismo día: al agregar un ítem normal y un crédito, el "ORDER TOTAL" del carrito no cambiaba — seguía sumando solo los ítems reales. `loadOrder()` en `CurrentOrderActivity.kt` ahora calcula `creditsTotal = pendingDamageItems.sumOf { it.qty * it.unitPrice }` y lo resta del total mostrado; nuevo `tvCreditsTotal` (rojo, `activity_current_order.xml`) muestra `"Credits: -$X.XX"` debajo del total cuando hay crédito, oculto si no. String `label_order_credits` en ambos locales.
+
+## Fase 86: Persistir los credit items del carrito (sobreviven cierre de la app) ✅
+
+### Contexto
+Reporte del usuario: al cerrar la app y volver a abrirla, los productos normales del carrito seguían ahí, pero los agregados vía "+ Agregar crédito" (Fase 85) desaparecían. Causa: vivían solo en `pendingDamageItems`, una variable en memoria de `CurrentOrderActivity` — se pierde si Android mata el proceso. Los productos normales sobreviven porque están en SQLite (`pending_orders`).
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 86.1 | `AppDatabase` v12 → v13 — columna nueva `pending_orders.is_credit INTEGER DEFAULT 0` (`ALTER TABLE` simple, no requiere recrear la tabla) | `data/local/AppDatabase.kt` | ✅ |
+| 86.2 | `PendingOrderEntity.isCredit: Boolean = false`; `OrderDao` — `insert()`/`cursorToEntity()` leen/escriben la columna; `findActiveByBarcodeAndPrice()` agrega `AND is_credit = 0` (evita que un re-escaneo normal se mergee por accidente con una fila de crédito del mismo barcode — riesgo real en Case/Unit/Bucket, mismo precio unitario); nuevo `findActiveCreditByBarcode()`; `count()` agrega `AND is_credit = 0` (badge "Ver pedido (N)" ya no cuenta créditos como producto) | `data/local/entities/PendingOrderEntity.kt`, `data/local/dao/OrderDao.kt` | ✅ |
+| 86.3 | `OrderRepository.saveCreditItem(barcode, productName, qty, unitPrice)` — inserta o mergea (suma qty) una fila `is_credit = true` | `data/repository/OrderRepository.kt` | ✅ |
+| 86.4 | Los 6 lugares de `CurrentOrderActivity` que llaman `getPendingOrders()` separan `normalItems`/`creditRows` por `isCredit` — el más crítico es `printFirstTicketThenAskPayment()` (`toBatchItems()` solo con `normalItems`, para que un crédito nunca se mande como línea positiva real en la factura). `askCreditQtyThenAdd()` ahora llama `saveCreditItem()` en vez de mutar una lista en memoria. `PendingOrderEntity.toDamageItem()` es el helper de conversión | `CurrentOrderActivity.kt` | ✅ |
+
+### Fuera de esta ronda
+- Sin cambios de backend.
+
+---
+
+## Fase 87: Pre-órdenes — detalle de producto (peso/case/precio) se captura al convertir, no al crear ✅
+
+### Contexto
+Pedido del usuario: crear una pre-orden debía ser únicamente elegir qué productos van, sin pesar/casear/precificar nada — porque el producto exacto que se entrega (y su precio/peso ese día) recién se sabe el día de la pre-orden. Antes, `CreatePreOrderActivity` lanzaba el mismo stepper de peso/case/precio que usa el carrito real (`ProductDetailActivity` en `PRE_ORDER_MODE`) al agregar cada producto. Ahora ese stepper se movió íntegro a `PreOrderDetailActivity`, producto por producto, justo antes de convertir — con el precio/catálogo **actual** (no el que había al crear el borrador).
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 87.1 | `PreOrderItem.price/quantity/total` pasan a nullable (borrador sin detallar); se agrega `caseQty` (no existía) | `data/Models.kt` | ✅ |
+| 87.2 | `ConvertPreOrderRequest` agrega `items: List<PreOrderItem>` — el detalle finalizado, que antes no viajaba en la conversión | `data/Models.kt` | ✅ |
+| 87.3 | `CreatePreOrderActivity` deja de lanzar `ProductDetailActivity` — `addDraftItem()` agrega el producto directo (barcode+nombre, sin duplicados); se quita "Total estimado" (nada que sumar sin precio) | `CreatePreOrderActivity.kt`, `activity_create_pre_order.xml` | ✅ |
+| 87.4 | `PreOrderDetailActivity` — para pre-órdenes DRAFT/CONFIRMED, cada item sin detallar muestra botón "Detallar"; `finalizeItem()` pide el producto fresco del catálogo (`getProductByBarcode`) y relanza `ProductDetailActivity` en `PRE_ORDER_MODE`; `btnConvert` queda deshabilitado hasta que todos los items tengan su detalle. `askDamagedItems()`/`askApplyCredit()`/`doConvert()` usan `finalizedItemsFlat` en vez de `po.items`. `reusePreOrder()` ya no copia el precio finalizado al nuevo borrador (la nueva pre-orden también pasa por su propio finalize-at-conversion) | `PreOrderDetailActivity.kt`, `activity_pre_order_detail.xml` | ✅ |
+| 87.5 | `ProductDetailActivity` — la rama `PRE_ORDER_MODE` de `saveOrder()` ahora setea `caseQty` en el `PreOrderItem` devuelto (gap preexistente: un pre-order de un producto Case perdía ese dato) | `ProductDetailActivity.kt` | ✅ |
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 87.6 | `pre_order_items`: `price`/`quantity`/`total` ahora nullable; columnas nuevas `unit`/`case_qty` | `preOrderController.ts` (`ensureTables`), `excellentia_schema.sql`, `routes/setup.ts` | ✅ |
+| 87.7 | `createPreOrder`/`updatePreOrder` — el insert de items tolera precio/cantidad ausentes (`hasPricing` gate) | `preOrderController.ts` | ✅ |
+| 87.8 | `convertPreOrder` reescrito: los items finalizados llegan en el body (`req.body.items`, 400 si falta) en vez de leerse de `pre_order_items` — se valida precio mínimo por item (paridad nueva con `createBatch`, antes no existía para pre-órdenes), se insertan en `orders` incluyendo `unit`/`case_qty` (gap preexistente, cerrado de paso), y se reescriben en `pre_order_items` (delete+reinsert) para que `GET /api/preorders/:id` y "Reusar pre-orden" reflejen lo entregado, no el borrador vacío | `preOrderController.ts` | ✅ |
+| 87.9 | Migración `routes/setup.ts` (`GET /api/setup`, correr una vez): `pre_orders.salesperson_name` (ya estaba en `ensureTables()` pero no en `setup.ts`), `pre_order_items` nullable + `unit`/`case_qty` | `routes/setup.ts` | ✅ |
+| 87.10 | Fix — `finalizeItem()` mandaba `QUANTITY = 1.0` fijo al relanzar el stepper; para productos Case eso pisaba el tamaño real de la caja (`products` **no tiene** columna `case_qty` — el tamaño de caja viaja en `products.qty`, y `ProductDetailActivity` lo recupera vía el fallback interno de `QUANTITY` cuando `CASE_QTY` llega en 0, ver Fase 87 nota de diseño en `CLAUDE.md` de Android). Cada caja se procesaba como "caja de 1". Fix: calcular `initialQty` igual que `MainActivity.openDetail()` (`product.qty` si > 0, si no `weightPerUnit`, si no 1.0); de paso se agregó el extra `STOCK` que tampoco se mandaba, para paridad completa con el flujo normal | `PreOrderDetailActivity.kt` | ✅ |
+| 87.11 | Fix — `PreOrderListActivity` mostraba "$0.00" para toda pre-orden DRAFT/CONFIRMED/CANCELLED (esperado, sin precio hasta convertir — Fase 87), se leía como error. Ahora muestra "Sin detallar" salvo `status == "CONVERTED"` (único estado con total real persistido en `pre_order_items`). `PreOrderDetailActivity.renderItemsSection()` ya mostraba "—" correctamente para el mismo caso — solo faltaba la lista | `PreOrderListActivity.kt` | ✅ |
+
+### Orden de despliegue
+Backend primero (compatible hacia atrás con un APK viejo que siga mandando precio completo al crear) → correr `GET /api/setup` una vez → recién ahí distribuir el APK nuevo. Sin esto, `createPreOrder` con items sin precio falla contra la constraint `NOT NULL` vieja.
+
+### Fuera de esta ronda
+- `convertPreOrder` sigue sin descontar `products.stock` al convertir (a diferencia de `createBatch`) — gap preexistente, no tocado.
+- Pre-órdenes DRAFT/CONFIRMED creadas antes de este deploy (con precio completo, app vieja) se muestran como "sin detallar" la primera vez que se abren con la app nueva — se sobreescriben al finalizar, sin pérdida de datos.
+
+---
+
+## Fase 88: Pre-órdenes — doble impresión (mismo patrón que CurrentOrderActivity) ✅
+
+### Contexto
+Pedido del usuario: que la conversión de pre-órdenes tenga el mismo flujo de impresión que un pedido normal — ticket #1 apenas se manda (con el número de factura real), se pregunta el método de pago después, y se imprime un ticket #2 con "Payment: X". Antes de esta fase, `PreOrderDetailActivity` preguntaba el pago **antes** de convertir e imprimía una sola vez.
+
+Sin cambios de backend ni de SQL: `updateBatchPayment` (`PUT /api/orders/batch/:batchId/payment`, Fase 82) ya es genérico sobre la tabla `orders` por `batch_id` — como `convertPreOrder` escribe ahí con el mismo esquema que `createBatch`, sirve tal cual sin tocarlo.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 88.1 | Reordenado: `askApplyCredit()` ahora sigue a `checkPrinterThenConvert()` en vez de a `askPaymentMethod()` — el pago se pregunta después de convertir, no antes | `PreOrderDetailActivity.kt` | ✅ |
+| 88.2 | `doConvert()` → `doConvertAndPrintFirst(skipPrint)` — manda `convertPreOrder` con `payment_method=null`/`check_number=null` (ya con firma/dañados/crédito), guarda la respuesta en `sentConversion` (nuevo, mismo rol que `SentBatch` en `CurrentOrderActivity`), imprime el ticket #1 sin "Payment:", y llama `askPaymentMethod(skipPrint)` en vez de navegar a `OrderSuccessActivity` | `PreOrderDetailActivity.kt` | ✅ |
+| 88.3 | `askPaymentMethod()` pasa a recibir `skipPrint: Boolean`; cada botón llama `sendPaymentAndPrint(skipPrint)` en vez de `checkPrinterThenConvert()` | `PreOrderDetailActivity.kt` | ✅ |
+| 88.4 | `sendPaymentAndPrint(skipPrint)` (nuevo) — adjunta el pago vía `updateBatchPayment` (endpoint existente, sin cambios), imprime el ticket #2 con el mismo invoice + Payment, y recién ahí navega a `OrderSuccessActivity` | `PreOrderDetailActivity.kt` | ✅ |
+
+### Fuera de esta ronda
+- Sin cambios de backend — `updateBatchPayment` ya era reusable tal cual.
+- A diferencia de `CurrentOrderActivity`, las pre-órdenes no tienen variante offline (`isOfflinePending`) — requieren internet siempre, así que `sendPaymentAndPrint` no necesita esa rama.
+
+---
+
+## Fase 89: Fix — precio de Case es el precio total de la caja, no se multiplica por caseQty ✅
+
+### Contexto
+Reporte del usuario: productos `unit = "Case"` con caja de 12 unidades, catálogo con `price = 2.69` — la app calculaba el total de la caja como `2.69 × 12 = $32.28`, pero la tienda vende esa caja completa en $2.69, no $32.28. `products.price` para un Case ya es el precio de venta de la caja entera, no el precio de una sola unidad dentro de ella. Sin cambios de backend — `creditCalculator.ts`/QBO invoice nunca multiplicaban por su cuenta, solo usan el precio que manda el cliente, así que el fix fue enteramente del lado Android.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 89.1 | `onCreate()`/`showProduct()` — eliminado `baseTotal = productPrice * caseQty`; ahora `baseTotal`/`pricePerLb = productPrice` directo | `ProductDetailActivity.kt` | ✅ |
+| 89.2 | Labels `"$X/unit"` (`tvPrice`, `tvTotalWeight` en `recalcTotal()`) — antes mostraban `productPrice` crudo como precio unitario, ahora `productPrice / caseQty` (ya que `productPrice` pasó a ser el precio de la caja) | `ProductDetailActivity.kt` | ✅ |
+| 89.3 | `editItem()` — ya no reconstruye `order.price / caseQty` para pasarlo como `PRODUCT_PRICE`; se manda `order.price` tal cual, porque `ProductDetailActivity` ya no vuelve a multiplicar | `CurrentOrderActivity.kt` | ✅ |
+| 89.4 | `estimatedUnitValueOf()` (crédito de un producto suelto, buscado fuera del carrito) — Case pasó de usar `product.price` directo a `product.price / caseSize` para obtener el valor de una sola unidad dañada. `caseSize` usa `product.caseQty?.takeIf{it>0} ?: product.qty.takeIf{it>0}` porque `products.case_qty` no existe en MySQL (`ProductDto.caseQty` siempre null/0) | `CurrentOrderActivity.kt`, `IssueCreditActivity.kt` (misma función duplicada en ambos) | ✅ |
+
+### Fuera de esta ronda
+- `unitValueOf(order: PendingOrderEntity)` (crédito de un producto ya en el carrito) **no cambió** — ya dividía `order.price / order.caseQty`, que sigue siendo correcto porque `order.price` sigue significando "precio de la caja completa" en el esquema nuevo igual que en el viejo.
+- Sin cambios de backend.
+- ⚠️ Pendiente de verificar en el backend/admin: si `min_price` de estos productos Case fue cargado asumiendo el precio multiplicado (~$32), ahora bloqueará ediciones al precio real (~$2.69) — puede necesitar recarga de datos para esos SKUs.
+
+---
+
+## Fase 90: Fusión de tipos de producto "Case" + "Unit" → "Case/Unit" ✅
+
+### Contexto
+Pedido del usuario: unificar los tipos "Case" y "Unit" en un solo tipo de producto, "Case/Unit", reusando la lógica de precio de Case (Fase 89 — `price` = precio total del paquete, se divide por la cantidad de unidades para obtener el valor de una sola unidad). Confirmado con el usuario antes de implementar: los productos que hoy son "Unit" casi siempre tienen `qty = 1` (se venden de a uno), así que fusionarlos con la lógica de Case es seguro — un "paquete de 1" se comporta igual que el "Unit" lineal de antes.
+
+De paso se detectó y arregló un bug de dinero activo desde la Fase 89: `creditCalculator.ts` (backend, cálculo autoritativo de crédito por daño) seguía devolviendo `products.price` directo para Case, sin dividir por tamaño de paquete — desde que Android empezó a tratar `price` como precio total del paquete (Fase 89), el crédito real aplicado en la factura de QuickBooks para una unidad dañada de un producto Case estaba sobre-valuado por un factor de `qty` (ej. 1 unidad dañada de un paquete de 12 a $2.69 se acreditaba $2.69 completos en vez de $0.22).
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 90.1 | `unitValueOf()` — Case/Unit/Case-Unit ahora divide `price / qty` (antes devolvía `price` directo para Case); agregado `qty` al SELECT (`products` no tiene `case_qty`, el tamaño real de paquete viaja en `qty`) | `src/services/creditCalculator.ts` | ✅ |
+| 90.2 | Migración de datos (endpoint `/api/setup`, correr a mano tras el deploy): `UPDATE products SET unit='Case/Unit' WHERE unit IN ('Case','Unit')` — solo el catálogo vivo; `orders`/`pre_order_items` históricos no se tocan (quedan con el unit real de la venta) | `src/routes/setup.ts` | ✅ |
+
+### Webapp
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 90.3 | Dropdown de tipo de producto — colapsados `<option value="Unit">`/`<option value="Case">` en un solo `<option value="Case/Unit">` | `app/products/_components/ProductModal.tsx` | ✅ |
+| 90.4 | Al editar un producto viejo con `unit` legacy ("Case"/"Unit" sueltos, previo a correr la migración), se normaliza a `"Case/Unit"` al popular el form para que el `<select>` preseleccione correctamente | `app/products/_components/ProductModal.tsx` | ✅ |
+| 90.5 | Columna "Unidad" de la tabla — mismo mapeo Case/Unit → "Case/Unit" para que se vea consistente aunque la fila no esté migrada todavía | `app/products/_components/ProductRow.tsx` | ✅ |
+
+### Android
+Detalle completo en `CLAUDE.md` (repo Android) — nuevo helper `isCaseUnitType(unit)` en `data/Models.kt` (acepta `"Case/Unit"` y, por compatibilidad con datos históricos, también `"Case"`/`"Unit"` sueltos), usado en `ProductDetailActivity`, `CurrentOrderActivity` e `IssueCreditActivity` en vez de comparar contra `"Case"` a secas. Categoría de ticket fusionada (`TICKET_CATEGORY_ORDER`, `ticketCategoryFor()`) para que un ticket con productos históricamente "Case" y "Unit" mezclados no muestre dos secciones separadas.
+
+### Fuera de esta ronda
+- Min-price validation (`orderController.ts`/`preOrderController.ts`) ya era unit-agnóstica — no necesitó cambios.
+- No se tocaron `orders.unit`/`pre_order_items.unit` de ventas ya facturadas — la app y el backend ya tratan esos valores legacy como equivalentes a `Case/Unit` en la lectura.
+- Bucket y Lbs sin cambios — la fusión es solo entre Case y Unit.
+
+---
+
+## Fase 91: Ticket — nuevo formato de línea de ítem (# / descripción / qty / rate / total) ✅
+
+### Contexto
+Pedido del usuario: cambiar cómo se muestran los productos en el ticket a un formato tipo factura — número de línea, descripción, cantidad/peso, tarifa y total como campos separados (antes la cantidad y la tarifa venían mezcladas en un solo texto, ej. `"22.8 lb x $0.18/lb"`). Confirmado con el usuario el layout de 2 líneas por ítem (nombre no siempre entra junto con las 4 columnas en el ancho angosto de la impresora térmica ZQ630) y que aplica igual al ticket impreso y al de pantalla.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 91.1 | Línea 1 `"# Nombre"` (número de línea corrido para todo el ticket, no se reinicia por categoría) + línea 2 en 3 columnas (`threeCol` nuevo, análogo a `twoCol`): qty/weight, rate, total | `data/print/PrintService.kt` (CPCL) | ✅ |
+| 91.2 | Mismo cambio en el ticket en pantalla — `addThreeCol()` nuevo (fila `LinearLayout` de 3 `TextView`, mid/right alineados a la derecha) | `TicketDetailActivity.kt` | ✅ |
+| 91.3 | El campo qty ya no incluye `"x $rate"` (se movió a su propia columna); el desglose `"of Q"` (Case/Unit con paquete >1) y `"N -"` (varias pesadas agrupadas) se conservan igual que antes de la Fase 91 | ambos archivos | ✅ |
+| 91.4 | Encabezado de columnas — `"#  Description"` + `threeCol("Qty/Weight", "Rate", "Total")` una sola vez antes de la lista de ítems (pedido de seguimiento del usuario, después de ver el resultado sin headers) | `data/print/PrintService.kt`, `TicketDetailActivity.kt` | ✅ |
+| 91.5 | Ticket impreso — el usuario preguntó por el padding izq/der; `PAGE-WIDTH 576` ya es el ancho real de la ZQ630 (no hay margen artificial ahí), pero los anchos de `wrapText`/`threeCol` de la sección de ítems eran conservadores (24/30 chars contra un máximo físico de ~33.9 con Font 4). Ensanchados a 27/32 para aprovechar más el ancho real sin llegar al límite teórico | `data/print/PrintService.kt` | ✅ |
+| 91.6 | **Fix** — al ajustar esos anchos a mano el usuario terminó con `threeCol(..., width = 48)` (48 chars × 17px = 816px, más de lo que entra en `PAGE-WIDTH 576`); la impresora envolvía esa fila por su cuenta sin que el código avanzara el `y`, pisando la línea siguiente. Unificado: `LINE_WIDTH`/`MAX_LINE_CHARS` calculados una sola vez desde `PW`/17px, todo el ticket usa ese único default, y `wrapText`/`twoCol`/`threeCol` clampan internamente contra el máximo físico — ya no se puede desbordar la página aunque alguien pase un ancho grande a mano. De paso, los campos de cabecera (nombre de empresa, subtítulo, dirección, ciudad, teléfono) que truncaban con `.take()` en vez de wrappear pasaron a usar wrap real (`tWrapped()` nuevo) | `data/print/PrintService.kt` | ✅ |
+
+### Fuera de esta ronda
+- Sin cambios de backend/webapp — es puramente presentación del ticket en Android.
+- En el ticket impreso, la columna de cantidad/peso se trunca (`.take()`) en el caso raro de un texto muy largo (ej. "N - Case/Unit of Q" con N y Q de 2+ dígitos a la vez) para no romper la alineación de rate/total — no aplica al ticket en pantalla, que usa `TextView`s reales sin límite de caracteres fijo.
+
+---
+
+---
+
+## Fase 92: Fix — ancho de línea + splitAddress en ticket CPCL (PrintService) ✅
+
+### Contexto
+La dirección del cliente en el ticket impreso se partía por `wrapText()` usando `LINE_WIDTH=31` chars sin considerar que Font 4 en la ZQ630 es proporcional — cadenas de ≤31 caracteres podían ocupar más de 576px en la impresora y el firmware envolvía el último carácter sin avanzar `y`, pisando la línea siguiente. Además, direcciones sin coma (ej. `"2323 Avenida Costa Este Suite 100"`) no se partían en la calle vs. unidades/cuarto — `wrapText` por ancho solo producía cortes antiestéticos.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 92.1 | `LINE_WIDTH` reducido de `MAX_LINE_CHARS - 2` a `MAX_LINE_CHARS - 4` (33→29) — margen extra de ~83px contra PAGE-WIDTH 576px para absorber la variación de la fuente proporcional | `data/print/PrintService.kt` | ✅ |
+| 92.2 | `splitAddress(text)` — nuevo helper que parte una dirección en líneas naturales: (1) primera coma separa calle de ciudad/estado; (2) palabras clave (Suite/Unit/Apt/Ste/Apart) con word boundary regex; (3) prefijo `#` para unidades; (4) si nada coincide, devuelve el texto completo (wrapText se encarga después) | `data/print/PrintService.kt` | ✅ |
+| 92.3 | Header `address` y `city` — reemplazado `tWrapped` directo por `splitAddress()` + loop de `tWrapped` por cada parte. Mismo patrón que se aplicó a `customerAddress` | `data/print/PrintService.kt` | ✅ |
+| 92.4 | `customerAddress` — reemplazado el split por coma manual por `splitAddress()` + loop de `tWrapped` (misma lógica, ahora también detecta keywords y #) | `data/print/PrintService.kt` | ✅ |
+
+**Efecto en `"2323 Avenida Costa Este Suite 100"`:**
+```
+Antes (wrapText 31 chars):      Después (splitAddress + tWrapped):
+2323 Avenida Costa Este         2323 Avenida Costa Este
+Suite 100                       Suite 100
+```
+El resultado impreso es idéntico en este caso concreto (ambos métodos rompían igual por ancho), pero la lógica con `splitAddress` también separa por coma (calle vs. ciudad/estado) igual que `TicketDetailActivity.buildReceipt()`, manteniendo consistencia entre el ticket en pantalla y el impreso.
+
+### SQL
+Ninguno — cambios solo en código Android (Kotlin).
+
+---
+
+---
+
+## Fase 93: Ticket — ajustes de columnas, QR link y header compacto ✅
+
+### Contexto
+Tres ajustes al ticket (CPCL impreso + pantalla) después de la Fase 92: (1) las columnas `midWidth`/`rightWidth` de `threeCol` troncaban valores grandes ($1000+) y el header/data usaban `x` distintos en CPCL, desalineando; (2) el URL del QR se agregó debajo del código pero sin `https://` ni salto de línea — la impresora ZQ630 superponía caracteres; (3) los headers de columna eran innecesariamente largos (`"#  Description"`, `"Qty/Weight"`) y ocupaban espacio valioso.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 93.1 | `threeCol`: midWidth 7→8, rightWidth 8→9 (caben $1000.00 y $10000.00 sin truncar); `leftWidth` se recalcula solo (14→12) | `data/print/PrintService.kt` | ✅ |
+| 93.2 | threeCol header y data rows: `x=4`→`x=0` en CPCL, alineados con `"#  Desc"` | `data/print/PrintService.kt` | ✅ |
+| 93.3 | Continuation lines de nombre de producto (wrap): `F4, 4, y`→`F4, 0, y` — mismo x que el resto, sin zigzag | `data/print/PrintService.kt` | ✅ |
+| 93.4 | `addThreeCol` en pantalla: mid/right pasan de `WRAP_CONTENT` a ancho fijo medido con `Paint.measureText("M".repeat(N))` — columnas ya no se desalinean entre header y data | `TicketDetailActivity.kt` | ✅ |
+| 93.5 | URL del QR: `"excellentiafoods.com/..."`→`"https://excellentiafoods.com/..."` con `chunked(LINE_WIDTH=29)` — parte exactamente en `.com/` (2 líneas, sin overlapping) | `data/print/PrintService.kt` | ✅ |
+| 93.6 | URL del QR en pantalla: same `https://` prefix agregado al TextView | `TicketDetailActivity.kt` | ✅ |
+| 93.7 | Header compacto: `"#  Description"`→`"#  Desc"`, `"Qty/Weight"`→`"Qty/W"` (ambos archivos) | `data/print/PrintService.kt`, `TicketDetailActivity.kt` | ✅ |
+
+### Fuera de esta ronda
+- Sin cambios de backend/webapp.
+
+---
+
+## Fase 94: Nombre corto de producto (`short_name`) para el ticket ✅
+
+### Contexto
+Pedido del usuario: en la webapp, poder cargar a mano un "nombre corto" por producto (distinto del `name` completo usado en QBO/reportes), y que ese nombre corto sea el que se imprima/muestre en el ticket de venta en vez del nombre completo — pensado para productos con nombres largos que no entran bien en el ancho angosto de la ZQ630 o que el usuario prefiere mostrar más simplificados al cliente. Si un producto no tiene `short_name` cargado, el ticket sigue mostrando el `name` completo como hasta ahora (fallback, sin romper productos existentes).
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 94.1 | Columna `products.short_name VARCHAR(255) NULL` — agregada al `CREATE TABLE` (instalaciones nuevas) y como migración `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` (bases existentes) | `src/routes/setup.ts` | ✅ |
+| 94.2 | `createProduct`/`updateProduct` — `short_name` agregado al INSERT y al patrón de partial-update dinámico (mismo tratamiento que `description`: string nullable, no dispara sync a QBO) | `src/controllers/productController.ts` | ✅ |
+| 94.3 | `Product` interface — campo `short_name: string \| null` agregado | `src/types/index.ts` | ✅ |
+| 94.4 | Sin cambios en `listProducts`/`getProductByBarcode` — ambos usan `SELECT *`, la columna nueva aparece automáticamente en la respuesta JSON sin tocar la query | `src/controllers/productController.ts` | ✅ |
+| 94.5 | Reference docs sincronizados (no ejecutados por la app) | `src/db/schema.sql`, `excellentia_schema.sql` | ✅ |
+
+**Fuera de esta ronda:** `GET /api/orders` (`listOrders`) no hace join con `products` — los reimpresos de pedidos históricos desde Historial siguen mostrando el `name` completo, no el `short_name`. Solo importa para el ticket inmediato (justo después de la venta), donde todo se arma en el cliente Android sin volver a golpear el backend.
+
+### Webapp
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 94.6 | Campo "Short name (ticket)" en el modal de producto — mismo patrón que `description` (siempre se manda, `trim() \|\| null`, para que vaciarlo en la UI también lo borre en el servidor) | `app/products/_components/ProductModal.tsx` | ✅ |
+| 94.7 | Subtexto azul bajo el nombre en la tabla de productos, solo si `short_name` tiene valor | `app/products/_components/ProductRow.tsx` | ✅ |
+| 94.8 | `Product` interface (`short_name: string \| null`) + claves de traducción `modal_shortName`/`modal_shortNamePh` (es/en) | `app/products/page.tsx`, `app/lib/i18n.ts` | ✅ |
+
+### Android
+Detalle completo en `CLAUDE.md` (este repo). Resumen: `short_name` viaja por toda la cadena — `ProductDto`/`Product` → cache offline (`cached_products`, migración v14) → escaneo/búsqueda en `MainActivity` (extra `SHORT_NAME`, 5 sitios de `SuggestionItem`) → `ProductDetailActivity` (nuevo `KEY_SHORT_NAME`) → carrito (`pending_orders`, migración v14) → armado del ticket en `CurrentOrderActivity`/`PreOrderDetailActivity`. El único punto de resolución del nombre a mostrar es `GroupedTicketItem` (`data/Models.kt`): `shortName?.takeIf { it.isNotBlank() } ?: productName`. Ni `PrintService` (CPCL) ni `TicketDetailActivity` (pantalla) necesitaron cambios — ambos ya consumen `GroupedTicketItem.productName` tal cual. Pre-órdenes (`PreOrderItem`) también lo llevan, para que el ticket de una pre-orden convertida respete el nombre corto igual que una venta normal.
+
+### SQL
+```sql
+ALTER TABLE products ADD COLUMN IF NOT EXISTS short_name VARCHAR(255) NULL AFTER name;
+```
+(Idempotente — también se corre solo al pegarle a `GET /api/setup` tras desplegar el backend.)
+
+---
+
+## Fase 95: Fix reprint short_name + quitar # del nombre en el ticket ✅
+
+### Contexto
+Dos reportes del usuario después de probar la Fase 94 en dispositivo:
+
+1. **Bug** — en `TicketDetailActivity`, la vista en pantalla (`buildReceipt()`, arma `GroupedTicketItem` desde `orders.groupedForTicket()`) mostraba correctamente el `short_name`, pero el botón **"Reimprimir ticket"** imprimía el nombre completo. Causa: ese botón reconstruye `List<BatchItem>` a mano desde `orders` (línea ~187 de `TicketDetailActivity.kt`) para pasárselo a `PrintService.printTicket()`, y esa reconstrucción no copiaba `shortName` (ni `caseQty`, mismo bug de paso) — `BatchItem.shortName` quedaba en su default `null`, así que `PrintService`'s `groupedForTicket()` (overload de `BatchItem`) caía al fallback `productName` completo.
+2. **Ajuste de formato** — el usuario no quería el número de línea corrido (`#`, agregado en la Fase 91) pegado al nombre del producto (`"1  Queso Fresco"`). El número de unidades/cajas/pesadas agrupadas (`"3 - Case/Unit"`, `"2 - 2.00 lb"`, ya existente desde antes de la Fase 91) debía seguir apareciendo, pero únicamente en esa línea de cantidad/tipo — nunca junto al nombre.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 95.1 | **Fix** — `shortName = o.shortName` (+ `caseQty = o.caseQty`, faltaba también) agregados a la reconstrucción manual de `BatchItem` en el botón "Reimprimir ticket" | `TicketDetailActivity.kt` | ✅ |
+| 95.2 | Quitado el número de línea corrido (`itemNumber`) de la línea del nombre de producto — ahora solo imprime el nombre (con wrap si es largo), sin prefijo numérico | `data/print/PrintService.kt`, `TicketDetailActivity.kt` | ✅ |
+| 95.3 | Header de columna `"#  Desc"` → `"Desc"` (ya no hay `#` por fila junto al nombre) | `data/print/PrintService.kt`, `TicketDetailActivity.kt` | ✅ |
+| 95.4 | `ITEM_NAME_WIDTH` (ticket impreso) — ya no reserva espacio para el prefijo `"N  "`, usa el ancho completo de línea (`LINE_WIDTH`) | `data/print/PrintService.kt` | ✅ |
+
+**El número de cantidad/tipo (`"3 - Case/Unit"`, `"2 - 2.00 lb"`, sin cambios de lógica) sigue funcionando igual que antes de la Fase 91** — aplica a Case/Unit, Bucket (vía el mismo branch `else`) y Lbs (solo cuando `count > 1`), y es exactamente lo que el usuario pidió mantener: el número solo ahí, nunca en el nombre.
+
+### SQL
+Ninguno — cambios solo en código Android (Kotlin).
+
+---
+
+## Fase 96: Qty/W = cantidad total real (Case × unidades por caja), rate recalculado ✅
+
+### Contexto
+Pedido del usuario, después de la Fase 95: la columna Qty/W debía mostrar solo el número de la cantidad realmente seleccionada, sin texto de tipo/unidad ni desgloses (`"N - Case/Unit of Q"`, `"N - X.XX lb"`) — y para Case/Unit ese número **no** es la cantidad de cajas escaneadas sino el total de unidades individuales: "si tengo un case de 12 y selecciono 3 cajas son 36, eso va en el qty". Para Lbs y Bucket el número ya era el total real (peso sumado / conteo de buckets), sin necesidad de multiplicar nada más. El usuario confirmó explícitamente que el rate debe recalcularse sobre esa nueva base (`total / qty`), y el total de la línea no cambia.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 96.1 | `displayQty` nuevo por ítem: para categoría `"CASE/UNIT"` = `quantity * caseQty` (caseQty ausente/≤0 → ×1); para `"LBS"`/`"BUCKET"`/otras = `quantity` tal cual (ya es el total real) | `data/print/PrintService.kt`, `TicketDetailActivity.kt` | ✅ |
+| 96.2 | `qtyStr` simplificado a solo el número — `"%.2f"` para categorías de peso, `"%d"` (entero) para el resto. Se eliminó el prefijo `"N - "` y el desglose `"of Q"` | `data/print/PrintService.kt`, `TicketDetailActivity.kt` | ✅ |
+| 96.3 | `rate` (columna del medio) recalculado como `total / displayQty` (antes `total / quantity`, es decir antes era precio-por-caja, ahora precio-por-unidad-individual cuando aplica el multiplicador de Case) | `data/print/PrintService.kt`, `TicketDetailActivity.kt` | ✅ |
+| 96.4 | `unitLabel()` ya no se usa en la columna Qty/W (sigue usándose sin cambios en la línea de resumen al pie, `"XX.XX lb total"`) | ambos archivos | ✅ |
+
+**Sin cambios** — encabezados de categoría (LBS/CASE-UNIT/BUCKET, solo se muestran si el pedido mezcla tipos), agrupación por producto/categoría, columna Total (sigue siendo el total real de la línea, no cambia con el recálculo de rate).
+
+### SQL
+Ninguno — cambios solo en código Android (Kotlin).
+
+---
+
+## Fase 97: Prefijo "N -" (cantidad seleccionada) de vuelta antes del nombre del producto ✅
+
+### Contexto
+La Fase 95 había quitado el número de línea corrido (`itemNumber`, 1/2/3... por todo el ticket) de la línea del nombre porque no aportaba información útil. Después de ver el resultado, el usuario pidió agregar de vuelta un número ahí — pero **no** el número de línea, sino la cantidad de veces que ese producto se seleccionó/escaneó (ej. "1 -", "3 -"), que sí es información relevante. Aclaración importante: **no** es la misma cantidad que ahora vive en la columna Qty/W desde la Fase 96 (que ya viene multiplicada por unidades-por-caja para Case/Unit) — este prefijo es la cantidad "cruda" seleccionada (cajas/buckets elegidos, o pesadas individuales agrupadas para Lbs).
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 97.1 | `pickCount` nuevo por ítem: Lbs = `g.count` (pesadas individuales agrupadas); Case/Unit y Bucket = `g.quantity.toInt()` (unidades elegidas, sin multiplicar por unidades-por-caja) | `data/print/PrintService.kt`, `TicketDetailActivity.kt` | ✅ |
+| 97.2 | Nombre del producto → `"$pickCount - $nombre"`, siempre (incluso si es 1, a diferencia del viejo formato pre-Fase 96 que solo mostraba el número en Lbs cuando `count > 1`) | `data/print/PrintService.kt`, `TicketDetailActivity.kt` | ✅ |
+| 97.3 | Ticket impreso — `ITEM_NAME_WIDTH` vuelve a reservar espacio para el prefijo (`LINE_WIDTH - 4`, revertido de la Fase 95); el prefijo solo va en la primera línea si el nombre hace wrap | `data/print/PrintService.kt` | ✅ |
+
+**No confundir con Qty/W (Fase 96)** — esa columna sigue mostrando la cantidad ya multiplicada/expandida (36 para 3 cajas de 12); este prefijo es un dato distinto (3, la cantidad seleccionada) que vive junto al nombre.
+
+### SQL
+Ninguno — cambios solo en código Android (Kotlin).
+
+---
+
+## Fase 98: Fix — header de categoría (CASE/UNIT, LBS, BUCKET) siempre visible en el ticket ✅
+
+### Contexto
+`showCategoryHeaders` (implementado desde antes de la Fase 91) solo mostraba el encabezado de categoría (`"CASE/UNIT"`, `"LBS"`, `"BUCKET"`) cuando el pedido mezclaba más de un tipo de producto — con un solo tipo (ej. 2 productos Case/Unit) el encabezado no aparecía. El usuario pidió que el header aparezca siempre, sin importar si hay uno o varios tipos en el pedido.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 98.1 | Quitada la condición `groupedByCategory.size > 1` — el header de categoría se imprime siempre, una vez por cada grupo | `data/print/PrintService.kt`, `TicketDetailActivity.kt` | ✅ |
+
+Sin cambios en la línea de resumen al pie (`"22.80 lb total"` vs `"N items total"`), que sigue usando `groupedByCategory.size` para decidir si puede sumar cantidad+unidad o debe mostrar conteo de productos — esa lógica es independiente de si se muestra el header por categoría.
+
+### SQL
+Ninguno — cambios solo en código Android (Kotlin).
+
+---
+
+## Fase 99: Fix — factura QBO agrupa filas del mismo producto en una sola línea ✅
+
+### Contexto
+El usuario reportó: un producto por peso (ej. "Michoacano") pesado 10 veces por separado (10 filas en `orders`, una por cada pesada de 1 lb — así vive el carrito en Android, ver nota de `PendingOrderEntity.quantity` en `CLAUDE.md` del repo Android) aparecía en la factura de QuickBooks como **10 líneas separadas** (`"Michoacano - 1 lb a $3.49/lb", Qty 1, $3.49` × 10), mientras que el ticket de Android ya lo mostraba correctamente agrupado ("Michoacano", 10 lb, $3.49/lb, $34.90) desde antes (`GroupedTicketItem`/`groupedForTicket()`). El agrupado del ticket es solo de presentación en Android — nunca tocaba lo que se mandaba a QBO, así que la factura real seguía yendo desglosada fila por fila.
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 99.1 | `createBatchInvoice()` — agrupa `items` por `qb_item_id + price` (mismo criterio de merge que usa Android en el carrito/ticket: mismo producto y mismo precio se suman, precio distinto no se mezcla) antes de armar las líneas de la factura; suma `quantity` y `total` de las filas agrupadas | `src/services/qbInvoices.ts` | ✅ |
+| 99.2 | Cada línea de QBO ahora manda `Qty: <cantidad agrupada>` y `UnitPrice: <price>` (antes `Qty: 1, UnitPrice: item.total` por fila — un hack para que cada fila individual se viera como "1 x total"); `Amount` sigue siendo el total real de la línea agrupada | `src/services/qbInvoices.ts` | ✅ |
+
+**Efecto:** con 10 pesadas de 1 lb a $3.49/lb, la factura ahora manda **una sola línea** `"Michoacano - 10 lb a $3.49/lb"`, `Qty: 10`, `UnitPrice: 3.49`, `Amount: 34.90` — igual a lo que ya mostraba el ticket. Aplica también a Case/Unit y Bucket si llegan varias filas del mismo producto al mismo precio (mismo criterio, aunque en el carrito normal ya se mergean al agregar — Fase 70 — así que en la práctica esto solo se nota con productos por peso, donde cada pesada es intencionalmente una fila separada).
+
+**Sin cambios** — `createInvoice()` (factura de un solo ítem, usada por `syncEngine.ts`/retry individual) no aplica acá, no tiene el problema de filas múltiples. Las líneas de damage/crédito/descuento (dañados, `QB_CREDIT_ITEM_ID`, `QB_CREDIT_APPLY_ITEM_ID`) no se tocaron.
+
+### SQL
+Ninguno.
+
+---
+
+## Fase 100: Ticket — header de categoría enmarcado + "lb" de vuelta en Qty/W ✅
+
+### Contexto
+Dos mejoras visuales pedidas por el usuario sobre el ticket (impreso y en pantalla), después de ver la Fase 98/96 en uso real: (1) el nombre de categoría (`"LBS"`, `"CASE/UNIT"`, `"BUCKET"`) quedaba pegado al texto de alrededor y se perdía o confundía visualmente; (2) la columna Qty/W (Fase 96 la dejó como número puro) no dejaba claro que un valor como "105" era libras — pidió un indicador de unidad ahí.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 100.1 | Header de categoría enmarcado con separador arriba y abajo (`DASH`/`addSep(heavy=false)`) — queda como su propia sección, no pegado al resto | `data/print/PrintService.kt`, `TicketDetailActivity.kt` | ✅ |
+| 100.2 | Columna Qty/W — `"lb"` de vuelta solo para categorías de peso (`"105.00 lb"`); Case/Unit y Bucket quedan como número puro (`"36"`), sin sufijo — ya quedan claros con el nombre + header de categoría | `data/print/PrintService.kt`, `TicketDetailActivity.kt` | ✅ |
+
+Verificado que `"105.00 lb"` no se trunca en el ticket impreso — el ancho izquierdo de `threeCol` (`LINE_WIDTH - midWidth(8) - rightWidth(9)` ≈ 12 chars) alcanza sin problema; en pantalla la columna izquierda de `addThreeCol` es de ancho flexible (`weight=1f`), sin riesgo de corte.
+
+### SQL
+Ninguno — cambios solo en código Android (Kotlin).
+
+---
+
+## Fase 101: Ticket — indicador corto de unidad en Qty/W para Case/Unit ("cs/unt") y Bucket ("bkt") ✅
+
+### Contexto
+Extensión directa de la Fase 100: el usuario pidió el mismo tipo de indicador de unidad que se agregó para Lbs (`"lb"`) también para Case/Unit y Bucket, pero abreviado ("con pocos caracteres") ya que comparte fila con rate/total en un ancho angosto.
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 101.1 | `shortQtyUnit(category)` nuevo — `"CASE/UNIT"` → `"cs/unt"` (ajustado tras feedback del usuario, antes `"cs"` a secas), `"BUCKET"` → `"bkt"`, cualquier otra categoría → primeras 3 letras en minúscula (fallback genérico) | `data/print/PrintService.kt`, `TicketDetailActivity.kt` | ✅ |
+| 101.2 | Qty/W para categorías no-peso: `"36 cs/unt"`, `"2 bkt"` (antes número puro desde la Fase 96) | `data/print/PrintService.kt`, `TicketDetailActivity.kt` | ✅ |
+
+Verificado que "36 cs/unt" (9 chars) y "2 bkt" (5 chars) entran sin truncarse en el ancho izquierdo de `threeCol` (~12 chars) del ticket impreso.
+
+### SQL
+Ninguno — cambios solo en código Android (Kotlin).
+
+---
+
+## Fase 102: Fix — dirección del cliente ausente en reprint + check number pisaba la dirección ✅
+
+### Contexto
+Tres bugs reportados por el usuario sobre el bloque "Customer" del ticket:
+
+1. La línea `"Payment: Check (#$checkNumber)"` (Fase — commit `cd818ac`, "check number") se imprimía en un solo comando `T` de CPCL sin wrap. Con un número de cheque largo, la línea se salía del ancho físico de la página (`PAGE-WIDTH`) — la impresora la envolvía por su cuenta pero `y` (el cursor que controla dónde se dibuja lo siguiente) no avanzaba lo que la impresora de verdad imprimía, así que la dirección del cliente (que se dibujaba justo después) quedaba pisada por el texto desbordado del cheque. Mismo patrón de bug que la Fase 91.6.
+2. Pedido explícito del usuario: el número de cheque debía ir en su propia línea, no pegado a "Payment: Check" en el mismo renglón.
+3. Orden pedido del bloque cliente: Customer → Dirección → Payment → Check #, no Customer → Payment → Check # → Dirección (orden que tenía el ticket impreso desde la Fase de check number).
+4. Bug más profundo, separado de los anteriores: `orders`/`pre_order_items` (MySQL) nunca guardaron la dirección del cliente — solo `customer_id`/`customer_name`. La dirección solo viajaba de forma efímera vía extras de Intent en Android, hilvanada desde `CustomerPickerActivity` → `CurrentOrderActivity` → ticket inmediato. En cuanto el usuario salía de esa cadena (ej. `HistoryActivity`/`ClientHistoryActivity` → `TicketDetailActivity` → "Reimprimir ticket", que abren el ticket a partir de `GET /api/orders`, sin dirección en el DTO) la dirección ya no existía en ningún lado y el reprint salía sin ella. `PreOrderDetailActivity` tenía el mismo problema pero peor — mandaba `customerAddress = null`/`""` siempre a impresión y a `OrderSuccessActivity`, porque `pre_orders` tampoco guarda dirección.
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 102.1 | Nuevo endpoint `GET /api/customers/:customerId` — un solo cliente, cache-first contra `cached_customers` (ya tiene `address_line1`/`city`/`state_code`/`postal_code` desde la Fase de cache de clientes), fallback a QB (`paginatedQuery`) si no está cacheado. Sin cambios de esquema — reusa la tabla de cache existente. Se registra después de `/stats` y `/refresh` (rutas literales de un segmento) para no ser capturado por ellas. | `src/routes/customers.ts` | ✅ |
+
+No se agregó `customer_address` a `orders`/`pre_order_items` a propósito — habría significado migración de esquema + repetir la dirección en cada fila (como `customer_name`) cuando ya existe una fuente de verdad (el cliente en QB) que se puede resolver bajo demanda con una sola llamada barata (cache-first).
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 102.2 | `ApiService.getCustomer(customerId)` — nuevo, `GET api/customers/{id}` → `Response<QbCustomer>` (reusa el modelo existente, con `fullAddress` ya calculado) | `data/network/ApiService.kt` | ✅ |
+| 102.3 | `PrintService.kt`/`TicketDetailActivity.kt` — número de cheque en su propia línea indentada (`"Check #: $checkNumber"`, con `tWrapped`/`addLine(indent=true)`) en vez de pegado a `"Payment: Check"` | `data/print/PrintService.kt`, `TicketDetailActivity.kt` | ✅ |
+| 102.4 | `PrintService.kt` — reordenado el bloque cliente del ticket impreso a Customer → Dirección → Payment → Check # (el ticket en pantalla ya tenía este orden) | `data/print/PrintService.kt` | ✅ |
+| 102.5 | `TicketDetailActivity` — `customerAddress` pasó de `val` a `var`; si llega vacío y el batch tiene `customer_id` (siempre lo tiene, viene de `orders.customer_id`), se resuelve con `getCustomer()` y se reconstruye el recibo — mismo patrón ya usado para firma/damage vía `getBatchDamage`. Corre dentro del mismo bloque `if (batchId.isNotBlank())`, un solo rebuild combinando los 3 flags (`damageChanged`/`signatureChanged`/`addressChanged`) | `TicketDetailActivity.kt` | ✅ |
+| 102.6 | `PreOrderDetailActivity` — nuevo campo `resolvedCustomerAddress`, resuelto una vez en `loadPreOrder()` vía `po.customerId` + `getCustomer()`; reemplaza los `customerAddress = null` hardcodeados en ambos prints (`doConvertAndPrintFirst`/`sendPaymentAndPrint`) y el `putExtra("customer_address", "")` hacia `OrderSuccessActivity` | `PreOrderDetailActivity.kt` | ✅ |
+
+### SQL
+Ninguno — sin cambios de esquema, ver nota arriba.
 
 ---
 

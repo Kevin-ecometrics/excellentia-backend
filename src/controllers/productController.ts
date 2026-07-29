@@ -105,15 +105,15 @@ export async function getProductByBarcode(req: Request, res: Response): Promise<
 
 export async function createProduct(req: Request, res: Response): Promise<void> {
   try {
-    const { barcode, name, price, min_price, category, brand, stock, description, unit, qty, weight_per_unit } = req.body;
+    const { barcode, name, short_name, price, min_price, category, brand, stock, description, unit, qty, weight_per_unit } = req.body;
     if (!name || price === undefined) {
       res.status(400).json({ error: 'Nombre y precio requeridos' });
       return;
     }
 
     const [result] = await pool.query(
-      'INSERT INTO products (barcode, name, price, min_price, category, brand, stock, description, unit, qty, weight_per_unit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [barcode ?? null, name, price, min_price ?? null, category ?? null, brand ?? null, stock ?? 0, description ?? null, unit ?? null, qty ?? 0, weight_per_unit ?? null]
+      'INSERT INTO products (barcode, name, short_name, price, min_price, category, brand, stock, description, unit, qty, weight_per_unit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [barcode ?? null, name, short_name ?? null, price, min_price ?? null, category ?? null, brand ?? null, stock ?? 0, description ?? null, unit ?? null, qty ?? 0, weight_per_unit ?? null]
     ) as any;
 
     res.status(201).json({ id: result.insertId, barcode, name, price });
@@ -126,7 +126,7 @@ export async function createProduct(req: Request, res: Response): Promise<void> 
 export async function updateProduct(req: Request, res: Response): Promise<void> {
   try {
     const { id } = req.params;
-    const { barcode, name, price, min_price, category, brand, stock, description, unit, qty, weight_per_unit } = req.body;
+    const { barcode, name, short_name, price, min_price, category, brand, stock, description, unit, qty, weight_per_unit } = req.body;
 
     const [existing] = await pool.query('SELECT id FROM products WHERE id = ?', [id]) as any[];
     if (existing.length === 0) {
@@ -139,6 +139,7 @@ export async function updateProduct(req: Request, res: Response): Promise<void> 
 
     if (barcode !== undefined) { fields.push('barcode = ?'); values.push(barcode ?? null); }
     if (name !== undefined) { fields.push('name = ?'); values.push(name); }
+    if (short_name !== undefined) { fields.push('short_name = ?'); values.push(short_name ?? null); }
     if (price !== undefined) { fields.push('price = ?'); values.push(price); }
     if (min_price !== undefined) { fields.push('min_price = ?'); values.push(min_price ?? null); }
     if (category !== undefined) { fields.push('category = ?'); values.push(category ?? null); }

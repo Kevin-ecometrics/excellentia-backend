@@ -61,7 +61,7 @@ export async function getStats(req: Request, res: Response): Promise<void> {
           (SELECT COUNT(*) FROM orders WHERE status='PENDING' ${userFilter}) AS pending,
           (SELECT COUNT(*) FROM orders WHERE status='SENT' ${userFilter}) AS sent,
           (SELECT COUNT(*) FROM orders WHERE status='FAILED' ${userFilter}) AS failed,
-          (SELECT COALESCE(SUM(amount),0) FROM customer_credits WHERE DATE(created_at) BETWEEN '${from}' AND '${to}') AS credits_period
+          (SELECT COALESCE(SUM(amount),0) FROM credit_transactions WHERE type='EARNED' AND DATE(created_at) BETWEEN '${from}' AND '${to}') AS credits_period
       `),
       // Pedidos por hora
       pool.query(`

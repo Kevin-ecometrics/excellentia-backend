@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS `products` (
     `id`              INT AUTO_INCREMENT PRIMARY KEY,
     `barcode`         VARCHAR(50) UNIQUE,
     `name`            VARCHAR(255) NOT NULL,
+    `short_name`      VARCHAR(255) NULL,
     `price`           DECIMAL(10,2) NOT NULL,
     `min_price`       DECIMAL(10,2) NULL,
     `category`        VARCHAR(100),
@@ -100,6 +101,9 @@ CREATE TABLE IF NOT EXISTS `orders` (
     `retry_count`   INT DEFAULT 0,
     `unit`          VARCHAR(20) NULL,
     `case_qty`      INT NULL,
+    `payment_method` VARCHAR(20) NULL,
+    `check_number`   VARCHAR(20) NULL,
+    `credit_applied` DECIMAL(10,2) NULL,
     `created_at`    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     `updated_at`    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (`device_id`) REFERENCES `devices`(`id`),
@@ -146,25 +150,27 @@ CREATE TABLE IF NOT EXISTS `batch_damage` (
     `qty`          INT NOT NULL DEFAULT 0,
     `unit_price`   DECIMAL(10,2) NULL,
     `amount`       DECIMAL(10,2) NULL,
+    `qb_item_id`   VARCHAR(64) NULL,
     `created_at`   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     INDEX `idx_batch_damage_batch_id` (`batch_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- -----------------------------------------------------------------------------
--- 8b. customer_credits
--- Ledger de créditos generados por daño — una fila por batch con crédito.
--- Fundamento para reportes/saldo por cliente a futuro; el crédito de esta
--- fase siempre se aplica de inmediato al mismo batch que lo generó.
+-- 8b. credit_transactions
+-- Ledger completo de créditos — EARNED cuando se genera un crédito por daño,
+-- USED cuando se aplica a una compra futura. Saldo disponible = SUM(EARNED) - SUM(USED).
 -- -----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS `customer_credits` (
-    `id`            INT AUTO_INCREMENT PRIMARY KEY,
-    `customer_id`   VARCHAR(64) NULL,
-    `customer_name` VARCHAR(255) NULL,
-    `batch_id`      VARCHAR(100) NOT NULL,
-    `amount`        DECIMAL(10,2) NOT NULL,
-    `created_at`    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX `idx_customer_credits_batch` (`batch_id`),
-    INDEX `idx_customer_credits_customer` (`customer_id`)
+CREATE TABLE IF NOT EXISTS `credit_transactions` (
+    `id`                INT AUTO_INCREMENT PRIMARY KEY,
+    `customer_id`       VARCHAR(64) NULL,
+    `customer_name`     VARCHAR(255) NULL,
+    `type`              ENUM('EARNED','USED') NOT NULL,
+    `amount`            DECIMAL(10,2) NOT NULL,
+    `reference_batch_id` VARCHAR(100) NULL,
+    `invoice_id`        VARCHAR(50) NULL,
+    `created_at`        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX `idx_ct_customer` (`customer_id`),
+    INDEX `idx_ct_batch` (`reference_batch_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- -----------------------------------------------------------------------------
@@ -230,8 +236,9 @@ CREATE TABLE IF NOT EXISTS `company_settings` (
     `phone`           VARCHAR(50) DEFAULT NULL,
     `city`            VARCHAR(100) DEFAULT NULL,
     `disclaimer`      TEXT DEFAULT NULL,
-    `invoice_counter` INT NOT NULL DEFAULT 51551,
-    `updated_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    `invoice_counter`          INT NOT NULL DEFAULT 51551,
+    `qb_credit_apply_item_id` VARCHAR(50) NULL,
+    `updated_at`              TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Fila por defecto

@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS `products` (
     `id`              INT AUTO_INCREMENT PRIMARY KEY,
     `barcode`         VARCHAR(50) UNIQUE,
     `name`            VARCHAR(255) NOT NULL,
+    `short_name`      VARCHAR(255) NULL,
     `price`           DECIMAL(10,2) NOT NULL,
     `min_price`       DECIMAL(10,2) NULL,
     `category`        VARCHAR(100),
@@ -95,6 +96,8 @@ CREATE TABLE IF NOT EXISTS `orders` (
     `retry_count`   INT DEFAULT 0,
     `created_at`    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     `updated_at`    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    `payment_method` VARCHAR(20) NULL,
+    `check_number`   VARCHAR(20) NULL,
     FOREIGN KEY (`device_id`) REFERENCES `devices`(`id`),
     FOREIGN KEY (`user_id`)   REFERENCES `users`(`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -137,6 +140,9 @@ CREATE TABLE IF NOT EXISTS `batch_damage` (
     `barcode`      VARCHAR(100) NOT NULL,
     `product_name` VARCHAR(255) NOT NULL,
     `qty`          INT NOT NULL DEFAULT 0,
+    `unit_price`   DECIMAL(10,2) NULL,
+    `amount`       DECIMAL(10,2) NULL,
+    `qb_item_id`   VARCHAR(64) NULL,
     `created_at`   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     INDEX `idx_batch_damage_batch_id` (`batch_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -232,14 +238,19 @@ CREATE TABLE IF NOT EXISTS `pre_orders` (
 -- 15. pre_order_items
 -- (depende de pre_orders)
 -- -----------------------------------------------------------------------------
+-- price/quantity/total quedan NULL mientras la pre-orden está sin detallar (solo
+-- barcode+product_name al crearla) — se llenan al convertir, cuando el vendedor
+-- detalla peso/case/precio de cada producto.
 CREATE TABLE IF NOT EXISTS `pre_order_items` (
     `id`           INT AUTO_INCREMENT PRIMARY KEY,
     `pre_order_id` INT NOT NULL,
     `barcode`      VARCHAR(100) NOT NULL,
     `product_name` VARCHAR(255) NOT NULL,
-    `price`        DECIMAL(10,6) NOT NULL,
-    `quantity`     DECIMAL(10,2) NOT NULL,
-    `total`        DECIMAL(10,2) NOT NULL,
+    `price`        DECIMAL(10,6) DEFAULT NULL,
+    `quantity`     DECIMAL(10,2) DEFAULT NULL,
+    `total`        DECIMAL(10,2) DEFAULT NULL,
+    `unit`         VARCHAR(20) DEFAULT NULL,
+    `case_qty`     INT DEFAULT NULL,
     FOREIGN KEY (`pre_order_id`) REFERENCES `pre_orders`(`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

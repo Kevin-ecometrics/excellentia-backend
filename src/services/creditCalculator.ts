@@ -10,21 +10,29 @@ export interface DamageInput {
 export interface DamageComputed extends DamageInput {
   unit_price: number;
   amount: number;
+  qb_item_id: string | null;
 }
 
 // Valor por unidad de un producto dañado, consultado fresco en `products` al
 // momento de crear el batch (nunca se confía en un precio mandado por el
 // cliente para esto). Distinto según cómo se vende el producto:
-//   - Case: products.price ya es el precio por unidad individual dentro de la
-//     caja (mismo criterio que usa ProductDetailActivity en Android para
-//     multiplicar por caseQty y obtener el precio de la caja completa).
+//   - Case/Unit (fusionados en un solo tipo — se aceptan igual los valores
+//     viejos "Case"/"Unit" que puedan quedar en catálogos sin migrar):
+//     products.price ya es el precio del paquete/caja completa, se divide
+//     por el tamaño de paquete para obtener el valor de una sola unidad
+//     dañada (mismo criterio que usa ProductDetailActivity en Android).
+//     `products` no tiene columna case_qty — el tamaño real de paquete viaja
+//     en products.qty.
 //   - Lbs / sin unit: products.price es $/lb — se multiplica por
 //     weight_per_unit para obtener el valor de una unidad física.
-//   - Unit / Bucket: products.price ya es el precio por unidad, directo.
-function unitValueOf(product: { price: number; unit: string | null; weight_per_unit: number | null }): number {
+//   - Bucket: products.price ya es el precio por unidad, directo.
+function unitValueOf(product: { price: number; unit: string | null; weight_per_unit: number | null; qty: number | null }): number {
   const price = Number(product.price) || 0;
-  if (product.unit === 'Case') return price;
-  if (product.unit === 'Unit' || product.unit === 'Bucket') return price;
+  if (product.unit === 'Case' || product.unit === 'Unit' || product.unit === 'Case/Unit') {
+    const caseSize = Number(product.qty) || 1;
+    return price / caseSize;
+  }
+  if (product.unit === 'Bucket') return price;
   const weightPerUnit = Number(product.weight_per_unit) || 1.0;
   return price * weightPerUnit;
 }
@@ -42,22 +50,23 @@ export async function computeDamageCredit(items: DamageInput[]): Promise<{ rows:
     if (!(item.qty > 0)) continue;
     try {
       const [productRows] = await pool.query(
-        'SELECT price, unit, weight_per_unit FROM products WHERE barcode = ?',
+        'SELECT price, unit, weight_per_unit, qty, qb_item_id FROM products WHERE barcode = ?',
         [item.barcode]
       ) as any[];
       const product = productRows[0];
       if (!product) {
         logger.warn(`computeDamageCredit: producto no encontrado para barcode ${item.barcode}, crédito omitido para esa línea`);
-        rows.push({ ...item, unit_price: 0, amount: 0 });
+        rows.push({ ...item, unit_price: 0, amount: 0, qb_item_id: null });
         continue;
       }
+      const qbItemId = product.qb_item_id ?? null;
       const unitPrice = unitValueOf(product);
       const amount = Math.round(unitPrice * item.qty * 100) / 100;
-      rows.push({ ...item, unit_price: unitPrice, amount });
+      rows.push({ ...item, unit_price: unitPrice, amount, qb_item_id: qbItemId });
       creditsTotal += amount;
     } catch (err) {
       logger.warn(`computeDamageCredit: error calculando crédito para ${item.barcode}:`, err);
-      rows.push({ ...item, unit_price: 0, amount: 0 });
+      rows.push({ ...item, unit_price: 0, amount: 0, qb_item_id: null });
     }
   }
 

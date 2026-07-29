@@ -53,7 +53,7 @@ async function processPendingOrders(): Promise<void> {
         ) as any[];
 
         const invoice = await createInvoice(order, order.qb_item_id, order.qb_class_id ?? null, invoice_counter);
-        const invoiceId = invoice.Invoice?.Id;
+        const invoiceId = invoice.Invoice?.DocNumber;
 
         if (invoiceId) {
           await pool.query(

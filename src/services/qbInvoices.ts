@@ -35,25 +35,49 @@ export async function createInvoice(order: Order, qbItemId: string, classId?: st
   return response.json;
 }
 
-interface DamageItem { barcode: string; product_name: string; qty: number }
+interface DamageItem { barcode: string; product_name: string; qty: number; unit_price?: number; amount?: number; qb_item_id?: string | null }
 
 export async function createBatchInvoice(
   items: { qb_item_id: string; product_name: string; price: number; quantity: number; total: number }[],
   customerId?: string | null,
   damageItems: DamageItem[] = [],
   paymentMethod?: string | null,
+  checkNumber?: string | null,
   classId?: string | null,
   docNumber?: number,
-  creditAmount: number = 0
+  creditAmount: number = 0,
+  damageComputed?: { qb_item_id: string | null; product_name: string; qty: number; unit_price: number; amount: number }[],
+  applyCredit?: number
 ): Promise<any> {
   if (!oauthClient.isAccessTokenValid()) {
     await refreshToken();
   }
-  const lines: any[] = items.map(item => {
+
+  // Un mismo producto puede llegar como varias filas (ej. Lbs: cada pesada
+  // individual es una fila separada en `orders`, ver CLAUDE.md del repo
+  // Android) — sin esto, la factura de QBO mostraba una línea por fila (10
+  // líneas de "Michoacano - 1 lb" en vez de una sola "Michoacano - 10 lb").
+  // Se agrupa por qb_item_id + price (mismo criterio que el ticket de Android,
+  // `groupedForTicket()` en data/Models.kt) — si el precio cambió entre filas
+  // no se mezclan, igual que en el carrito.
+  const grouped = new Map<string, { qb_item_id: string; product_name: string; price: number; quantity: number; total: number }>();
+  for (const item of items) {
+    const key = `${item.qb_item_id}::${item.price}`;
+    const existing = grouped.get(key);
+    if (existing) {
+      existing.quantity += Number(item.quantity);
+      existing.total += Number(item.total);
+    } else {
+      grouped.set(key, { ...item, quantity: Number(item.quantity), total: Number(item.total) });
+    }
+  }
+  const groupedItems = Array.from(grouped.values());
+
+  const lines: any[] = groupedItems.map(item => {
     const salesItemLineDetail: Record<string, any> = {
       ItemRef: { value: item.qb_item_id },
-      Qty: 1,
-      UnitPrice: Number(item.total),
+      Qty: item.quantity,
+      UnitPrice: Number(item.price),
     };
     if (classId) salesItemLineDetail.ClassRef = { value: classId };
     return {
@@ -64,12 +88,51 @@ export async function createBatchInvoice(
     };
   });
 
-  // Línea negativa por crédito de daño — reduce el total real de la factura,
-  // no solo el memo de texto. Requiere un item de QBO configurado en
-  // QB_CREDIT_ITEM_ID; si no está configurado, se omite la línea y el crédito
-  // queda solo como memo (comportamiento anterior), sin romper la factura.
-  const creditItemId = process.env.QB_CREDIT_ITEM_ID;
-  if (creditAmount > 0) {
+  // Líneas negativas por producto dañado — reduce el total real de la factura
+  // usando el mismo qb_item_id del producto (no un ítem genérico de crédito).
+  // Si damageComputed no tiene qb_item_id (registros viejos), cae al fallback
+  // QB_CREDIT_ITEM_ID.
+  if (damageComputed && damageComputed.length > 0) {
+    const hasQbItemId = damageComputed.some(d => d.qb_item_id);
+    if (hasQbItemId) {
+      for (const dmg of damageComputed) {
+        if (!dmg.qb_item_id || dmg.qty <= 0 || dmg.amount <= 0) continue;
+        const lineDetail: Record<string, any> = {
+          ItemRef: { value: dmg.qb_item_id },
+          Qty: -dmg.qty,
+          UnitPrice: dmg.unit_price,
+        };
+        if (classId) lineDetail.ClassRef = { value: classId };
+        lines.push({
+          DetailType: 'SalesItemLineDetail' as const,
+          Amount: -dmg.amount,
+          Description: `Damaged: ${dmg.product_name} - ${dmg.qty} unit(s)`,
+          SalesItemLineDetail: lineDetail,
+        });
+      }
+    } else {
+      // Fallback: todos sin qb_item_id → usar QB_CREDIT_ITEM_ID si existe
+      const creditItemId = process.env.QB_CREDIT_ITEM_ID;
+      if (creditItemId && creditAmount > 0) {
+        const creditLineDetail: Record<string, any> = {
+          ItemRef: { value: creditItemId },
+          Qty: 1,
+          UnitPrice: -creditAmount,
+        };
+        if (classId) creditLineDetail.ClassRef = { value: classId };
+        lines.push({
+          DetailType: 'SalesItemLineDetail' as const,
+          Amount: -creditAmount,
+          Description: 'Store Credit / Damaged Goods',
+          SalesItemLineDetail: creditLineDetail,
+        });
+      } else if (creditAmount > 0) {
+        logger.warn(`createBatchInvoice: crédito de $${creditAmount.toFixed(2)} sin qb_item_id ni QB_CREDIT_ITEM_ID — solo memo`);
+      }
+    }
+  } else if (creditAmount > 0) {
+    // Sin damageComputed array (llamadas antiguas sin el parámetro)
+    const creditItemId = process.env.QB_CREDIT_ITEM_ID;
     if (creditItemId) {
       const creditLineDetail: Record<string, any> = {
         ItemRef: { value: creditItemId },
@@ -94,14 +157,44 @@ export async function createBatchInvoice(
     ...(docNumber && { DocNumber: String(docNumber) }),
   };
 
+  // Discount line por crédito aplicado de saldo disponible del cliente
+  if (applyCredit && applyCredit > 0) {
+    const creditApplyItemId = process.env.QB_CREDIT_APPLY_ITEM_ID
+        ?? process.env.QB_CREDIT_ITEM_ID
+        ?? items[0]?.qb_item_id ?? null;
+    if (creditApplyItemId) {
+      const discountDetail: Record<string, any> = {
+        ItemRef: { value: creditApplyItemId },
+        Qty: 1,
+        UnitPrice: -applyCredit,
+      };
+      if (classId) discountDetail.ClassRef = { value: classId };
+      lines.push({
+        DetailType: 'SalesItemLineDetail' as const,
+        Amount: -applyCredit,
+        Description: `Customer Credit Applied: -$${applyCredit.toFixed(2)}`,
+        SalesItemLineDetail: discountDetail,
+      });
+    } else {
+      logger.warn(`createBatchInvoice: crédito de cliente $${applyCredit.toFixed(2)} sin QB_CREDIT_APPLY_ITEM_ID — la factura no incluye la línea de descuento, solo el memo`);
+    }
+  }
+
   const memoLines: string[] = [];
-  if (paymentMethod) memoLines.push(`Payment: ${paymentMethod}`);
+  if (paymentMethod) {
+    const pm = checkNumber && /^check$/i.test(paymentMethod)
+      ? `Check #${checkNumber}` : `Payment: ${paymentMethod}`;
+    memoLines.push(pm);
+  }
   const damagedFiltered = damageItems.filter(d => d.qty > 0);
   if (damagedFiltered.length > 0) {
     const detail = damagedFiltered
       .map(d => `${d.product_name}: ${d.qty} unit(s)`)
       .join(', ');
     memoLines.push(`Negative Sale: ${detail}`);
+  }
+  if (applyCredit && applyCredit > 0) {
+    memoLines.push(`Credit Applied: -$${applyCredit.toFixed(2)}`);
   }
   if (memoLines.length > 0) {
     body.CustomerMemo = { value: memoLines.join(' | ') };

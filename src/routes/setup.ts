@@ -29,6 +29,7 @@ router.get('/', async (_req: Request, res: Response) => {
         id              INT AUTO_INCREMENT PRIMARY KEY,
         barcode         VARCHAR(50) UNIQUE,
         name            VARCHAR(255) NOT NULL,
+        short_name      VARCHAR(255) NULL,
         price           DECIMAL(10,2) NOT NULL,
         min_price       DECIMAL(10,2) NULL,
         category        VARCHAR(100),
@@ -113,18 +114,21 @@ router.get('/', async (_req: Request, res: Response) => {
         qty          INT NOT NULL DEFAULT 0,
         unit_price   DECIMAL(10,2) NULL,
         amount       DECIMAL(10,2) NULL,
+        qb_item_id   VARCHAR(64) NULL,
         created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         INDEX idx_batch_damage_batch_id (batch_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
-      `CREATE TABLE IF NOT EXISTS customer_credits (
-        id            INT AUTO_INCREMENT PRIMARY KEY,
-        customer_id   VARCHAR(64) NULL,
-        customer_name VARCHAR(255) NULL,
-        batch_id      VARCHAR(100) NOT NULL,
-        amount        DECIMAL(10,2) NOT NULL,
-        created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        INDEX idx_customer_credits_batch (batch_id),
-        INDEX idx_customer_credits_customer (customer_id)
+      `CREATE TABLE IF NOT EXISTS credit_transactions (
+        id                INT AUTO_INCREMENT PRIMARY KEY,
+        customer_id       VARCHAR(64) NULL,
+        customer_name     VARCHAR(255) NULL,
+        type              ENUM('EARNED','USED') NOT NULL,
+        amount            DECIMAL(10,2) NOT NULL,
+        reference_batch_id VARCHAR(100) NULL,
+        invoice_id        VARCHAR(50) NULL,
+        created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_ct_customer (customer_id),
+        INDEX idx_ct_batch (reference_batch_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
       `CREATE TABLE IF NOT EXISTS batch_signatures (
         batch_id   VARCHAR(100) PRIMARY KEY,
@@ -170,24 +174,27 @@ router.get('/', async (_req: Request, res: Response) => {
         updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
       `CREATE TABLE IF NOT EXISTS pre_orders (
-        id             INT AUTO_INCREMENT PRIMARY KEY,
-        user_id        INT,
-        customer_id    VARCHAR(100) NOT NULL,
-        customer_name  VARCHAR(255) NOT NULL,
-        scheduled_date DATE,
-        notes          TEXT,
-        status         ENUM('DRAFT','CONFIRMED','CONVERTED','CANCELLED') DEFAULT 'DRAFT',
-        created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        id               INT AUTO_INCREMENT PRIMARY KEY,
+        user_id          INT,
+        customer_id      VARCHAR(100) NOT NULL,
+        customer_name    VARCHAR(255) NOT NULL,
+        salesperson_name VARCHAR(255) DEFAULT NULL,
+        scheduled_date   DATE,
+        notes            TEXT,
+        status           ENUM('DRAFT','CONFIRMED','CONVERTED','CANCELLED') DEFAULT 'DRAFT',
+        created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
       `CREATE TABLE IF NOT EXISTS pre_order_items (
         id           INT AUTO_INCREMENT PRIMARY KEY,
         pre_order_id INT NOT NULL,
         barcode      VARCHAR(100) NOT NULL,
         product_name VARCHAR(255) NOT NULL,
-        price        DECIMAL(10,6) NOT NULL,
-        quantity     DECIMAL(10,2) NOT NULL,
-        total        DECIMAL(10,2) NOT NULL,
+        price        DECIMAL(10,6) DEFAULT NULL,
+        quantity     DECIMAL(10,2) DEFAULT NULL,
+        total        DECIMAL(10,2) DEFAULT NULL,
+        unit         VARCHAR(20) DEFAULT NULL,
+        case_qty     INT DEFAULT NULL,
         FOREIGN KEY (pre_order_id) REFERENCES pre_orders(id) ON DELETE CASCADE
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
     ];
@@ -238,6 +245,24 @@ router.get('/', async (_req: Request, res: Response) => {
       ["ALTER TABLE orders ADD COLUMN IF NOT EXISTS case_qty INT NULL", "orders.case_qty agregada"],
       ["ALTER TABLE batch_damage ADD COLUMN IF NOT EXISTS unit_price DECIMAL(10,2) NULL", "batch_damage.unit_price agregada"],
       ["ALTER TABLE batch_damage ADD COLUMN IF NOT EXISTS amount DECIMAL(10,2) NULL", "batch_damage.amount agregada"],
+      ["ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method VARCHAR(20) NULL", "orders.payment_method agregada"],
+      ["ALTER TABLE orders ADD COLUMN IF NOT EXISTS check_number VARCHAR(20) NULL", "orders.check_number agregada"],
+      ["ALTER TABLE orders ADD COLUMN IF NOT EXISTS credit_applied DECIMAL(10,2) NULL", "orders.credit_applied agregada"],
+      ["ALTER TABLE batch_damage ADD COLUMN IF NOT EXISTS qb_item_id VARCHAR(64) NULL", "batch_damage.qb_item_id agregada"],
+      ["ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS qb_credit_apply_item_id VARCHAR(50) NULL", "company_settings.qb_credit_apply_item_id agregada"],
+      ["INSERT IGNORE INTO credit_transactions (customer_id, customer_name, type, amount, reference_batch_id, created_at) SELECT customer_id, customer_name, 'EARNED', amount, batch_id, created_at FROM customer_credits", "customer_credits migrados a credit_transactions"],
+      ["ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS salesperson_name VARCHAR(255) DEFAULT NULL", "pre_orders.salesperson_name agregada"],
+      ["ALTER TABLE pre_order_items MODIFY COLUMN price DECIMAL(10,6) NULL DEFAULT NULL", "pre_order_items.price ahora nullable"],
+      ["ALTER TABLE pre_order_items MODIFY COLUMN quantity DECIMAL(10,2) NULL DEFAULT NULL", "pre_order_items.quantity ahora nullable"],
+      ["ALTER TABLE pre_order_items MODIFY COLUMN total DECIMAL(10,2) NULL DEFAULT NULL", "pre_order_items.total ahora nullable"],
+      ["ALTER TABLE pre_order_items ADD COLUMN IF NOT EXISTS unit VARCHAR(20) DEFAULT NULL", "pre_order_items.unit agregada"],
+      ["ALTER TABLE pre_order_items ADD COLUMN IF NOT EXISTS case_qty INT DEFAULT NULL", "pre_order_items.case_qty agregada"],
+      // Fusión de tipos "Case" + "Unit" en uno solo, "Case/Unit" — solo el catálogo
+      // vivo (products); las órdenes/pre-órdenes ya facturadas conservan su unit
+      // histórico tal cual se vendieron (app y webapp ya tratan "Case"/"Unit" viejos
+      // como equivalentes a "Case/Unit" en la lectura, así que no hace falta tocarlas).
+      ["UPDATE products SET unit = 'Case/Unit' WHERE unit IN ('Case', 'Unit')", "products.unit — Case/Unit fusionados"],
+      ["ALTER TABLE products ADD COLUMN IF NOT EXISTS short_name VARCHAR(255) NULL AFTER name", "products.short_name agregada"],
     ];
     for (const [sql, label] of migrations) {
       try {

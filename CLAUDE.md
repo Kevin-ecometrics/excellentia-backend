@@ -52,6 +52,7 @@ src/
 | POST | `/api/orders/batch/:batchId/retry` | JWT | Reintenta el envío a QBO de un batch PENDING/FAILED al instante (mismo `createBatchInvoice` que la creación). Disponible para el operador dueño del batch, no solo admin |
 | GET | `/api/products` | JWT | Listar productos |
 | GET | `/api/customers` | JWT | Clientes QB |
+| GET | `/api/customers/:customerId` | JWT | Un solo cliente — cache-first contra `cached_customers`, fallback a QB (Fase 102, ticket Android necesitaba resolver dirección para reprint) |
 | GET | `/api/settings` | JWT | Info de la empresa |
 
 ## Schema — tabla `orders`
@@ -115,6 +116,18 @@ El modal de "artículos dañados" (ya existente en el flujo de la app Android) g
 
 El resultado se guarda por línea en `batch_damage.unit_price`/`amount`, y agregado en `customer_credits` (ledger de auditoría — el crédito siempre se aplica de inmediato al mismo batch, no hay redención en un pedido futuro todavía). `createBatchInvoice()` (`qbInvoices.ts`) recibe un parámetro `creditAmount` y, si es > 0 y `QB_CREDIT_ITEM_ID` está configurado en `.env`, agrega una línea `SalesItemLineDetail` con `Amount` negativo a la factura — reduce el total real en QBO, no solo el `CustomerMemo`. Sin esa env var, sigue funcionando como antes (memo únicamente). Los reintentos (`retryBatchSync`) reusan el `amount` ya persistido, nunca lo recalculan, para que el crédito no derive si el precio del catálogo cambió después de la venta.
 
+**Nota:** el código evolucionó después de la Fase 75 a un ledger `credit_transactions` (`type` EARNED/USED, `src/services/creditController.ts`) con balance consultable (`getCustomerBalance`) y un flujo real de aplicación de saldo en una venta distinta a la que lo generó (`applyCustomerCredit`, `apply_credit` en `createBatch`/`convertPreOrder`, consumido por `askApplyCredit()` en Android) — no documentado en su momento. La tabla `customer_credits` de la Fase 75 quedó obsoleta en la práctica; el balance real vive en `credit_transactions`.
+
+## Créditos standalone — POST /api/credits/issue (Fase 76)
+
+Botón "Agregar crédito" en la app Android — agenda crédito para un cliente **sin que exista una venta** (ej. producto dañado/caducado encontrado sin que se vaya a vender). Reusa `computeDamageCredit()` (misma regla de valuación de arriba) para calcular el monto real desde `products`. `src/routes/credits.ts`:
+- Body: `{ customer_id, customer_name?, items: [{ barcode, product_name, qty }] }`.
+- Genera un `batch_id` sintético (prefijo `cr`, sin fila real en `orders` detrás — `batch_damage.batch_id` y `credit_transactions.reference_batch_id` son `VARCHAR` libres, sin FK).
+- Inserta el detalle por línea en `batch_damage` y el total en `credit_transactions` (`type='EARNED'`, `invoice_id=NULL`).
+- **No crea ningún documento en QuickBooks** — el crédito se refleja ahí recién cuando se use en una venta real vía el flujo `apply_credit` ya existente.
+
+**Fix Fase 79 (webapp):** `GET /api/customers/stats` (página `/customers`) tenía `FROM orders` — un cliente con **solo** un crédito standalone (sin ninguna fila en `orders`) no aparecía en la lista y su crédito quedaba invisible ahí (aunque sí se veía en `/api/credits`, que consulta `credit_transactions` directo). Se reescribió para que el `FROM` sea la unión de customer_ids con pedido `SENT` y customer_ids con alguna fila en `credit_transactions`.
+
 ## createBatch — flujo
 
 ```
@@ -137,9 +150,48 @@ Body: { items[], customer_id?, customer_name?, signature?, damage_items?, paymen
 6. Responde: { batchId, invoiceId, orders[], creditsTotal }
 ```
 
+## updateBatchPayment — PUT /api/orders/batch/:batchId/payment (Fase 82)
+
+Adjunta `payment_method`/`check_number` a un batch que ya se creó (factura de
+QBO incluida) sin conocerlos todavía — Android ahora manda el batch antes de
+imprimir el primer ticket (para traer el número de factura real ahí) y recién
+después pregunta el método de pago. `UPDATE orders SET payment_method = ?,
+check_number = ? WHERE batch_id = ?`, sin ninguna llamada a QuickBooks — el
+`CustomerMemo` de la factura se queda como estaba al crearla (decisión
+explícita: alcanza con que el ticket impreso lo muestre).
+
+## Pre-órdenes — `pre_orders`/`pre_order_items` (Fase 87)
+
+Crear una pre-orden (`POST /api/preorders`) solo requiere `customer_id`, `customer_name`
+y `items[]` con `barcode`/`product_name` — sin precio/cantidad/unidad. El detalle real
+(peso, case/unit, precio) se captura recién al convertir, el día de la entrega, desde
+Android (`PreOrderDetailActivity`, reusa el mismo stepper que `ProductDetailActivity`
+usa para el carrito real). Por eso `pre_order_items.price/quantity/total` son
+`NULL`-ables y hay columnas `unit`/`case_qty` (agregadas en Fase 87, antes no existían).
+
+```
+POST /api/preorders/:id/convert
+Body: { items[] (barcode, product_name, price, quantity, total?, unit?, case_qty?),
+        signature?, payment_method?, damage_items?, check_number?, apply_credit? }
+
+1. 400 si items falta o está vacío — antes de esta fase no había items en el body,
+   se leían de pre_order_items (que ahora puede no tener precio)
+2. Valida min_price por item (mismo cálculo que createBatch, nuevo para pre-órdenes)
+3. INSERT en orders por item (incluye unit/case_qty, antes no se insertaban)
+4. DELETE + reinsert de pre_order_items con el detalle finalizado — para que
+   GET /api/preorders/:id y "Reusar pre-orden" reflejen lo entregado, no el
+   borrador vacío original
+5. Firma, damage credits, apply-credit, factura QBO — igual que createBatch
+6. Responde: { batchId, invoiceId, invoiceNumber, preOrderId, creditsTotal, creditApplied }
+```
+
+No descuenta `products.stock` al convertir (a diferencia de `createBatch`) — gap
+preexistente, no cerrado en la Fase 87.
+
 ## Notas de diseño
 
 - `signature` se guarda en **cada fila** del batch (redundante pero consistente con `customer_id`/`customer_name` que también se repiten por fila). No hay tabla separada de batches.
+- **`orders`/`pre_order_items` no guardan la dirección del cliente** (a propósito, Fase 102) — solo `customer_id`/`customer_name`. La dirección se resuelve bajo demanda contra `GET /api/customers/:customerId` (cache-first) cuando hace falta (ej. reimprimir un ticket desde Historial en Android, donde la dirección nunca viajó por Intent). Evita repetir un dato mutable del cliente en cada fila de venta cuando ya hay una fuente de verdad (QB) resoluble con una llamada barata.
 - `price` en la tabla es `DECIMAL(10,6)` (6 decimales) — permite precio/lb con precisión suficiente.
 - SyncEngine corre cada 5 min en `index.ts` para reintentar PENDING/FAILED.
 - `loadTokensFromDb()` al arrancar carga tokens QB desde MySQL (fallback a `.env`).
