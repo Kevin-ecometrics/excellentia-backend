@@ -264,3 +264,19 @@ La librería `intuit-oauth` solo expone en `error.message` el texto genérico qu
 - **Crear**: en QBO (Productos y servicios → Nuevo como Inventory) → "Sincronizar QB" importa a MySQL con `qb_item_id`
 - **Editar** desde webapp: modal → `updateItemMeta` (nombre/desc/SKU) + `updateItemQtyOnHand` (stock) → QBO
 - **No se crean productos desde la webapp** — evita conflictos de tipo contable en QBO
+
+## Pendiente — bug: precio editado en webapp se revierte a los ~5 min
+
+**Síntoma reportado:** al editar el precio de un producto desde el modal de la webapp, el cambio se ve bien al guardar, pero unos 5 minutos después vuelve a aparecer el precio viejo.
+
+**Diagnóstico (confirmado por el usuario probando ambos sentidos por separado — cada uno funciona bien de forma aislada):**
+- Webapp → QBO: `updateProduct` (`productController.ts`) ya llama a `updateItemMeta` (`qbItems.ts`) al guardar, y el push a QBO se confirma en el momento (logs revisados: siempre "QBO actualizado", ningún fallo silencioso registrado en `logs/error.log`).
+- QBO → webapp: el sync (manual o automático) trae bien los cambios hechos directo en QBO.
+- El problema aparece solo cuando se cruzan en el tiempo: `syncProductsFromQbo` (`syncEngine.ts`, corre cada 5 min vía `setInterval` en `startSyncEngine`) hace `UPDATE products SET price = ?, stock = ? ... WHERE qb_item_id = ?` con lo que le devuelve la API de consulta de QBO (`findItemsUpdatedSince`), sin comparar contra cuándo se editó el producto en MySQL por última vez. La API de *consulta* de QBO (distinta de la de escritura) puede tardar un rato corto en reflejar internamente una escritura reciente — si el ciclo de 5 min cae en esa ventana, trae el precio viejo y pisa la edición reciente en MySQL.
+- El mismo `UPDATE` (sin el guard) está duplicado en el sync manual — botón "Sincronizar QB" — en `qbController.ts`.
+
+**Fix propuesto (no implementado todavía — pendiente, sin código hasta confirmación):**
+1. `src/services/syncEngine.ts` (`syncProductsFromQbo`) — antes de pisar `price`/`stock` de un producto, comparar `products.updated_at` (MySQL) contra `Metadata.LastUpdatedTime` (QBO) para ese item; si la edición local es más reciente, no pisar ese campo en esa pasada (se reintenta en el siguiente ciclo).
+2. `src/controllers/qbController.ts` (sync manual "Sincronizar QB") — mismo guard, ya que tiene el `UPDATE` duplicado (ver nota en `qb_active` de este mismo archivo: "ambos deben mantenerse en sync" entre `syncEngine.ts` y `qbController.ts`).
+3. `src/controllers/productController.ts` (`updateProduct`) — hoy el `catch (qbErr)` del push a QBO solo loguea warning y la respuesta HTTP es siempre `{ message: 'Producto actualizado' }`, sin importar si QBO confirmó el cambio. Exponer en la respuesta si el sync a QBO tuvo éxito, para que el admin se entere en el momento si falló (en vez de descubrirlo cuando el valor "se revierte" sin explicación).
+4. Webapp — `app/products/_components/ProductModal.tsx` — leer ese nuevo campo de la respuesta del PUT y mostrar un aviso si QBO no confirmó el cambio (ver pendiente ya anotado en `excellentia-webapp/CLAUDE.md`).
