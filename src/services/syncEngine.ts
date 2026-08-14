@@ -108,24 +108,40 @@ async function syncProductsFromQbo(): Promise<void> {
 
     let upserted = 0;
     let skipped = 0;
+    let guarded = 0;
 
     for (const item of items) {
       try {
         const active = item.Active === false ? 0 : 1;
         const [existing] = await pool.query(
-          'SELECT id FROM products WHERE qb_item_id = ?',
+          'SELECT id, barcode, updated_at FROM products WHERE qb_item_id = ?',
           [item.Id]
         ) as any[];
 
         if (existing.length > 0) {
+          // Si la edición local es más reciente que el LastUpdatedTime que reporta
+          // QBO, la API de consulta todavía no reflejó nuestra propia escritura —
+          // no pisar nada esta pasada, se reintenta en el siguiente ciclo cuando
+          // QBO ya haya convergido (ver nota "Pendiente" en CLAUDE.md).
+          const localUpdatedAt = new Date(existing[0].updated_at).getTime();
+          const qboUpdatedAt = new Date(item.Metadata?.LastUpdatedTime).getTime();
+          if (!Number.isNaN(qboUpdatedAt) && localUpdatedAt > qboUpdatedAt) {
+            guarded++;
+            continue;
+          }
+
+          const sku = item.Sku?.trim();
+          const barcode = sku || existing[0].barcode;
+
           await pool.query(
-            'UPDATE products SET name = ?, price = ?, stock = ?, qb_active = ?, updated_at = NOW() WHERE qb_item_id = ?',
-            [item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, active, item.Id]
+            'UPDATE products SET name = ?, price = ?, stock = ?, barcode = ?, qb_active = ?, updated_at = NOW() WHERE qb_item_id = ?',
+            [item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, barcode, active, item.Id]
           );
         } else {
+          const barcode = item.Sku?.trim() || `QBO-${item.Id}`;
           await pool.query(
             'INSERT INTO products (barcode, name, price, stock, qb_item_id, qb_active) VALUES (?, ?, ?, ?, ?, ?)',
-            [null, item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, item.Id, active]
+            [barcode, item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, item.Id, active]
           );
         }
         upserted++;
@@ -135,7 +151,7 @@ async function syncProductsFromQbo(): Promise<void> {
       }
     }
 
-    logger.info(`syncProductsFromQbo: ${upserted} procesados, ${skipped} omitidos`);
+    logger.info(`syncProductsFromQbo: ${upserted} procesados, ${skipped} omitidos, ${guarded} en espera (edición local reciente)`);
 
     const latestTime = items.reduce((latest: string, item: any) => {
       return item.Metadata?.LastUpdatedTime > latest ? item.Metadata.LastUpdatedTime : latest;

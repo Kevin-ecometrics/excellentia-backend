@@ -1,5 +1,6 @@
 import { oauthClient, refreshToken } from './qbAuth.ts';
 import type { Order } from '../types/index.ts';
+import { isLbsUnit, formatDamageQty } from './creditCalculator.ts';
 import logger from './logger.ts';
 
 const DEFAULT_CUSTOMER_REF = process.env.QB_DEFAULT_CUSTOMER_ID ?? '2';
@@ -35,7 +36,7 @@ export async function createInvoice(order: Order, qbItemId: string, classId?: st
   return response.json;
 }
 
-interface DamageItem { barcode: string; product_name: string; qty: number; unit_price?: number; amount?: number; qb_item_id?: string | null }
+interface DamageItem { barcode: string; product_name: string; qty: number; unit_price?: number; amount?: number; qb_item_id?: string | null; unit?: string | null }
 
 export async function createBatchInvoice(
   items: { qb_item_id: string; product_name: string; price: number; quantity: number; total: number }[],
@@ -46,7 +47,7 @@ export async function createBatchInvoice(
   classId?: string | null,
   docNumber?: number,
   creditAmount: number = 0,
-  damageComputed?: { qb_item_id: string | null; product_name: string; qty: number; unit_price: number; amount: number }[],
+  damageComputed?: { qb_item_id: string | null; product_name: string; qty: number; unit_price: number; amount: number; unit: string | null }[],
   applyCredit?: number
 ): Promise<any> {
   if (!oauthClient.isAccessTokenValid()) {
@@ -97,16 +98,20 @@ export async function createBatchInvoice(
     if (hasQbItemId) {
       for (const dmg of damageComputed) {
         if (!dmg.qb_item_id || dmg.qty <= 0 || dmg.amount <= 0) continue;
-        const lineDetail: Record<string, any> = {
-          ItemRef: { value: dmg.qb_item_id },
-          Qty: -dmg.qty,
-          UnitPrice: dmg.unit_price,
-        };
+        // Para Lbs, dmg.qty es el peso real dañado (no un conteo de piezas) —
+        // igual que una venta normal (ver "QBO Invoices — Qty por venta" en
+        // CLAUDE.md), QBO no debe descontar libras del conteo de inventario:
+        // Qty fijo en -1 y el monto completo va en UnitPrice. Case/Unit y
+        // Bucket sí son conteos reales de piezas — ahí Qty:-dmg.qty tiene
+        // sentido tal cual (un descuento de N piezas de inventario).
+        const lineDetail: Record<string, any> = isLbsUnit(dmg.unit)
+          ? { ItemRef: { value: dmg.qb_item_id }, Qty: -1, UnitPrice: dmg.amount }
+          : { ItemRef: { value: dmg.qb_item_id }, Qty: -dmg.qty, UnitPrice: dmg.unit_price };
         if (classId) lineDetail.ClassRef = { value: classId };
         lines.push({
           DetailType: 'SalesItemLineDetail' as const,
           Amount: -dmg.amount,
-          Description: `Damaged: ${dmg.product_name} - ${dmg.qty} unit(s)`,
+          Description: `Damaged: ${dmg.product_name} - ${formatDamageQty(dmg.qty, dmg.unit)}`,
           SalesItemLineDetail: lineDetail,
         });
       }
@@ -186,10 +191,14 @@ export async function createBatchInvoice(
       ? `Check #${checkNumber}` : `Payment: ${paymentMethod}`;
     memoLines.push(pm);
   }
-  const damagedFiltered = damageItems.filter(d => d.qty > 0);
+  // Prefiere damageComputed (recalculado fresco desde products, con unit
+  // verificado) sobre el damageItems crudo que mandó el cliente — solo cae a
+  // este último si por algún motivo no se pasó damageComputed.
+  const damagedSource = damageComputed && damageComputed.length > 0 ? damageComputed : damageItems;
+  const damagedFiltered = damagedSource.filter(d => d.qty > 0);
   if (damagedFiltered.length > 0) {
     const detail = damagedFiltered
-      .map(d => `${d.product_name}: ${d.qty} unit(s)`)
+      .map(d => `${d.product_name}: ${formatDamageQty(d.qty, d.unit)}`)
       .join(', ');
     memoLines.push(`Negative Sale: ${detail}`);
   }

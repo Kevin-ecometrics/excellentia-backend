@@ -47,8 +47,8 @@ router.post('/issue', auth, async (req: Request, res: Response) => {
 
     for (const dmg of computed) {
       await pool.query(
-        'INSERT INTO batch_damage (batch_id, barcode, product_name, qty, unit_price, amount, qb_item_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [batchId, dmg.barcode, dmg.product_name, dmg.qty, dmg.unit_price, dmg.amount, dmg.qb_item_id]
+        'INSERT INTO batch_damage (batch_id, barcode, product_name, qty, unit, unit_price, amount, qb_item_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [batchId, dmg.barcode, dmg.product_name, dmg.qty, dmg.unit, dmg.unit_price, dmg.amount, dmg.qb_item_id]
       );
     }
 

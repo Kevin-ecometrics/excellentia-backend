@@ -93,6 +93,8 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS unit VARCHAR(20) NULL;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS case_qty INT NULL;
 ALTER TABLE batch_damage ADD COLUMN IF NOT EXISTS unit_price DECIMAL(10,2) NULL;
 ALTER TABLE batch_damage ADD COLUMN IF NOT EXISTS amount DECIMAL(10,2) NULL;
+ALTER TABLE batch_damage MODIFY COLUMN qty DECIMAL(10,2) NOT NULL DEFAULT 0;
+ALTER TABLE batch_damage ADD COLUMN IF NOT EXISTS unit VARCHAR(20) NULL AFTER product_name;
 CREATE TABLE IF NOT EXISTS customer_credits (
   id INT AUTO_INCREMENT PRIMARY KEY,
   customer_id VARCHAR(64) NULL,
@@ -110,9 +112,14 @@ CREATE TABLE IF NOT EXISTS customer_credits (
 ## Créditos por daño (Fase 75)
 
 El modal de "artículos dañados" (ya existente en el flujo de la app Android) genera un crédito real en dólares, no solo texto descriptivo. `src/services/creditCalculator.ts` (`computeDamageCredit`) calcula el valor por unidad consultando `products` fresco al momento de crear el batch — **nunca** un precio mandado por el cliente:
-- **Case**: `unitValue = products.price` (ya es el precio por unidad individual dentro de la caja).
-- **Lbs / sin unit**: `unitValue = products.price * (products.weight_per_unit || 1.0)`.
-- **Unit / Bucket**: `unitValue = products.price` directo.
+- **Case/Unit**: `unitValue = products.price / caseSize` (products.price es el precio del paquete completo, se divide por el tamaño de paquete — `products.qty` — para obtener el valor de una sola unidad dañada).
+- **Lbs / sin unit / Bucket**: `unitValue = products.price` directo.
+
+**`qty` es peso real para Lbs, no un conteo de piezas (fix posterior a la Fase 75).** Originalmente `batch_damage.qty` era `INT` y, para productos Lbs, el crédito se estimaba como `products.price * products.weight_per_unit * qty` — es decir, "N piezas dañadas, cada una de un peso promedio". Eso se reemplazó: `batch_damage.qty` es ahora `DECIMAL(10,2)` y, para Lbs, es directamente el peso real dañado (ej. `2.35`), igual que `orders.quantity` en una venta normal — `weight_per_unit` ya no interviene en el cálculo. `batch_damage.unit` (columna nueva) guarda el tipo de venta del producto al momento del daño, snapshot igual que `orders.unit`, para que el input en pantalla (decimal solo si es Lbs), el texto del ticket y la factura de QBO sepan interpretar `qty` correctamente. `isLbsUnit()`/`formatDamageQty()` (exportadas desde `creditCalculator.ts`, espejadas en `data/Models.kt` de la app Android) son la fuente de verdad de ese criterio — úsalas en vez de repetir la comparación `unit == 'Lbs'` a mano.
+
+**QBO — línea de factura de un daño en Lbs usa `Qty` fijo.** Igual que una venta normal de Lbs (`Qty: 1` + `UnitPrice: total`, ver "QBO Invoices — Qty por venta" más abajo), una línea de daño en un producto Lbs manda `Qty: -1` + `UnitPrice: dmg.amount` en vez de `Qty: -dmg.qty` — así QBO no descuenta libras del conteo de inventario, que se lleva por unidades/eventos de venta, no por peso. Case/Unit y Bucket sí son conteos reales de piezas — ahí `Qty: -dmg.qty` se mantiene tal cual (`qbInvoices.ts`, `createBatchInvoice`). `retryBatchSync` tiene su propio `SELECT ... FROM batch_damage` (no pasa por `computeDamageCredit`, reusa lo ya persistido) — hay que mantenerle la columna `unit` en el SELECT también, se pisó una vez sin querer al agregar la columna.
+
+**Gotcha — `DECIMAL` vía `mysql2` no es `number` en JS, mismo patrón que `TINYINT(1)`/`qb_active` (ver más abajo).** Al pasar `batch_damage.qty` de `INT` a `DECIMAL(10,2)`, `mysql2` empezó a devolverlo como **string** (`"2.35"`, no `2.35`) — no hay `decimalNumbers` configurado en `db/connection.ts`. `formatDamageQty(qty, unit)` hacía `qty.toFixed(2)` directo sobre un valor leído crudo de una fila de MySQL (vía `retryBatchSync`) y reventaba (`qty.toFixed is not a function`, string no tiene ese método) — pasó también en la webapp con el mismo patrón (ver `excellentia-webapp/CLAUDE.md`). Fix: `Number(qty) || 0` dentro de `formatDamageQty()` antes de formatear. Los operadores aritméticos/relacionales (`*`, `<=`, unario `-`) coaccionan solos un string a number — el problema es específico de llamar un método de `Number.prototype` (`.toFixed()`) sobre algo que en runtime es un string aunque el tipo declarado diga `number`.
 
 El resultado se guarda por línea en `batch_damage.unit_price`/`amount`, y agregado en `customer_credits` (ledger de auditoría — el crédito siempre se aplica de inmediato al mismo batch, no hay redención en un pedido futuro todavía). `createBatchInvoice()` (`qbInvoices.ts`) recibe un parámetro `creditAmount` y, si es > 0 y `QB_CREDIT_ITEM_ID` está configurado en `.env`, agrega una línea `SalesItemLineDetail` con `Amount` negativo a la factura — reduce el total real en QBO, no solo el `CustomerMemo`. Sin esa env var, sigue funcionando como antes (memo únicamente). Los reintentos (`retryBatchSync`) reusan el `amount` ya persistido, nunca lo recalculan, para que el crédito no derive si el precio del catálogo cambió después de la venta.
 
@@ -224,7 +231,7 @@ Ambas funciones son silent — el fallo en QBO no revierte el guardado en MySQL.
 
 `syncProducts` lee `item.Sku` como barcode. Si el SKU está vacío, usa `QBO-{Id}` como fallback. También sincroniza `item.Description` → `products.description`.
 
-**Inconsistencia conocida (no arreglada):** `syncProductsFromQbo` (el sync automático de `syncEngine.ts`, cada 5 min) inserta productos nuevos con `barcode = NULL` directo, sin el fallback `item.Sku || 'QBO-{Id}'` que sí usa `syncProducts`. Un producto que nace por esta vía queda sin barcode — y como `orders.barcode = products.barcode` es el JOIN que usa todo el flujo de facturación (`retryBatchSync`, `processPendingOrders`), ese producto nunca puede facturarse aunque tenga `qb_item_id` válido, porque `NULL` no matchea contra nada.
+**Fix aplicado:** tanto `syncProductsFromQbo` (`syncEngine.ts`, automático cada 5 min) como `syncProducts` (`qbController.ts`, botón manual) usan ahora el mismo fallback `item.Sku?.trim() || 'QBO-{Id}'` al insertar un producto nuevo — antes el sync automático insertaba `barcode = NULL` directo. Además, ambos ahora también actualizan el `barcode` de un producto **ya existente** cuando el SKU cambió en QBO (antes solo se escribía al crear, nunca al actualizar): si `item.Sku` viene vacío, el barcode local no se toca (nunca se pisa con blanco ni con el `QBO-{Id}` sintético — ese fallback es solo para altas). `barcode` es `UNIQUE` en MySQL: un choque de SKU entre dos ítems cae en el try/catch por ítem ya existente (se omite y se loguea, mismo tratamiento que cualquier otro error de fila).
 
 `updateItemMeta` acepta `sku` y lo envía como `Sku` en el sparse update. `updateProduct` pasa `barcode` como `sku` cuando cambia.
 
@@ -265,18 +272,14 @@ La librería `intuit-oauth` solo expone en `error.message` el texto genérico qu
 - **Editar** desde webapp: modal → `updateItemMeta` (nombre/desc/SKU) + `updateItemQtyOnHand` (stock) → QBO
 - **No se crean productos desde la webapp** — evita conflictos de tipo contable en QBO
 
-## Pendiente — bug: precio editado en webapp se revierte a los ~5 min
+## Guard contra pisar ediciones locales recientes — fix del bug "precio se revierte a los ~5 min"
 
-**Síntoma reportado:** al editar el precio de un producto desde el modal de la webapp, el cambio se ve bien al guardar, pero unos 5 minutos después vuelve a aparecer el precio viejo.
+**Síntoma que tenía (ya arreglado):** al editar el precio de un producto desde el modal de la webapp, el cambio se veía bien al guardar, pero unos 5 minutos después volvía a aparecer el precio viejo.
 
-**Diagnóstico (confirmado por el usuario probando ambos sentidos por separado — cada uno funciona bien de forma aislada):**
-- Webapp → QBO: `updateProduct` (`productController.ts`) ya llama a `updateItemMeta` (`qbItems.ts`) al guardar, y el push a QBO se confirma en el momento (logs revisados: siempre "QBO actualizado", ningún fallo silencioso registrado en `logs/error.log`).
-- QBO → webapp: el sync (manual o automático) trae bien los cambios hechos directo en QBO.
-- El problema aparece solo cuando se cruzan en el tiempo: `syncProductsFromQbo` (`syncEngine.ts`, corre cada 5 min vía `setInterval` en `startSyncEngine`) hace `UPDATE products SET price = ?, stock = ? ... WHERE qb_item_id = ?` con lo que le devuelve la API de consulta de QBO (`findItemsUpdatedSince`), sin comparar contra cuándo se editó el producto en MySQL por última vez. La API de *consulta* de QBO (distinta de la de escritura) puede tardar un rato corto en reflejar internamente una escritura reciente — si el ciclo de 5 min cae en esa ventana, trae el precio viejo y pisa la edición reciente en MySQL.
-- El mismo `UPDATE` (sin el guard) está duplicado en el sync manual — botón "Sincronizar QB" — en `qbController.ts`.
+**Causa raíz:** `syncProductsFromQbo` (`syncEngine.ts`, cada 5 min) y `syncProducts` (`qbController.ts`, sync manual) pisaban `price`/`stock` con lo que devolvía la API de *consulta* de QBO, sin comparar contra cuándo se había editado el producto en MySQL por última vez. Esa API de consulta (distinta de la de escritura) puede tardar un rato corto en reflejar internamente una escritura reciente — si el ciclo caía en esa ventana, traía el valor viejo y pisaba la edición reciente.
 
-**Fix propuesto (no implementado todavía — pendiente, sin código hasta confirmación):**
-1. `src/services/syncEngine.ts` (`syncProductsFromQbo`) — antes de pisar `price`/`stock` de un producto, comparar `products.updated_at` (MySQL) contra `Metadata.LastUpdatedTime` (QBO) para ese item; si la edición local es más reciente, no pisar ese campo en esa pasada (se reintenta en el siguiente ciclo).
-2. `src/controllers/qbController.ts` (sync manual "Sincronizar QB") — mismo guard, ya que tiene el `UPDATE` duplicado (ver nota en `qb_active` de este mismo archivo: "ambos deben mantenerse en sync" entre `syncEngine.ts` y `qbController.ts`).
-3. `src/controllers/productController.ts` (`updateProduct`) — hoy el `catch (qbErr)` del push a QBO solo loguea warning y la respuesta HTTP es siempre `{ message: 'Producto actualizado' }`, sin importar si QBO confirmó el cambio. Exponer en la respuesta si el sync a QBO tuvo éxito, para que el admin se entere en el momento si falló (en vez de descubrirlo cuando el valor "se revierte" sin explicación).
-4. Webapp — `app/products/_components/ProductModal.tsx` — leer ese nuevo campo de la respuesta del PUT y mostrar un aviso si QBO no confirmó el cambio (ver pendiente ya anotado en `excellentia-webapp/CLAUDE.md`).
+**Fix aplicado (en ambos archivos, `syncEngine.ts` y `qbController.ts`):** antes de hacer el `UPDATE` de un producto existente, se compara `products.updated_at` (MySQL) contra `Metadata.LastUpdatedTime` (QBO) para ese item; si la edición local es más reciente, se salta el `UPDATE` completo de esa fila en esa pasada (protege `price`, `stock` y `barcode` a la vez, no campo por campo) — se reintenta en el siguiente ciclo, cuando la API de consulta de QBO ya haya convergido. Se cuentan por separado en el log/respuesta (`guarded`) de los omitidos por error (`skipped`).
+
+**Pendiente, no implementado todavía:**
+- `src/controllers/productController.ts` (`updateProduct`) — el `catch (qbErr)` del push a QBO solo loguea warning y la respuesta HTTP es siempre `{ message: 'Producto actualizado' }`, sin importar si QBO confirmó el cambio. Exponer en la respuesta si el sync a QBO tuvo éxito, para que el admin se entere en el momento si falló.
+- Webapp — `app/products/_components/ProductModal.tsx` — leer ese nuevo campo de la respuesta del PUT y mostrar un aviso si QBO no confirmó el cambio (ver pendiente ya anotado en `excellentia-webapp/CLAUDE.md`).

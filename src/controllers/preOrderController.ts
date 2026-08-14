@@ -262,7 +262,7 @@ export async function convertPreOrder(req: Request, res: Response): Promise<void
     }
 
     let creditsTotal = 0;
-    let damageComputed: { qb_item_id: string | null; product_name: string; qty: number; unit_price: number; amount: number }[] = [];
+    let damageComputed: { qb_item_id: string | null; product_name: string; qty: number; unit_price: number; amount: number; unit: string | null }[] = [];
     if (Array.isArray(damage_items)) {
       const toInsert = (damage_items as any[]).filter(d => Number(d.qty) > 0);
       if (toInsert.length > 0) {
@@ -273,8 +273,8 @@ export async function convertPreOrder(req: Request, res: Response): Promise<void
         creditsTotal = total;
         for (const dmg of computed) {
           await pool.query(
-            'INSERT INTO batch_damage (batch_id, barcode, product_name, qty, unit_price, amount, qb_item_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            [batchId, dmg.barcode, dmg.product_name, dmg.qty, dmg.unit_price, dmg.amount, dmg.qb_item_id]
+            'INSERT INTO batch_damage (batch_id, barcode, product_name, qty, unit, unit_price, amount, qb_item_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            [batchId, dmg.barcode, dmg.product_name, dmg.qty, dmg.unit, dmg.unit_price, dmg.amount, dmg.qb_item_id]
           );
         }
         if (creditsTotal > 0) {

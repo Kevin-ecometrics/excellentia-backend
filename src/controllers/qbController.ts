@@ -88,25 +88,37 @@ export async function syncProducts(_req: Request, res: Response): Promise<void> 
     let inserted = 0;
     let updated = 0;
     let skipped = 0;
+    let guarded = 0;
 
     for (const item of items) {
       try {
-        const barcode = item.Sku?.trim() || `QBO-${item.Id}`;
         const category = item.IncomeAccountRef?.name ?? null;
         const description = item.Description ?? null;
         const active = item.Active === false ? 0 : 1;
         const [existing] = await pool.query(
-          'SELECT id FROM products WHERE qb_item_id = ?',
+          'SELECT id, barcode, updated_at FROM products WHERE qb_item_id = ?',
           [item.Id]
         ) as any[];
 
         if (existing.length > 0) {
+          // Mismo guard que syncProductsFromQbo (syncEngine.ts) — ver nota ahí.
+          const localUpdatedAt = new Date(existing[0].updated_at).getTime();
+          const qboUpdatedAt = new Date(item.Metadata?.LastUpdatedTime).getTime();
+          if (!Number.isNaN(qboUpdatedAt) && localUpdatedAt > qboUpdatedAt) {
+            guarded++;
+            continue;
+          }
+
+          const sku = item.Sku?.trim();
+          const barcode = sku || existing[0].barcode;
+
           await pool.query(
-            'UPDATE products SET name = ?, price = ?, stock = ?, category = ?, description = ?, qb_active = ?, updated_at = NOW() WHERE qb_item_id = ?',
-            [item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, category, description, active, item.Id]
+            'UPDATE products SET name = ?, price = ?, stock = ?, barcode = ?, category = ?, description = ?, qb_active = ?, updated_at = NOW() WHERE qb_item_id = ?',
+            [item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, barcode, category, description, active, item.Id]
           );
           updated++;
         } else {
+          const barcode = item.Sku?.trim() || `QBO-${item.Id}`;
           await pool.query(
             'INSERT INTO products (barcode, name, price, stock, qb_item_id, category, description, qb_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             [barcode, item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, item.Id, category, description, active]
@@ -126,11 +138,12 @@ export async function syncProducts(_req: Request, res: Response): Promise<void> 
     );
 
     res.json({
-      message: `Sync completado. ${items.length} items en QBO, ${inserted} nuevos, ${updated} actualizados, ${skipped} omitidos.`,
+      message: `Sync completado. ${items.length} items en QBO, ${inserted} nuevos, ${updated} actualizados, ${skipped} omitidos, ${guarded} en espera.`,
       total_qbo: items.length,
       inserted,
       updated,
       skipped,
+      guarded,
     });
   } catch (err) {
     logger.error('syncProducts error:', err);
