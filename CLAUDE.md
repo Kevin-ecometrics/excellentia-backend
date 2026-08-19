@@ -54,6 +54,15 @@ src/
 | GET | `/api/customers` | JWT | Clientes QB |
 | GET | `/api/customers/:customerId` | JWT | Un solo cliente — cache-first contra `cached_customers`, fallback a QB (Fase 102, ticket Android necesitaba resolver dirección para reprint) |
 | GET | `/api/settings` | JWT | Info de la empresa |
+| PUT | `/api/settings/invoice-counter` | JWT+admin | Reasigna el próximo número de factura QBO (`company_settings.invoice_counter`) — ver nota abajo |
+
+## invoice_counter — numeración de facturas QBO
+
+`company_settings.invoice_counter` (fila única, `id = 1`) es el **próximo** `DocNumber` a asignar en QuickBooks — se lee y se incrementa en `createBatch`/`retryBatchSync`/`convertPreOrder` (`orderController.ts`, `preOrderController.ts`) y en `processPendingOrders` (SyncEngine). Cada factura exitosa hace `invoice_counter = invoice_counter + 1`.
+
+`PUT /api/settings/invoice-counter` (`updateInvoiceCounter`, `settingsController.ts`) permite reasignarlo manualmente — caso de uso real: se acaba la caja de facturas físicas y hay que arrancar la numeración en un número más alto. **Solo admite avanzar el contador, nunca retroceder** (`next > current`, si no 400) — bajarlo podría reasignar un `DocNumber` que QBO ya usó en una factura previa. Cada cambio queda en `activity_log` (`action = 'INVOICE_COUNTER_UPDATED'`, `details` con `#actual → #nuevo`) para auditoría, dado que es un valor sensible que afecta la numeración fiscal.
+
+Editable desde la webapp en Settings (card "Invoice numbering", admin-only) — `excellentia-webapp/app/settings/_components/SettingsClient.tsx`. Requiere confirmación en un modal antes de aplicar el cambio.
 
 ## Schema — tabla `orders`
 

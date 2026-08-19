@@ -1,6 +1,6 @@
 # Excellentia — Progreso del Proyecto
 
-> Estado actual: **Fase 101 ✅ — Ticket: indicador corto de unidad en Qty/W para Case/Unit ("cs/unt") y Bucket ("bkt")**
+> Estado actual: **Fase 103 ✅ — Numeración de facturas editable desde Settings (invoice_counter)**
 
 ---
 
@@ -2781,6 +2781,39 @@ Ninguno — sin cambios de esquema, ver nota arriba.
 
 ---
 
+## Fase 103: Numeración de facturas editable desde Settings (invoice_counter) ✅
+
+### Contexto
+El usuario se quedó sin facturas físicas y pidió arrancar la numeración en un número específico (`#51640` → `#52551`). Hasta ahora `company_settings.invoice_counter` (el próximo `DocNumber` a asignar en QBO, incrementado en cada factura por `createBatch`/`retryBatchSync`/`convertPreOrder`/SyncEngine) solo se podía cambiar con un `UPDATE` manual en phpMyAdmin sobre producción. Se decidió exponerlo como campo editable en la webapp para que no dependa de acceso directo a la base de datos la próxima vez que se repita (se acaba una caja de facturas).
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 103.1 | Nuevo endpoint `PUT /api/settings/invoice-counter` (JWT + admin) — valida entero positivo y que el nuevo valor sea **estrictamente mayor** al actual (400 si no); bajarlo podría reasignar un `DocNumber` que QBO ya usó en una factura previa | `src/controllers/settingsController.ts`, `src/routes/settings.ts` | ✅ |
+| 103.2 | Cambio registrado en `activity_log` (`action = 'INVOICE_COUNTER_UPDATED'`, `details` con `#actual → #nuevo`) para auditoría — es un valor sensible que afecta numeración fiscal | `src/controllers/settingsController.ts` | ✅ |
+
+`GET /api/settings` no cambió — ya devolvía `invoice_counter` vía `SELECT *`.
+
+### Webapp
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 103.3 | Card "Invoice numbering" en Settings — próximo número actual + input para el nuevo valor (validación en vivo: debe ser mayor al actual) + botón, visible solo si `getUserInfo().role === 'admin'` | `app/settings/_components/SettingsClient.tsx` | ✅ |
+| 103.4 | Modal de confirmación antes de aplicar el cambio (mismo patrón visual que `DeleteModal` de `UsersClient.tsx`, en ámbar en vez de rojo por no ser una acción destructiva) | `app/settings/_components/SettingsClient.tsx` | ✅ |
+| 103.5 | Claves i18n `cfg_invoice*` (`es`/`en`) | `app/lib/i18n.ts` | ✅ |
+| 103.6 | `CompanySettings` gana `invoice_counter: number` | `app/settings/page.tsx` | ✅ |
+
+`bun run build` corrió limpio después del cambio.
+
+### Pendiente, no cerrado en esta fase
+`GET /api/settings` sigue sin `adminOnly` en el backend — un operador que navegue directo a `/settings` por URL puede ver la página (el link está oculto en el sidebar, pero a diferencia de `/dashboard` la ruta no redirige). La card de facturación se ocultó igual con el chequeo de rol en cliente, y el `PUT` en sí ya está protegido por `adminOnly`, pero la inconsistencia general de la página queda para después — ver `excellentia-webapp/CLAUDE.md`.
+
+### SQL
+Ninguno — `company_settings.invoice_counter` ya existía desde antes de esta fase.
+
+---
+
 ## Pendiente / Mejoras futuras
 
 ### Android
@@ -2840,3 +2873,5 @@ Ninguno — sin cambios de esquema, ver nota arriba.
 | Media | **Alerta de stock bajo** | Badge/indicador rojo en productos con stock ≤ 5 en la página de productos. Ya existe el dato, mínimo esfuerzo. |
 | Media | **Historial/saldo de créditos por cliente** | Página o sección en `/customers` mostrando créditos generados y saldo disponible, más la capacidad de "aplicar" ese saldo en un pedido futuro distinto al que lo generó. La tabla `customer_credits` ya existe (Fase 75) como ledger de auditoría — falta la UI de saldo/aplicación |
 | Media | **Reporte de damage por período** | Sección en dashboard con: total perdido por damage por semana/mes, top productos más dañados, qué operador reporta más damage. Útil para decisiones de compra. |
+| ✅ | ~~**Numeración de facturas editable**~~ | Completado en Fase 103 — card en Settings, admin-only, con validación forward-only y modal de confirmación |
+| Baja | **`/settings` sin protección de rol consistente** | `GET /api/settings` no tiene `adminOnly` y la página no redirige a un operador que entre por URL directa (a diferencia de `/dashboard`). No es grave hoy (solo lee nombre/dirección de empresa), pero quedó expuesto de nuevo al agregar la card de facturación en Fase 103 — conviene cerrarlo antes de agregar más campos sensibles a Settings |
