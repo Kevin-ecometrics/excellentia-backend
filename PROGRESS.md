@@ -1,6 +1,6 @@
 # Excellentia — Progreso del Proyecto
 
-> Estado actual: **Fase 106 ✅ — Endurecimiento del endpoint migrate-sku (re-corridas seguras, error por fila)**
+> Estado actual: **Fase 109 ✅ — Ticket ZQ630 Plus: letra más chica (Font 7) + aprovechamiento del ancho del papel**
 
 ---
 
@@ -2989,6 +2989,58 @@ Con la migración NEW_SKU cerrada (Fase 107), el SKU (`MIS045`, `REY001`…) se 
 - La columna `sku` del cache queda poblada con el primer `prefetchAllProducts` completo tras actualizar la app (o a medida que escaneen productos).
 - Los otros 3 diálogos de búsqueda (CurrentOrder/CreatePreOrder/IssueCredit) buscan por SKU vía backend pero sus etiquetas siguen mostrando barcode — extender si hace falta.
 - Compilación: tsc limpio (9 errores preexistentes), `gradlew :app:compileDebugKotlin` OK.
+
+---
+
+## Fase 109: Ticket ZQ630 Plus — letra más chica (Font 7) + aprovechamiento del ancho del papel ✅
+
+Proyecto Android (`androidStudioProjects/test`), único archivo tocado: `data/print/PrintService.kt`. El ticket se genera en CPCL y se manda por Bluetooth SPP.
+
+### Contexto
+Pedido: achicar la letra del ticket impreso. El cuerpo usaba solo la Font 4 (17×27px) vía comando CPCL `T {font} 0 x y texto`. Limitación descubierta: **las fuentes bit-mapped de CPCL son de tamaño fijo** — mover constantes de layout (`F4H`, gaps) nunca achica los glifos, solo reacomoda líneas. La spec del ZQ630 Plus lista 25 fuentes bit-mapped + 1 escalable (CG Triumvirate Bold Condensed), pero el código comentaba "solo font 4 y 7 disponibles" (elección histórica, no límite real).
+
+### Probe 1 — fuentes residentes (temporal en `buildTestCpcl`, luego revertido)
+Por cada número candidato imprimía una etiqueta en F4 + 50 dígitos (`0123456789|`×5, grupos de 10 para contar) + una línea F7 tras `SETMAG 1 1`.
+
+Hallazgos:
+- **En este firmware la Font 7 es una condensada MÁS CHICA que la Font 4** (~40 dígitos entran en PAGE-WIDTH vs 33; glifos visiblemente más bajos). Las tablas de Zebra que listan la Font 7 como 28×44px **NO aplican a este firmware** — el comentario viejo del código heredaba ese dato equivocado.
+- `SETMAG 1 1` no le hace nada (= tamaño base); no es palanca para achicar más.
+- ⚠️ **Los resultados de F0–F6, F20–F26 y F55 nunca se recolectaron** — el usuario solo reportó F4 y F7. El probe es trivial de re-crear; conviene reimprimirlo antes de cualquier otro cambio de tipografía (ver "Caminos futuros").
+
+### Probe 2 — ancho físico del papel (temporal, luego revertido)
+Papel real medido: **102mm ≈ 816 dots** (la ZQ630 Plus es de 4", hasta 104mm imprimibles) — el `PAGE-WIDTH 576` histórico era un valor de impresora de 3", dejaba ~15mm muerto por lado. Con página a 816 entraban separadores "=" de hasta 56 chars. Además se confirmó el comportamiento del origen: con página ancha, **x=0 queda pegado al borde físico izquierdo** (cero padding a la izquierda observado; el sobrante cae todo a la derecha).
+
+### Cambios finales
+
+| Constante | Antes | Ahora | Nota |
+|---|---|---|---|
+| Fuente del cuerpo | `F4 = 4` | `BODY_FONT = 7` | condensada más chica en este firmware |
+| Ancho de carácter | 17px | `BODY_CHAR_PX = 15` | conservador: dígito real ≈14.2–14.4px; la fuente es proporcional y hay letras más anchas |
+| Alto de línea | `F4H = 34` | `BODY_H = 28` | estimado — afinar con ticket físico si el espaciado se ve mal |
+| PAGE-WIDTH | 576 | `PW = 800` | ~1mm de holgura física por lado sobre el papel de 102mm |
+| Padding lateral | inexistente (x=0) | `X_LEFT = 48` | ~6mm + ~3mm propios del borde físico ≈ 9mm visual; los anchos de texto derivan del interior `(PW - 2*X_LEFT)` |
+| MAX_LINE_CHARS | 33 | 46 | `(PW - 2*X_LEFT) / BODY_CHAR_PX` |
+| LINE_WIDTH | 29 | 42 | colchón −4 bajo MAX |
+| ITEM_NAME_WIDTH | 25 | 38 | |
+| SEP / DASH | 32 chars | **56 chars** | desacoplados de LINE_WIDTH (ver decisión 1) |
+| QR términos | 320px | 500px | centrado sobre el mismo eje que la caja interior |
+| Firma | 480px | 700px | ≤ ancho interior (704px) |
+
+### Decisiones
+1. **Separadores desacoplados de LINE_WIDTH**: son puro "=", de ancho conocido (~11.5–12px real, deducido del gap derecho observado con 52 chars). Pueden ser más largos que las líneas de texto sin riesgo de envolver; el texto conserva su colchón porque la Font 7 es proporcional.
+2. **Padding manual con X_LEFT**: CPCL no centra contenido; el origen pega al borde físico. Todo `t()`/`tWrapped()` usa `X_LEFT` (o `X_LEFT + 4` para indentados), y los anchos salen del ancho interior.
+3. Error transitorio durante la edición: SEP quedó un momento con `#` en vez de `=` — detectado y corregido antes de compilar; longitudes verificadas por script (56 exacto).
+4. Compilación verificada en cada paso (`gradlew compileDebugKotlin`, `JAVA_HOME` = JBR de Android Studio). Los dos probes quedaron revertidos: "imprimir prueba" saca el ticket simple.
+
+### Ajuste fino pendiente (knobs)
+- Espaciado vertical raro → tocar `BODY_H` (28 es estimado).
+- Sobra aire a la derecha en texto → `BODY_CHAR_PX` 15→14 (líneas 46→50 chars).
+- Más/menos padding lateral → `X_LEFT` (8 dots = 1mm).
+
+### Caminos futuros para el tamaño de letra (documentados, NO implementados)
+1. **Revisar las fuentes F0–F26/F55 del probe 1** — sus resultados jamás se recolectaron; alguna podría ser más chica o más grande que F7 sin ningún comando extra. Es el paso más barato: re-imprimir el probe y contar dígitos por fuente.
+2. **`SETMAG`** para agrandar sin cambiar de fuente: `SETMAG 2 2` duplica ancho+alto (solo pasos enteros — no hay 1.25×/1.5×); también desigual (`2 1`/`1 2`). Es comando de estado: afecta a las líneas siguientes hasta el próximo SETMAG, así que puede aplicarse por sección (ej. TOTAL grande y resto normal). Efecto sobre F7 sin confirmar (el probe solo probó magnitud 1).
+3. **Migración a ZPL**: `^A0N,alto,ancho` da tamaño exacto en dots (+15%, +30%, lo que sea) — requiere reescribir el generador (`buildCpcl` → `buildZpl`, gráficos EG → `^GF`). Solo si 1 y 2 no alcanzan.
 
 ---
 
