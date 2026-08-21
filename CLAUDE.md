@@ -50,11 +50,82 @@ src/
 | GET | `/api/orders/export` | JWT | Exportar CSV |
 | POST | `/api/orders/:id/sync` | JWT+admin | Forzar sync a QuickBooks (re-encola para SyncEngine, no llama a QBO al instante) |
 | POST | `/api/orders/batch/:batchId/retry` | JWT | Reintenta el envío a QBO de un batch PENDING/FAILED al instante (mismo `createBatchInvoice` que la creación). Disponible para el operador dueño del batch, no solo admin |
-| GET | `/api/products` | JWT | Listar productos |
+| GET | `/api/products` | JWT | Listar productos — `?search=` matchea `name`/`barcode`/**`sku`** (Fase 108), `?sort=sku` ordena por secuencia NEW_SKU (marca A-Z, luego 001, 002…; sin NEW_SKU al final) |
 | GET | `/api/customers` | JWT | Clientes QB |
 | GET | `/api/customers/:customerId` | JWT | Un solo cliente — cache-first contra `cached_customers`, fallback a QB (Fase 102, ticket Android necesitaba resolver dirección para reprint) |
 | GET | `/api/settings` | JWT | Info de la empresa |
 | PUT | `/api/settings/invoice-counter` | JWT+admin | Reasigna el próximo número de factura QBO (`company_settings.invoice_counter`) — ver nota abajo |
+| POST | `/api/products/migrate-sku` | JWT+admin | Migración de una sola vez: adopta la nomenclatura NEW_SKU (marca+secuencia) del master sheet Excellentia-vs-QBO — ver nota abajo |
+
+## migrateSkuNomenclature — migración de una sola vez a la nomenclatura NEW_SKU
+
+`POST /api/products/migrate-sku?apply=true&offset=0&limit=25` (`migrateSkuNomenclature`,
+`productController.ts`) — reemplaza el `sku` de cada producto por el código
+`MARCA+secuencia` (ej. `REY001`) calculado a partir de la comparación entre el
+export de QBO y la lista de precios PDF de Excellentia (agosto 2026). Como `sku` es
+el campo que sincroniza con QBO, cada cambio dispara el mismo `updateItemMeta` que
+editar el SKU a mano en el modal — por eso corre secuencial con una pausa de 400ms
+entre llamadas a QBO (no en paralelo, para no pisar `SyncToken`s ni gatillar rate
+limit) y **paginado** (`offset`/`limit`, máx 50 por llamada) para no exceder el
+timeout del proxy de cPanel en una corrida de varios minutos — se pega la URL
+varias veces siguiendo el `next_offset` que devuelve cada respuesta hasta que sale
+`null`. Sin `apply=true` corre en modo dry-run (no escribe nada, solo informa qué
+haría). Los 198 registros de entrada (incluye qué producto matchea con qué,
+unit/qty objetivo, y las filas que no tienen fila en `products` porque nunca se
+importaron de QBO) están hardcodeados en `src/data/sku-migration-input.json`,
+importado directo en el bundle — no se lee de disco en runtime. Reemplaza el
+script standalone `bun run` que se descartó porque cPanel no da acceso a terminal
+para correrlo ahí.
+
+Solo llena `unit`/`qty` si el producto no tenía nada guardado — nunca pisa un valor
+ya asignado a mano. El match del producto local es por `barcode` (SKU histórico de
+QBO, ya no se toca desde la Fase 105); si no matchea, cae a un match exacto por
+`name` y, como tercer intento, por `name_normalized` (los nombres del master sheet
+traen prefijo de unidad — `Units:`, `Pounds:`, `Case/Bucket:`, `Case:` — que los
+productos locales no tienen; se quita el prefijo y se compara exacto contra
+`products.name`). Endpoint pensado para usarse una sola vez y después quedar en
+desuso (no hay botón en la webapp a propósito).
+
+**Robustez para re-corridas (Fase 106):** la decisión de push a QBO se toma contra el
+Sku **vivo del item en QBO** (`getItemById`), no contra el `sku` local — si una
+corrida anterior aplicó el sku local pero el push falló, la re-corrida detecta el
+desajuste y reintenta (auto-curativo; si QBO no responde se asume push y el fallo se
+reporta por fila). Cada fila corre en su propio try/catch: un error de MySQL/QBO en
+una fila (ej. choque del `UNIQUE` de `products.sku`) se reporta con `status:'error'`
++ `db_error` y NO aborta la página. Se detectan duplicados de `new_sku` dentro del
+JSON (primera aparición gana, `warnings.duplicate_new_skus` en la respuesta) y
+colisiones contra la DB antes del UPDATE (`SELECT id FROM products WHERE sku = ? AND
+id <> ?`). Contrato de respuesta: por fila `status` (`applied`/`dry_run`/
+`skipped`/`error`), `qbo_status` (`synced`/`needs_push`/`no_qb_item_id`/
+`unverified`), `db_error`; `summary.db_failed`; `qbo_push` solo reporta escrituras
+reales (`ok`/`failed`/`skipped` — en dry-run siempre `skipped`; la predicción vive
+en `qbo_status`).
+
+**Defecto del master sheet — barcodes duplicados (Fase 107):** seis pares de filas
+del JSON comparten el mismo `qbo_sku`; como el matcher prioriza barcode, ambas
+matchean al MISMO producto local y la segunda aparición pisa el sku que la primera
+acaba de aplicar. Detectado en la revisión post-corrida (productos 362/376/483/328/
+494 quedaron con el sku de la fila equivocada; el producto 366 "DF Shredded Mexican
+2lb", destinatario real de MIS053, quedó `barcode=NULL, sku=NULL` porque no tiene
+barcode y su fila fue consumida por otro). Remediación: se parcharon las 5 filas
+"segundas" del JSON para que apunten a su destinatario real (MIS046→`DF-01`,
+MIS056→`DF-46`, MIS072→`DF-21`, REY010→`null` not_found inofensivo, MIS053→`null`
+matchea por nombre normalizado) y una re-corrida completa reaplica las filas
+primeras a sus holders correctos. **Con el parche el JSON queda consistente:
+cualquier re-corrida futura es segura.**
+
+**Trampa SQL para queries de verificación:** `sku NOT REGEXP '^[A-Z]{3,4}[0-9]{3}$'`
+NO atrapa filas con `sku IS NULL` (`NULL NOT REGEXP ...` da NULL → la fila se
+filtra del resultado). Usar siempre `(sku IS NULL OR sku NOT REGEXP ...)`.
+
+**Estado: CERRADA (agosto 2026).** Corrida final verificada: la query de
+verificación NULL-safe da **0 filas** sin NEW_SKU entre los productos visibles y
+activos. Segundo lote de items Service (Shopify ×6, Pounds, Units, Services,
+Shipping, Spoils charge, Walmart sls chargeback) oculto con `hidden=1` por ids
+explícitos — sin tocar los flags Active en QBO (Shopify los necesita activos).
+Endpoint retirado en la práctica; el JSON parcheado queda consistente si alguna
+vez hiciera falta una re-corrida. La ruta es POST-only: un fetch sin
+`method:'POST'` responde 404.
 
 ## invoice_counter — numeración de facturas QBO
 
@@ -104,6 +175,9 @@ ALTER TABLE batch_damage ADD COLUMN IF NOT EXISTS unit_price DECIMAL(10,2) NULL;
 ALTER TABLE batch_damage ADD COLUMN IF NOT EXISTS amount DECIMAL(10,2) NULL;
 ALTER TABLE batch_damage MODIFY COLUMN qty DECIMAL(10,2) NOT NULL DEFAULT 0;
 ALTER TABLE batch_damage ADD COLUMN IF NOT EXISTS unit VARCHAR(20) NULL AFTER product_name;
+ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS assigned_user_id INT DEFAULT NULL AFTER user_id;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS sku VARCHAR(50) UNIQUE AFTER barcode;
+UPDATE products SET sku = barcode WHERE sku IS NULL AND barcode IS NOT NULL;
 CREATE TABLE IF NOT EXISTS customer_credits (
   id INT AUTO_INCREMENT PRIMARY KEY,
   customer_id VARCHAR(64) NULL,
@@ -204,6 +278,25 @@ Body: { items[] (barcode, product_name, price, quantity, total?, unit?, case_qty
 No descuenta `products.stock` al convertir (a diferencia de `createBatch`) — gap
 preexistente, no cerrado en la Fase 87.
 
+### Visibilidad por asignación — `assigned_user_id` (Fase 104)
+
+El picker de "Vendedor" que ya existía en `CreatePreOrderActivity` (Android) hace
+doble función: además de guardar `salesperson_name` (texto libre para el ticket
+impreso), manda el `id` real del usuario elegido como `assigned_user_id` en
+`pre_orders` — no hay un campo separado de "asignar". Ese id es lo que restringe
+quién puede ver la pre-orden.
+
+`listPreOrders` filtra para cualquier no-admin: solo ve pre-órdenes donde
+`user_id = req.user.id` (las que él mismo creó) **o** `assigned_user_id =
+req.user.id` (las que quedaron con él como vendedor seleccionado) — el resto del
+equipo no las ve, aunque estén "activas". Admin sigue viendo todo, sin filtro.
+
+`getPreOrder`/`updatePreOrder`/`deletePreOrder`/`convertPreOrder` (acceso por ID
+directo) aplican el mismo criterio vía `canAccessPreOrder()` — devuelven 403 si el
+usuario no es admin ni el creador ni el asignado, para que la restricción no se pueda
+saltear conociendo el ID aunque no aparezca en el listado. Antes de esta fase estos
+cuatro endpoints no verificaban ownership en absoluto.
+
 ## Notas de diseño
 
 - `signature` se guarda en **cada fila** del batch (redundante pero consistente con `customer_id`/`customer_name` que también se repiten por fila). No hay tabla separada de batches.
@@ -236,13 +329,37 @@ Ambas funciones son silent — el fallo en QBO no revierte el guardado en MySQL.
 
 **Requisito para stock:** Los ítems en QBO deben ser `Type: 'Inventory'`. Cambiar desde UI de QBO (Productos y servicios → editar → tipo Producto). Cuentas requeridas: `Inventory Asset` + `Cost of Goods Sold`.
 
-## QBO SKU ↔ Barcode
+## SKU (QBO) vs barcode (interno) — Fase 105
 
-`syncProducts` lee `item.Sku` como barcode. Si el SKU está vacío, usa `QBO-{Id}` como fallback. También sincroniza `item.Description` → `products.description`.
+`products.sku` y `products.barcode` son dos campos separados con dueños distintos.
+Antes de esta fase, `barcode` hacía las dos cosas a la vez (código físico Y SKU de
+QBO); se separaron porque QBO **no tiene un campo de barcode nativo** en el objeto
+`Item` — solo expone `Sku` — así que forzar el barcode físico ahí siempre iba a
+quedar limitado a ese único campo compartido.
 
-**Fix aplicado:** tanto `syncProductsFromQbo` (`syncEngine.ts`, automático cada 5 min) como `syncProducts` (`qbController.ts`, botón manual) usan ahora el mismo fallback `item.Sku?.trim() || 'QBO-{Id}'` al insertar un producto nuevo — antes el sync automático insertaba `barcode = NULL` directo. Además, ambos ahora también actualizan el `barcode` de un producto **ya existente** cuando el SKU cambió en QBO (antes solo se escribía al crear, nunca al actualizar): si `item.Sku` viene vacío, el barcode local no se toca (nunca se pisa con blanco ni con el `QBO-{Id}` sintético — ese fallback es solo para altas). `barcode` es `UNIQUE` en MySQL: un choque de SKU entre dos ítems cae en el try/catch por ítem ya existente (se omite y se loguea, mismo tratamiento que cualquier otro error de fila).
+- **`sku`** — contraparte real de `Item.Sku` en QBO. Es lo único que sincroniza en
+  ambas direcciones: `syncProducts` (`qbController.ts`, botón manual) y
+  `syncProductsFromQbo` (`syncEngine.ts`, automático cada 5 min) leen `item.Sku` y
+  lo escriben en `products.sku` (fallback `QBO-{Id}` si viene vacío, solo al insertar
+  un producto nuevo — igual que antes se hacía con barcode). Al actualizar un
+  producto ya existente, si `item.Sku` viene vacío el `sku` local no se toca (nunca
+  se pisa con blanco ni con el `QBO-{Id}` sintético). `sku` es `UNIQUE` en MySQL: un
+  choque entre dos ítems cae en el try/catch por ítem (se omite y se loguea, mismo
+  tratamiento que cualquier otro error de fila). `updateItemMeta` acepta `sku` y lo
+  envía como `Sku` en el sparse update; `updateProduct` lo dispara cuando cambia el
+  campo `sku` del body (ya no cuando cambia `barcode`).
+- **`barcode`** — puramente interno, nunca viaja hacia ni desde QBO. Es lo que se
+  escanea con el TC22 (`getProductByBarcode`) y lo que identifica un producto en
+  `orders`/`batch_damage`. Un producto recién importado de QBO (`sync` que lo crea
+  por primera vez) llega con `barcode = NULL` — no hay de dónde sacarlo — hasta que
+  alguien lo asigna/escanea localmente.
 
-`updateItemMeta` acepta `sku` y lo envía como `Sku` en el sparse update. `updateProduct` pasa `barcode` como `sku` cuando cambia.
+Migración de datos (Fase 105): `sku` se hizo backfill una sola vez copiando el
+`barcode` que ya existía (esos valores eran, de hecho, el SKU de QBO histórico).
+De ahí en adelante cada campo vive su vida por separado.
+
+También sincroniza `item.Description` → `products.description` (sin relación con
+sku/barcode).
 
 **Flujo completo en una sola llamada a QBO:** nombre + descripción + SKU + precio (`UnitPrice`) se sincronizan juntos en `updateItemMeta`. Stock va en llamada separada (`updateItemQtyOnHand`) porque requiere verificar el tipo del ítem.
 

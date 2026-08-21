@@ -1,6 +1,6 @@
 # Excellentia — Progreso del Proyecto
 
-> Estado actual: **Fase 103 ✅ — Numeración de facturas editable desde Settings (invoice_counter)**
+> Estado actual: **Fase 106 ✅ — Endurecimiento del endpoint migrate-sku (re-corridas seguras, error por fila)**
 
 ---
 
@@ -2811,6 +2811,184 @@ El usuario se quedó sin facturas físicas y pidió arrancar la numeración en u
 
 ### SQL
 Ninguno — `company_settings.invoice_counter` ya existía desde antes de esta fase.
+
+---
+
+## Fase 104: Pre-órdenes — visibilidad restringida al vendedor asignado ✅
+
+### Contexto
+El usuario (admin) pidió que una pre-orden que él crea o asigna a un vendedor específico solo la pueda ver ese vendedor (además de los admins) — el resto del equipo no debía verla en su lista aunque estuviera activa. Antes, `listPreOrders` solo filtraba por `user_id` (el creador), así que una pre-orden creada por un admin para que la viera un vendedor específico no aparecía en la lista de nadie más que la del propio admin. Además, ninguno de los endpoints de acceso por ID (`getPreOrder`/`updatePreOrder`/`deletePreOrder`/`convertPreOrder`) verificaba ownership — cualquiera con sesión válida podía ver/editar/convertir/cancelar cualquier pre-orden con solo conocer el ID, aunque no le apareciera en su lista.
+
+Primer diseño: campo separado "Asignar a" (admin-only) en `CreatePreOrderActivity`. El usuario pidió simplificarlo — reusar el picker de "Vendedor" que ya existía (antes solo guardaba el nombre como texto libre para el ticket impreso) para que también determine la visibilidad, sin agregar un campo nuevo en la UI.
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 104.1 | Columna `pre_orders.assigned_user_id` (nullable, sin FK) — id real del usuario elegido como vendedor | `src/routes/setup.ts`, `src/db/schema.sql`, `excellentia_schema.sql` | ✅ |
+| 104.2 | `createPreOrder`/`updatePreOrder` aceptan `assigned_user_id` en el body y lo persisten (lo manda el picker de vendedor de Android, no un campo separado) | `src/controllers/preOrderController.ts` | ✅ |
+| 104.3 | `listPreOrders` — un no-admin ahora solo ve pre-órdenes donde `user_id = él mismo` **o** `assigned_user_id = él mismo`; admin sigue viendo todo sin filtro | `src/controllers/preOrderController.ts` | ✅ |
+| 104.4 | `canAccessPreOrder()` — nuevo helper, usado en `getPreOrder`/`updatePreOrder`/`deletePreOrder`/`convertPreOrder` para devolver 403 si el usuario no es admin ni el creador ni el asignado | `src/controllers/preOrderController.ts` | ✅ |
+
+### Android
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 104.5 | `showSalespersonPicker()` — además de `salesperson_name` (texto para el ticket), ahora también captura el `id` real del usuario elegido (`selectedSalespersonUserId`) y lo manda como `assigned_user_id` en el request | `CreatePreOrderActivity.kt` | ✅ |
+| 104.6 | `PreOrderRequest` gana `assigned_user_id: Int?` | `data/Models.kt` | ✅ |
+
+### SQL
+```sql
+ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS assigned_user_id INT DEFAULT NULL AFTER user_id;
+```
+
+---
+
+## Fase 105: Separación SKU (QBO) vs Barcode (interno) + nomenclatura NEW_SKU ✅
+
+### Contexto
+`products.barcode` hacía dos trabajos a la vez: código físico escaneado con el TC22 Y el campo que sincronizaba como `Sku` en QuickBooks. El usuario quería generar una nomenclatura de SKU propia (marca + secuencia, ej. `REY001`) sin perder el barcode físico ya asignado. Investigación (Context7 + búsqueda web, documentación oficial de Intuit) confirmó que la API de QBO **no tiene un campo de barcode nativo** en el objeto `Item` — solo expone `Sku` — así que la separación era la única forma limpia de lograrlo sin que ambos usos sigan pisándose.
+
+Para saber qué nomenclatura nueva asignar a cada producto, se comparó el export completo de QuickBooks (`ProductServiceList__QBO.xls`, 191 productos tipo Inventory, se excluyeron 31 líneas tipo Service que son cargos/créditos/entradas contables) contra la lista de precios en PDF de Excellentia Foods (127 productos, 4 páginas) — sin SKU en común entre ambos archivos, el match se hizo por texto (nombre/descripción tokenizado, similitud de Jaccard) + cercanía de precio, con asignación 1:1 (bipartita greedy) y verificación manual de todos los casos de score bajo/ambiguo (variantes de sabor muy parecidas entre sí, ej. las 6 salsas de 16oz de El Campestre, o productos sin contraparte real en QBO como "Ghost Pepper" que no existe como SKU). Resultado: master sheet en Excel (`Master Product Comparison - Excellentia vs QBO.xlsx`, entregado en Downloads) con 195 filas — 123 coincidencias, 68 solo en QBO, 4 solo en la lista de Excellentia sin contraparte detectada.
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 105.1 | Columna `products.sku` (nueva, UNIQUE) — backfill inicial copiando `barcode` (que hasta este punto *era*, de hecho, el SKU histórico de QBO) | `src/routes/setup.ts`, `src/db/schema.sql`, `excellentia_schema.sql`, `src/types/index.ts` | ✅ |
+| 105.2 | `syncProducts`/`syncProductsFromQbo` — leen/escriben `sku` en vez de `barcode`; un producto nuevo importado de QBO llega ahora con `barcode = NULL` (no tiene fuente en QBO) | `src/controllers/qbController.ts`, `src/services/syncEngine.ts` | ✅ |
+| 105.3 | `createProduct`/`updateProduct` — `sku` y `barcode` ahora son campos independientes; el push a QBO (`updateItemMeta`) se dispara cuando cambia `sku`, ya no cuando cambia `barcode` | `src/controllers/productController.ts` | ✅ |
+| 105.4 | Nomenclatura NEW_SKU (prefijo de marca + secuencia de 3 dígitos, ej. `REY001` = Reynaldo's) calculada para las 195 filas del master sheet — orden de numeración: orden de impresión del PDF primero (por marca), alfabético para lo que solo existe en QBO | Master sheet (Excel, generado fuera del repo) | ✅ |
+| 105.5 | `POST /api/products/migrate-sku` (admin-only, paginado `offset`/`limit` para no exceder el timeout del proxy de cPanel, dry-run por default — `?apply=true` para escribir) — adopta el NEW_SKU calculado en `sku` (con push a QBO, secuencial + pausa de 400ms entre llamadas); solo llena `unit`/`qty` si el producto no tenía nada asignado, nunca pisa un valor ya guardado. Reemplazó un script standalone (`bun run`) que se descartó porque cPanel no da acceso a terminal para correrlo ahí | `src/controllers/productController.ts`, `src/routes/products.ts`, `src/data/sku-migration-input.json` (datos de las 195 filas, importado directo en el bundle de producción — no se lee de disco en runtime) | ✅ |
+
+### Webapp
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 105.6 | Campo SKU nuevo en el modal de edición (separado de Código de barras) y columna nueva en la tabla de productos | `app/products/_components/ProductModal.tsx`, `ProductRow.tsx`, `ProductsClient.tsx`, `app/products/page.tsx` | ✅ |
+| 105.7 | Traducciones `prod_colSku`/`modal_sku`/`modal_skuPh` (es/en); texto de "Requisitos de QuickBooks" corregido (ya no dice que el barcode va en el campo SKU) | `app/lib/i18n.ts` | ✅ |
+
+`bun run build` corrió limpio en ambos repos después de los cambios.
+
+### SQL
+```sql
+ALTER TABLE products ADD COLUMN IF NOT EXISTS sku VARCHAR(50) UNIQUE AFTER barcode;
+UPDATE products SET sku = barcode WHERE sku IS NULL AND barcode IS NOT NULL;
+```
+
+### Pendiente, no cerrado en esta fase
+Las 4 filas del master sheet que solo existen en la lista de precios de Excellentia (sin contraparte detectada en QBO — ej. "Quesos para Freir Tio Francisco", "Chile Relleno") no tienen fila en `products` (nunca se importaron de QBO) — `migrate-sku` las reporta pero no puede actualizarlas. Si son productos reales que faltan en el catálogo, hay que crearlos primero en QBO y sincronizar antes de que el NEW_SKU les aplique.
+
+---
+
+## Fase 106: Endurecimiento del endpoint `migrate-sku` — re-corridas seguras y visibilidad por fila ✅
+
+### Contexto
+Revisión de `POST /api/products/migrate-sku` (Fase 105) antes de la corrida real en cPanel. Se detectaron 3 gaps:
+
+1. **Push a QBO fallido no reintentable**: la decisión de push dependía de `product.sku !== new_sku`. Si el UPDATE local aplicaba pero el push a QBO fallaba, al re-correr la misma página el sku local ya era el nuevo → el push se omitía → desync permanente hasta editarlo a mano.
+2. **Un fallo de MySQL por fila reventaba la página**: el `UPDATE` no tenía try/catch por fila. Un choque del `UNIQUE` en `products.sku` (ej. dos filas del JSON con el mismo `new_sku`, o un sku ya usado por otro producto) abortaba la página entera con 500, sin `next_offset` ni visibilidad de qué fila falló.
+3. **Sin detección de duplicados en el input**: el JSON podía contener `new_sku` repetidos sin aviso.
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 106.1 | Push a QBO decidido contra el Sku **vivo** del item (`getItemById`), no contra el sku local — re-corridas reintentan pushes que fallaron antes (auto-curativo); si QBO no responde se asume push y el fallo se reporta por fila | `src/controllers/productController.ts` | ✅ |
+| 106.2 | try/catch por fila: un error de MySQL/QBO en una fila se reporta (`status:'error'`, `db_error`) sin abortar la página | ídem | ✅ |
+| 106.3 | Duplicados de `new_sku` en `sku-migration-input.json` detectados sobre el archivo completo (primera aparición gana) + `warnings.duplicate_new_skus` en la respuesta | ídem | ✅ |
+| 106.4 | Pre-check de colisión `SELECT id FROM products WHERE sku = ? AND id <> ?` antes del UPDATE, con mensaje claro por fila (el `UNIQUE` ya la atrapaba, pero solo con 500 global) | ídem | ✅ |
+| 106.5 | Contrato de respuesta enriquecido (compatible hacia atrás): `status` por fila (`applied`/`dry_run`/`skipped`/`error`), `db_error`, `qbo_status` (`synced`/`needs_push`/`no_qb_item_id`/`unverified`), `warnings`, `summary.db_failed`; `qbo_push` en dry-run ahora es siempre `skipped` (antes simulaba `ok`) — la predicción vive en `qbo_status` | ídem | ✅ |
+| 106.6 | **Fix bug silencioso de QBO writes**: `qbItems.ts` usaba `makeQboApiCall` (exportada por `qbAuth.ts`) sin importarla — `getItemById`/`findItemBySku`/`getInventoryAccountRefs` reventaban en runtime con `ReferenceError: makeQboApiCall is not defined`. Dejó de detectarse porque `bun build` no hace type-check (el error solo aparecía en tsc). Consecuencia en producción: **todos los writes a QBO fallaban silenciosamente** (editar nombre/SKU/precio/stock de un producto desde la webapp nunca llegaba a QBO; solo warning en el log). El sync de lectura (QBO→MySQL) no estaba afectado (`paginatedQuery` vive en `qbAuth.ts`, donde la función está en scope). Se detectó porque la migración dry-run reportaba `qbo_status:"unverified"` en todas las filas con `qb_item_id` — el GET de verificación (Fase 106.1) convertía el bug en visible. Fix de una línea: agregar el import. Igual que el error de `creditApplied` y los demás pendientes de tsc, conviene limpiarlos para que vuelvan a asomar errores nuevos | `src/services/qbItems.ts` | ✅ |
+
+`bun x tsc --noEmit`: 0 errores nuevos (los 12 errores restantes del repo son preexistentes en otros archivos: `orderController`, `qbController`, `qbAuth`, `qbItems`, `auth`, `customers` — no relacionados).
+
+### Nota de uso
+Sigue igual: `?apply=true&offset=0&limit=25`, pegar la URL siguiendo `next_offset` hasta `null`. Para verificar la auto-curativa: correr una página con token QB inválido (pushes fallan), restaurar el token y re-correr la misma página — la segunda corrida empuja los skus pendientes (`qbo_push:'ok'`).
+
+---
+
+## Fase 107: Cierre migración NEW_SKU — barcodes duplicados del master sheet + remediación ✅
+
+### Contexto
+Corrida 2 en producción de `migrate-sku` tras extender el JSON a 198 filas (+MIS128 Chicharron con barcode `CHICHA-01`, +COR006 Cotija Molido Rincon 40#, +MIS129 Ham Virginia) y agregar el tercer fallback de match `name_normalized` al matcher (los nombres del master sheet traen prefijo `Units:`/`Pounds:`/`Case/Bucket:`/`Case:` que los productos locales no tienen — sin esto, las filas con `qbo_sku` null quedaban not_found sin razón). Resultado: 63 productos actualizados, 61 pushes a QBO OK, 0 db_failed, 2 fallos de push esperados (COR006/MIS129 — items borrados en QBO, `qb_active=0`, skus locales aplicados igual).
+
+La query de revisión post-corrida dejó 22 items Service sin NEW_SKU + 3 productos reales (344/369/377) → destapó un **defecto del master sheet**: barcodes duplicados entre filas.
+
+### Causa raíz — overwrite por barcode duplicado
+El matcher prioriza barcode. Seis pares de filas del master sheet comparten el mismo `qbo_sku`; ambas matchean al MISMO producto local (holder) y la segunda aparición pisa el sku que la primera acaba de aplicar:
+
+| qbo_sku compartido | Fila A (correcta) | Fila B (pisa) | Holder |
+|---|---|---|---|
+| 091945108937 | MIS045 Pepper Jack | MIS046 Sharp | 362 |
+| 091945900319 | MIS055 Quesadilla 2lb | MIS056 Monterey Jack 2lb | 376 |
+| 091945160201 | MIS071 Medium Bar 1lb | MIS072 Mild Bar 1lb | 483 |
+| GS1 01000486…025198 | REY001 Beef Chorizo | REY010 Soy Chorizo | 328 |
+| 24622563699 | MIS007 Chicharron | MIS083 ChicharronPierna | 441 (correcto de casualidad) |
+| 091945200501 | MIS048 Italian | MIS053 Mexican 2lb | 494 |
+
+Además, **366 "DF Shredded Mexican 2lb"** (qb 448) quedó `barcode=NULL, sku=NULL`: era el destinatario real de MIS053 pero no tiene barcode y su fila fue consumida por 494. No apareció en la query de revisión por la trampa SQL clásica: `NULL NOT REGEXP ...` da NULL → la fila se filtra. Toda query de verificación debe usar `(sku IS NULL OR sku NOT REGEXP '^[A-Z]{3,4}[0-9]{3}$')`.
+
+### Remediación — parche del JSON + re-corrida (no edición manual)
+Editar a mano desde la webapp era inviable: el modal bloqueaba guardar cualquier campo si el stock precargado era negativo (ver 107.1), y cada guardado manda `stock` en el body — un workaround SQL (stock=0 → editar → restaurar) habría empujado `QtyOnHand=0` a QBO vía `updateItemQtyOnHand`. En su lugar se parcharon las 5 filas "segundas" del JSON para que apunten a su destinatario real:
+
+| Fila | qbo_sku parcheado → | Matchea |
+|---|---|---|
+| MIS046 | `'DF-01'` | 377 por barcode |
+| MIS056 | `'DF-46'` | 369 por barcode |
+| MIS072 | `'DF-21'` | 344 por barcode |
+| REY010 | `null` | nombre normalizado sin match local → not_found inofensivo |
+| MIS053 | `null` | nombre normalizado "DF Shredded Mexican 2lb" → 366 |
+
+Las filas primeras quedan intactas: la re-corrida completa reaplica MIS045→362, MIS055→376, MIS071→483, REY001→328, MIS048→494 y MIS083→441 (doble-write transitorio MIS007/MIS083 sobre 441 que converge por orden del archivo). Con el parche, **el JSON queda consistente para siempre — cualquier re-corrida futura es segura**.
+
+Decisiones del cierre: ocultar los 22 Services con `hidden=1` (local, no toca QBO); MIS128 asignado al Chicharron item 8; los ~110 items "(deleted)" de QBO se dejan como están. Mejora `extractQboErrorMessage` en migrate-sku salteada a propósito (endpoint retirado tras esta corrida).
+
+### Webapp
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 107.1 | Modal de productos bloqueaba guardar TODO si el stock precargado era negativo — dos capas: validación JS (`stock < 0` sobre el valor cargado del form) + validación nativa del navegador (`min="0"` en el input, form sin `noValidate`). Fix: la validación JS solo aplica si el valor cambió respecto al producto cargado; se quitó `min="0"` del input (el guard JS sigue activo para valores nuevos escritos por el usuario) | `excellentia-webapp/app/products/_components/ProductModal.tsx` | ✅ |
+| 107.2 | Orden por secuencia de SKU en la tabla de productos: `GET /api/products` acepta `?sort=sku` (prefijo de marca A-Z, luego número 001, 002…; filas sin NEW_SKU válido al final por `created_at DESC`). Opt-in para no cambiar el orden que ve Android (default sigue `created_at DESC`). La webapp lo pide siempre en `/products` | `src/controllers/productController.ts` (`listProducts`) + `excellentia-webapp/app/products/_components/ProductsClient.tsx` | ✅ |
+
+### Operativo (producción) — ejecutado y verificado ✅
+1. **Primer lote de Services** (22 items): `UPDATE ... SET hidden = 1` por nombre (`Cases%`, Case/Bucket, Delivery, Discount, Freight, Freight Charge, Labor, Bounce Check Charge, Bounced Check, Bounced Check Fee, Reimbursable Expense Item, Rent, Sales).
+2. **Segundo lote**: la query de revisión original tenía la trampa NULL (`sku NOT REGEXP` sin guard `sku IS NULL OR`) y el sync automático además había importado items nuevos creados por la integración QBO↔Shopify. El diagnóstico NULL-safe destapó 17 filas visibles sin NEW_SKU: 5 productos reales (344, 366, 369, 377 y el hallazgo **408 Soy Chorizo Rey**, destinatario real de REY010 — el parche `qbo_sku=null` hizo que matchee por nombre normalizado) + 12 basura ocultada por ids explícitos (`id IN (297,326,460,461,462,463,464,465,466,467,468,512)` — Pounds, Units, Services, Shipping, Shopify ×6, Spoils charge, Walmart sls chargeback). Solo local — no se tocaron los flags Active en QBO (Shopify los necesita activos).
+3. **Re-corrida final**: 198 filas · 14 aplicadas · 12 push OK · 2 push fallidos esperados (COR006/item 447 y MIS129/item 450, borrados en QBO) · 4 not_found conocidos (TIO005, COR004, CAM004, MIS049) · 0 error_db. Los 10 fixes verificados con product_id correcto; el doble-write transitorio MIS007/MIS083 sobre 441 convergió a MIS083.
+4. **Verificación final NULL-safe = 0 filas** — todo producto visible y activo tiene NEW_SKU.
+5. Deploy webapp en producción: fix del modal (107.1) + orden por SKU (107.2).
+
+Nota menor: el comentario del endpoint decía "GET/POST" pero la ruta es POST-only (`routes/products.ts`) — un fetch sin `method:'POST'` da 404. Comentario corregido.
+
+---
+
+## Fase 108: Búsqueda por SKU en Android + webapp ✅
+
+Con la migración NEW_SKU cerrada (Fase 107), el SKU (`MIS045`, `REY001`…) se vuelve el identificador útil para humanos — pero ningún buscador lo conocía:
+
+| Superficie | Antes | Ahora |
+|---|---|---|
+| Backend `GET /api/products?search=` (`listProducts`) | `name LIKE` OR `barcode LIKE` | + `sku LIKE` — beneficia Android online y webapp `/products` |
+| Webapp `/products` (buscador) | nombre/barcode | también SKU (automático vía backend) |
+| Android online (`searchProducts`) | ídem | ídem (automático vía backend) |
+| Android offline (SQLite `cached_products`) | sin columna `sku`; búsqueda barcode/name | columna nueva + `OR sku LIKE` |
+
+### Cambios
+
+**Backend** (`excellentia/`)
+- `productController.ts` (`listProducts`): tercera condición `sku LIKE ?` en el filtro de búsqueda.
+
+**Android** (`androidStudioProjects/test/`)
+- `AppDatabase.kt`: columna `sku TEXT` en CREATE TABLE + `DATABASE_VERSION 14→15` con `ALTER TABLE cached_products ADD COLUMN sku TEXT` (patrón try/catch existente).
+- `CachedProductEntity.kt` / `Models.kt` (`ProductDto`): campo `sku` (nullable, default null — compatible hacia atrás con respuestas viejas).
+- `ProductDao.kt`: upsert guarda `sku`, `cursorToEntity` lo lee (guard por índice), `searchByQuery` agrega `OR sku LIKE ?`.
+- `ProductRepository.kt` / `OrderRepository.kt` (`prefetchAllProducts`): mapean `dto.sku` al cachear.
+- `MainActivity.kt`: `SuggestionItem.sku` + SKU visible en las etiquetas de resultados del diálogo de entrada manual y del buscador por nombre (`nombre · $precio/lb · barcode · SKU`).
+
+### Notas
+- La columna `sku` del cache queda poblada con el primer `prefetchAllProducts` completo tras actualizar la app (o a medida que escaneen productos).
+- Los otros 3 diálogos de búsqueda (CurrentOrder/CreatePreOrder/IssueCredit) buscan por SKU vía backend pero sus etiquetas siguen mostrando barcode — extender si hace falta.
+- Compilación: tsc limpio (9 errores preexistentes), `gradlew :app:compileDebugKotlin` OK.
 
 ---
 

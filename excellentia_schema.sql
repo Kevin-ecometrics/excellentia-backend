@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS `users` (
 CREATE TABLE IF NOT EXISTS `products` (
     `id`              INT AUTO_INCREMENT PRIMARY KEY,
     `barcode`         VARCHAR(50) UNIQUE,
+    `sku`             VARCHAR(50) UNIQUE,
     `name`            VARCHAR(255) NOT NULL,
     `short_name`      VARCHAR(255) NULL,
     `price`           DECIMAL(10,2) NOT NULL,
@@ -225,6 +226,7 @@ VALUES (1, 'EXCELLENTIA', 'Ticket de Venta');
 CREATE TABLE IF NOT EXISTS `pre_orders` (
     `id`               INT AUTO_INCREMENT PRIMARY KEY,
     `user_id`          INT,
+    `assigned_user_id` INT DEFAULT NULL,
     `customer_id`      VARCHAR(100) NOT NULL,
     `customer_name`    VARCHAR(255) NOT NULL,
     `salesperson_name` VARCHAR(255) DEFAULT NULL,

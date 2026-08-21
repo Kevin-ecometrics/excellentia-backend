@@ -28,6 +28,7 @@ router.get('/', async (_req: Request, res: Response) => {
       `CREATE TABLE IF NOT EXISTS products (
         id              INT AUTO_INCREMENT PRIMARY KEY,
         barcode         VARCHAR(50) UNIQUE,
+        sku             VARCHAR(50) UNIQUE,
         name            VARCHAR(255) NOT NULL,
         short_name      VARCHAR(255) NULL,
         price           DECIMAL(10,2) NOT NULL,
@@ -176,6 +177,7 @@ router.get('/', async (_req: Request, res: Response) => {
       `CREATE TABLE IF NOT EXISTS pre_orders (
         id               INT AUTO_INCREMENT PRIMARY KEY,
         user_id          INT,
+        assigned_user_id INT DEFAULT NULL,
         customer_id      VARCHAR(100) NOT NULL,
         customer_name    VARCHAR(255) NOT NULL,
         salesperson_name VARCHAR(255) DEFAULT NULL,
@@ -263,6 +265,9 @@ router.get('/', async (_req: Request, res: Response) => {
       // como equivalentes a "Case/Unit" en la lectura, así que no hace falta tocarlas).
       ["UPDATE products SET unit = 'Case/Unit' WHERE unit IN ('Case', 'Unit')", "products.unit — Case/Unit fusionados"],
       ["ALTER TABLE products ADD COLUMN IF NOT EXISTS short_name VARCHAR(255) NULL AFTER name", "products.short_name agregada"],
+      ["ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS assigned_user_id INT DEFAULT NULL AFTER user_id", "pre_orders.assigned_user_id agregada"],
+      ["ALTER TABLE products ADD COLUMN IF NOT EXISTS sku VARCHAR(50) UNIQUE AFTER barcode", "products.sku agregada"],
+      ["UPDATE products SET sku = barcode WHERE sku IS NULL AND barcode IS NOT NULL", "products.sku — backfill desde barcode"],
     ];
     for (const [sql, label] of migrations) {
       try {

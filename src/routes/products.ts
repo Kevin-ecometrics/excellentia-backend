@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { listProducts, listCategories, getProductByBarcode, getProductPriceHistory, createProduct, updateProduct, deleteProduct } from '../controllers/productController.ts';
+import { listProducts, listCategories, getProductByBarcode, getProductPriceHistory, createProduct, updateProduct, deleteProduct, migrateSkuNomenclature } from '../controllers/productController.ts';
 import { auth } from '../middleware/auth.ts';
 import { adminOnly } from '../middleware/adminOnly.ts';
 
@@ -7,6 +7,7 @@ const router = Router();
 
 router.get('/', auth, listProducts);
 router.get('/categories', auth, listCategories);
+router.post('/migrate-sku', auth, adminOnly, migrateSkuNomenclature);
 router.get('/:barcode/history', auth, getProductPriceHistory);
 router.get('/:barcode', auth, getProductByBarcode);
 router.post('/', auth, adminOnly, createProduct);

@@ -6,7 +6,7 @@ import { computeDamageCredit } from '../services/creditCalculator.ts';
 import { getCustomerBalance, applyCustomerCredit } from '../services/creditController.ts';
 
 async function ensureTables() {
-  await pool.query("CREATE TABLE IF NOT EXISTS pre_orders (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, customer_id VARCHAR(100) NOT NULL, customer_name VARCHAR(255) NOT NULL, salesperson_name VARCHAR(255) DEFAULT NULL, scheduled_date DATE, notes TEXT, status ENUM('DRAFT','CONFIRMED','CONVERTED','CANCELLED') DEFAULT 'DRAFT', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
+  await pool.query("CREATE TABLE IF NOT EXISTS pre_orders (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, assigned_user_id INT DEFAULT NULL, customer_id VARCHAR(100) NOT NULL, customer_name VARCHAR(255) NOT NULL, salesperson_name VARCHAR(255) DEFAULT NULL, scheduled_date DATE, notes TEXT, status ENUM('DRAFT','CONFIRMED','CONVERTED','CANCELLED') DEFAULT 'DRAFT', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
   // price/quantity/total quedan NULL mientras la pre-orden está sin detallar (solo
   // barcode+product_name al crearla) — se llenan recién al convertir, cuando el
   // vendedor detalla peso/case/precio de cada producto (ver convertPreOrder). unit y
@@ -27,18 +27,32 @@ async function ensureTables() {
   `);
 }
 
+// Solo admin y quien creó/está asignado a la pre-orden pueden verla o actuar sobre
+// ella — el resto de operadores no debe ni listarla ni acceder por ID directo.
+function canAccessPreOrder(preOrder: any, user: any): boolean {
+  if (!user) return false;
+  if (user.role === 'admin') return true;
+  return preOrder.user_id === user.id || preOrder.assigned_user_id === user.id;
+}
+
 export async function createPreOrder(req: Request, res: Response): Promise<void> {
   await ensureTables();
   try {
-    const { customer_id, customer_name, salesperson_name, scheduled_date, notes, items } = req.body;
+    const { customer_id, customer_name, salesperson_name, scheduled_date, notes, items, assigned_user_id } = req.body;
     if (!customer_id || !customer_name || !Array.isArray(items) || items.length === 0) {
       res.status(400).json({ error: 'customer_id, customer_name e items son requeridos' });
       return;
     }
 
+    // assigned_user_id viaja junto con salesperson_name — el picker de "Vendedor" en
+    // el app manda el id real del usuario elegido, no solo su nombre. Ese id es el
+    // que restringe la visibilidad de la pre-orden (junto con el creador y los
+    // admins, ver canAccessPreOrder) al resto del equipo que no fue seleccionado.
+    const assignedUserId = assigned_user_id != null ? Number(assigned_user_id) : null;
+
     const [result] = await pool.query(
-      'INSERT INTO pre_orders (user_id, customer_id, customer_name, salesperson_name, scheduled_date, notes) VALUES (?, ?, ?, ?, ?, ?)',
-      [req.user?.id ?? null, customer_id, customer_name, salesperson_name ?? null, scheduled_date ?? null, notes ?? null]
+      'INSERT INTO pre_orders (user_id, assigned_user_id, customer_id, customer_name, salesperson_name, scheduled_date, notes) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [req.user?.id ?? null, assignedUserId, customer_id, customer_name, salesperson_name ?? null, scheduled_date ?? null, notes ?? null]
     ) as any;
     const preOrderId = result.insertId;
 
@@ -68,7 +82,8 @@ export async function listPreOrders(req: Request, res: Response): Promise<void> 
     const offset = (pageNum - 1) * limitNum;
 
     let query = `
-      SELECT p.id, p.user_id, p.customer_id, p.customer_name, p.salesperson_name, p.scheduled_date,
+      SELECT p.id, p.user_id, p.assigned_user_id, p.customer_id, p.customer_name,
+             p.salesperson_name, p.scheduled_date,
              p.notes, p.status, p.created_at, p.updated_at,
              COUNT(pi.id) AS item_count,
              COALESCE(SUM(pi.total), 0) AS total
@@ -78,7 +93,13 @@ export async function listPreOrders(req: Request, res: Response): Promise<void> 
     `;
     const params: any[] = [];
 
-    if (req.user?.role === 'operator') { query += ' AND p.user_id = ?'; params.push(req.user.id); }
+    // Un operador solo ve pre-órdenes que creó él mismo o que un admin le asignó
+    // explícitamente (assigned_user_id) — cualquier otra pre-órden, aunque exista,
+    // queda fuera del listado. Admin ve todo, sin filtro.
+    if (req.user?.role !== 'admin') {
+      query += ' AND (p.user_id = ? OR p.assigned_user_id = ?)';
+      params.push(req.user?.id ?? -1, req.user?.id ?? -1);
+    }
     if (status)      { query += ' AND p.status = ?';       params.push(status); }
     if (customer_id) { query += ' AND p.customer_id = ?';  params.push(customer_id); }
 
@@ -102,11 +123,16 @@ export async function getPreOrder(req: Request, res: Response): Promise<void> {
       res.status(404).json({ error: 'Pre-orden no encontrada' });
       return;
     }
+    const preOrder = (rows as any[])[0];
+    if (!canAccessPreOrder(preOrder, req.user)) {
+      res.status(403).json({ error: 'No tienes permiso para ver esta pre-orden' });
+      return;
+    }
     const [items] = await pool.query(
       'SELECT * FROM pre_order_items WHERE pre_order_id = ? ORDER BY id',
       [id]
     ) as any[];
-    res.json({ data: { ...(rows as any[])[0], items } });
+    res.json({ data: { ...preOrder, items } });
   } catch (err) {
     logger.error('getPreOrder error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
@@ -117,7 +143,17 @@ export async function updatePreOrder(req: Request, res: Response): Promise<void>
   await ensureTables();
   try {
     const { id } = req.params;
-    const { scheduled_date, notes, items, status, salesperson_name } = req.body;
+    const { scheduled_date, notes, items, status, salesperson_name, assigned_user_id } = req.body;
+
+    const [existingRows] = await pool.query('SELECT * FROM pre_orders WHERE id = ?', [id]) as any[];
+    if ((existingRows as any[]).length === 0) {
+      res.status(404).json({ error: 'Pre-orden no encontrada' });
+      return;
+    }
+    if (!canAccessPreOrder((existingRows as any[])[0], req.user)) {
+      res.status(403).json({ error: 'No tienes permiso para modificar esta pre-orden' });
+      return;
+    }
 
     const updates: string[] = ['updated_at = NOW()'];
     const updateParams: any[] = [];
@@ -125,6 +161,10 @@ export async function updatePreOrder(req: Request, res: Response): Promise<void>
     if (notes             !== undefined) { updates.push('notes = ?');             updateParams.push(notes); }
     if (salesperson_name  !== undefined) { updates.push('salesperson_name = ?');  updateParams.push(salesperson_name); }
     if (status      !== undefined)   { updates.push('status = ?');          updateParams.push(status); }
+    if (assigned_user_id !== undefined) {
+      updates.push('assigned_user_id = ?');
+      updateParams.push(assigned_user_id === null ? null : Number(assigned_user_id));
+    }
     updateParams.push(id);
 
     await pool.query(`UPDATE pre_orders SET ${updates.join(', ')} WHERE id = ?`, updateParams);
@@ -153,13 +193,16 @@ export async function deletePreOrder(req: Request, res: Response): Promise<void>
   await ensureTables();
   try {
     const { id } = req.params;
-    const [result] = await pool.query(
-      "UPDATE pre_orders SET status = 'CANCELLED' WHERE id = ?", [id]
-    ) as any;
-    if (result.affectedRows === 0) {
+    const [existingRows] = await pool.query('SELECT * FROM pre_orders WHERE id = ?', [id]) as any[];
+    if ((existingRows as any[]).length === 0) {
       res.status(404).json({ error: 'Pre-orden no encontrada' });
       return;
     }
+    if (!canAccessPreOrder((existingRows as any[])[0], req.user)) {
+      res.status(403).json({ error: 'No tienes permiso para cancelar esta pre-orden' });
+      return;
+    }
+    await pool.query("UPDATE pre_orders SET status = 'CANCELLED' WHERE id = ?", [id]);
     res.json({ message: 'Pre-orden cancelada' });
   } catch (err) {
     logger.error('deletePreOrder error:', err);
@@ -184,6 +227,10 @@ export async function convertPreOrder(req: Request, res: Response): Promise<void
       return;
     }
     const preOrder = (rows as any[])[0];
+    if (!canAccessPreOrder(preOrder, req.user)) {
+      res.status(403).json({ error: 'No tienes permiso para convertir esta pre-orden' });
+      return;
+    }
     if (preOrder.status === 'CONVERTED') {
       res.status(400).json({ error: 'La pre-orden ya fue convertida' });
       return;

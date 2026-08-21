@@ -114,7 +114,7 @@ async function syncProductsFromQbo(): Promise<void> {
       try {
         const active = item.Active === false ? 0 : 1;
         const [existing] = await pool.query(
-          'SELECT id, barcode, updated_at FROM products WHERE qb_item_id = ?',
+          'SELECT id, sku, updated_at FROM products WHERE qb_item_id = ?',
           [item.Id]
         ) as any[];
 
@@ -130,18 +130,21 @@ async function syncProductsFromQbo(): Promise<void> {
             continue;
           }
 
-          const sku = item.Sku?.trim();
-          const barcode = sku || existing[0].barcode;
+          // barcode NUNCA se toca acá — es interno, sin contraparte en QBO.
+          const qboSku = item.Sku?.trim();
+          const sku = qboSku || existing[0].sku;
 
           await pool.query(
-            'UPDATE products SET name = ?, price = ?, stock = ?, barcode = ?, qb_active = ?, updated_at = NOW() WHERE qb_item_id = ?',
-            [item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, barcode, active, item.Id]
+            'UPDATE products SET name = ?, price = ?, stock = ?, sku = ?, qb_active = ?, updated_at = NOW() WHERE qb_item_id = ?',
+            [item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, sku, active, item.Id]
           );
         } else {
-          const barcode = item.Sku?.trim() || `QBO-${item.Id}`;
+          // Producto nuevo importado de QBO: solo trae sku — barcode queda NULL,
+          // se asigna/escanea localmente después (no tiene fuente en QBO).
+          const sku = item.Sku?.trim() || `QBO-${item.Id}`;
           await pool.query(
-            'INSERT INTO products (barcode, name, price, stock, qb_item_id, qb_active) VALUES (?, ?, ?, ?, ?, ?)',
-            [barcode, item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, item.Id, active]
+            'INSERT INTO products (sku, name, price, stock, qb_item_id, qb_active) VALUES (?, ?, ?, ?, ?, ?)',
+            [sku, item.Name, item.UnitPrice ?? 0, item.QtyOnHand ?? 0, item.Id, active]
           );
         }
         upserted++;

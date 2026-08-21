@@ -1,4 +1,4 @@
-import { paginatedQuery, oauthClient, refreshToken } from './qbAuth.ts';
+import { paginatedQuery, oauthClient, refreshToken, makeQboApiCall } from './qbAuth.ts';
 
 // QBO por defecto excluye los items inactivos de las consultas — sin
 // "Active IN (true, false)" explícito, un item desactivado simplemente deja
