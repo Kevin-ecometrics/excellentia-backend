@@ -1,6 +1,6 @@
 # Excellentia — Progreso del Proyecto
 
-> Estado actual: **Fase 109 ✅ — Ticket ZQ630 Plus: letra más chica (Font 7) + aprovechamiento del ancho del papel**
+> Estado actual: **Fase 110 ✅ — Claude Design: aplicación completa del design system en Android (íconos, diálogos, inputs, bugs de tema)**
 
 ---
 
@@ -3041,6 +3041,96 @@ Papel real medido: **102mm ≈ 816 dots** (la ZQ630 Plus es de 4", hasta 104mm i
 1. **Revisar las fuentes F0–F26/F55 del probe 1** — sus resultados jamás se recolectaron; alguna podría ser más chica o más grande que F7 sin ningún comando extra. Es el paso más barato: re-imprimir el probe y contar dígitos por fuente.
 2. **`SETMAG`** para agrandar sin cambiar de fuente: `SETMAG 2 2` duplica ancho+alto (solo pasos enteros — no hay 1.25×/1.5×); también desigual (`2 1`/`1 2`). Es comando de estado: afecta a las líneas siguientes hasta el próximo SETMAG, así que puede aplicarse por sección (ej. TOTAL grande y resto normal). Efecto sobre F7 sin confirmar (el probe solo probó magnitud 1).
 3. **Migración a ZPL**: `^A0N,alto,ancho` da tamaño exacto en dots (+15%, +30%, lo que sea) — requiere reescribir el generador (`buildCpcl` → `buildZpl`, gráficos EG → `^GF`). Solo si 1 y 2 no alcanzan.
+
+---
+
+## Fase 110: Claude Design — aplicación completa del design system (Android) ✅
+
+Proyecto Android (`androidStudioProjects/test`). Se importó el mockup **"Mockup 2.0 Excellentia Brand"** (Claude Design, proyecto `39861b3e-28ce-4eb3-8563-18b4ed81b69b`) vía MCP `DesignSync`, y se revisó pantalla por pantalla contra las 16 pantallas del mockup, más diálogos nativos y notificaciones — sesión larga, resumida por área.
+
+### Íconos cruzados (el nombre del archivo no coincidía con el glyph real dentro)
+
+| # | Bug | Archivo | Estado |
+|---|---|---|---|
+| 110.1 | `ic_add_cart.xml` (nav "Pedido") tenía un ícono de refresh — reemplazado por un carrito real | `drawable/ic_add_cart.xml` | ✅ |
+| 110.2 | `ic_history.xml` (nav "Historial") tenía una tarjeta de crédito — reemplazado por un reloj | `drawable/ic_history.xml` | ✅ |
+| 110.3 | `ic_credit_card.xml` ("Agregar crédito") tenía un carrito — reemplazado por una tarjeta real | `drawable/ic_credit_card.xml` | ✅ |
+| 110.4 | `ic_settings.xml` (nav "Ajustes") era el engranaje clásico — reemplazado por el ícono de sliders del mockup | `drawable/ic_settings.xml` | ✅ |
+| 110.5 | `ic_schedule.xml` ("Pre-órdenes" en home) era un reloj — reemplazado por un calendario | `drawable/ic_schedule.xml` | ✅ |
+| 110.6 | Editar/Borrar en pedido actual usaban lápiz-de-compras y signo "−" — nuevos `ic_edit.xml` / `ic_delete.xml` | `item_pending_order.xml` | ✅ |
+| 110.7 | "Reimprimir" / "Imprimir página de prueba" usaban un ✓ — nuevo `ic_print.xml` | `activity_ticket_detail.xml`, `activity_settings.xml` | ✅ |
+| 110.8 | Error de login usaba el ícono de éxito (✓) en rojo — nuevo `ic_error.xml` | `activity_login.xml` | ✅ |
+| 110.9 | Buscador de clientes usaba el ícono de "producto" — nuevo `ic_search.xml` | `activity_customer_picker.xml` | ✅ |
+| 110.10 | Botones home "Entrada manual / Pre-órdenes / Agregar crédito": en mayúsculas el texto no entraba en una línea (11sp) — bajado a 10sp + padding horizontal reducido | `activity_main.xml` | ✅ |
+
+### Diálogos nativos, Snackbar y notificaciones
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 110.11 | `ThemeOverlay.Excellentia.MaterialAlertDialog` — título en fuente After verde, botón positivo verde sólido, negativo/neutral navy sólido (antes texto plano sin relleno), esquinas rectas, gap de 8dp entre botones | `themes.xml` | ✅ |
+| 110.12 | `DatePickerDialog` nativo (fecha de entrega, pre-órdenes) — acento verde vía `android:datePickerDialogTheme` | `themes.xml` | ✅ |
+| 110.13 | Snackbar global — verde oscuro (`ex_green_deep`) + acción en dorado, vía `snackbarStyle`/`snackbarTextViewStyle`/`snackbarButtonStyle` (antes gris/negro de Material) | `themes.xml` | ✅ |
+| 110.14 | Único `AlertDialog.Builder` suelto de la app (selector de vendedor, Crear pre-orden) no heredaba el tema — cambiado a `MaterialAlertDialogBuilder` | `CreatePreOrderActivity.kt` | ✅ |
+| 110.15 | Diálogos "sin impresora configurada" usaban el ícono de alerta de stock Android — nuevo `ic_alert.xml` en dorado | `CurrentOrderActivity.kt`, `PreOrderDetailActivity.kt` | ✅ |
+| 110.16 | Notificación "pedido sincronizado" usaba el ícono de sistema (ⓘ) — ahora `ic_check` + color verde de marca | `NotificationHelper.kt` | ✅ |
+| 110.17 | Diálogo de ítems dañados — filas sueltas sin card → wrapper con borde; hint de texto plano → banner con fondo tinte-danger | `CurrentOrderActivity.kt` (`askDamagedItems`) | ✅ |
+
+### Bug crítico — modo oscuro del sistema rompía todo el tema
+
+| # | Bug | Archivo | Estado |
+|---|---|---|---|
+| 110.18 | `values-night/themes.xml` redefinía `Base.Theme.Test` con solo 2 líneas — cualquier dispositivo con modo oscuro del sistema activado perdía diálogos, Snackbar, esquinas rectas y colores de marca (volvía al Material genérico morado/teal). Eliminado por completo: la app tiene un solo look de marca fijo, no debe adaptarse al modo oscuro del sistema | `values-night/themes.xml` (borrado) | ✅ |
+
+### Login — reconstrucción completa de los inputs
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 110.19 | `TextInputLayout` (modo outline) recortaba el label de arriba al combinarse con esquinas rectas (0dp) — bug del cálculo del "notch" del borde de Material. Se probó deshabilitar la animación (peor) y un radio de 1dp (no confirmado). Solución final: reconstruir los 3 campos (URL servidor, email, contraseña) **sin** `TextInputLayout` — caja con borde dibujado a mano (`bg_input_field*.xml`), label fijo en mayúsculas arriba, `EditText` plano abajo | `activity_login.xml`, `LoginActivity.kt` | ✅ |
+| 110.20 | Reconstruido a mano lo que daba gratis `TextInputLayout`: borde verde al enfocar, borde rojo en error de credenciales (con reset al reenfocar), mostrar/ocultar contraseña | `LoginActivity.kt` | ✅ |
+| 110.21 | Mismo patrón (caja + label fijo, sin `TextInputLayout`) aplicado a **todos** los demás campos de la app: Cambiar contraseña (3 campos, c/u con su ojo), Ajustes (URL backend), selector de clientes (buscador), Crear pre-orden (notas), y los 3 diálogos con input (entrada manual, editar peso con sufijo "lb", editar precio con prefijo "$") | `activity_change_password.xml`, `ChangePasswordActivity.kt`, `activity_settings.xml`, `activity_customer_picker.xml`, `activity_create_pre_order.xml`, `CreatePreOrderActivity.kt`, `dialog_manual_entry.xml`, `dialog_edit_weight.xml`, `dialog_edit_price.xml` | ✅ |
+
+### Otros fixes de pantalla
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 110.22 | "Venta completada": el check estaba dentro de 2 círculos anidados (uno con su propio círculo interno) — un solo círculo con `ic_check` (check simple, sin círculo propio) | `activity_order_success.xml` | ✅ |
+| 110.23 | El círculo verde del check no se veía verde — `app:backgroundTint` no aplica sobre un `FrameLayout` plano (AppCompat solo lo intercepta en widgets específicos); cambiado a `android:backgroundTint` (atributo nativo, funciona en cualquier View) | `activity_order_success.xml` | ✅ |
+| 110.24 | Banner "pendiente de sincronizar" persistente (antes un Snackbar transitorio) + fila de método de pago en el resumen de venta completada | `activity_order_success.xml`, `OrderSuccessActivity.kt` | ✅ |
+| 110.25 | Resumen cliente + total agregado a la pantalla de firma, antes de firmar | `activity_signature.xml`, `SignatureActivity.kt`, `CurrentOrderActivity.kt` | ✅ |
+| 110.26 | Número de factura (`Invoice #NNNN`) visible en el historial general y por cliente, antes de abrir el ticket — el dato ya vivía en `qb_invoice_id` (que guarda el `DocNumber`, no el Id interno de QBO) | `item_batch_header.xml`, `HistoryActivity.kt`, `ClientHistoryActivity.kt` | ✅ |
+| 110.27 | Estado "pendiente" (chips, banner offline) usaba `ex_gold` como color de texto sobre fondo crema pálido — contraste pobre. Cambiado a `ex_warning` (marrón oscuro) en 6 lugares | `activity_main.xml`, `ClientHistoryActivity.kt`, `HistoryActivity.kt` (x2), `PreOrderListActivity.kt`, `PreOrderDetailActivity.kt` | ✅ |
+| 110.28 | Chip activo de filtro (fecha/estado) usaba fondo verde-tint — mockup usa dorado sólido con texto verde | `color/chip_bg_color.xml` | ✅ |
+| 110.29 | Botón "−" del stepper de peso individual (Detalle de producto) tenía esquinas redondeadas (`cornerRadius=22`) — único lugar de la app violando la regla de esquinas rectas | `ProductDetailActivity.kt` | ✅ |
+| 110.30 | Método de pago: el diálogo combinaba `.setMessage()` + `.setItems()` — Android no permite ambos a la vez, el mensaje ganaba y la lista de opciones nunca se dibujaba. Se sacó el mensaje | `CurrentOrderActivity.kt` | ✅ |
+| 110.31 | Badge de conteo de ítems en "Pedido actual" (header, arriba a la derecha) tenía texto verde sobre fondo dorado — cambiado a blanco + `shapeAppearanceOverlay` explícito | `activity_current_order.xml` | ✅ |
+| 110.32 | Estado de conexión ("Online"/"en línea", Login y Home): el texto se pisaba en tiempo de ejecución a verde/rojo pese a estar en blanco en el XML (`setTextColor` dentro de `setStatus()`); el punto verde usaba el mismo verde oscuro/apagado que otros indicadores de "éxito" — nuevo color `ex_mint` (#7FD6A4, el verde menta del mockup) | `MainActivity.kt`, `LoginActivity.kt`, `drawable/circle_green.xml` | ✅ |
+
+### Flujo — cliente requerido antes de escanear
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 110.33 | "Tap to scan"/"Entrada manual" ya se atenuaban sin cliente activo, pero quedaban con `isEnabled=false` — un tap no disparaba nada, sin aviso. Ahora quedan siempre clicables (solo atenuados visualmente); `requireCustomerSelected()` intercepta el tap real y muestra un Snackbar "Selecciona un cliente primero" si no hay cliente | `MainActivity.kt` | ✅ |
+| 110.34 | Opacidad de "Tap to scan" deshabilitado no coincidía con "Entrada manual" (0.7 vs 0.4) — unificada a 0.4 | `MainActivity.kt` | ✅ |
+
+### Versión de la app
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 110.35 | `versionName` "1.0" → "1.5.1", `versionCode` 1 → 2 (Ajustes lee la versión real del build, no un string) | `app/build.gradle.kts` | ✅ |
+| 110.36 | String `app_version_label` (usado solo en Login) también actualizado a v1.5.1 | `strings.xml`, `strings-es.xml` | ✅ |
+
+### Backend (`excellentia/`)
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 110.37 | `GET /api/customers/:customerId/orders` — nuevo `meta.purchases30d` (batches `SENT` en los últimos 30 días), alimenta el recuadro "Compras 30d" del historial por cliente en Android | `routes/customers.ts` | ✅ |
+| 110.38 | Se agregó y luego se revirtió el campo `Balance` de QBO (columna `cached_customers.balance`, 3 endpoints, `QbCustomer.balance` en Android) — decisión del usuario, no lo necesitaba. El crédito disponible (`/credit-balance`, preexistente) y `purchases30d` se mantuvieron | `routes/customers.ts` | ✅ (revertido) |
+
+### Notas
+
+- Compilación verificada en cada paso: `gradlew :app:processDebugResources`, `:app:compileDebugKotlin`, y `:app:assembleDebug` completo al cierre — sin errores. Backend: `tsc --noEmit` con los mismos 9 errores preexistentes de siempre, ninguno nuevo.
+- Íconos, mockup y assets vía MCP `DesignSync` (`get_file`/`list_files` sobre el proyecto de Claude Design), no requirió tocar el proyecto de diseño en sí (solo lectura).
+- Pendiente de decisión del usuario, no implementado: ícono de "Entrada manual" en home (mockup usa lupa, se dejó el teclado por claridad de UX) y el ícono del botón "Seleccionar impresora" en Ajustes (usa el carrito por herencia del bug 110.1, sin ícono de printer/Bluetooth dedicado en el mockup).
 
 ---
 
