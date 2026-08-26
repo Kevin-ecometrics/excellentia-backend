@@ -255,6 +255,11 @@ router.get('/:customerId/orders', auth, async (req: Request, res: Response) => {
       [customerId]
     ) as any[];
 
+    const [[purchases30dRow]] = await pool.query(
+      "SELECT COUNT(DISTINCT batch_id) as count FROM orders WHERE customer_id = ? AND batch_id IS NOT NULL AND status = 'SENT' AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)",
+      [customerId]
+    ) as any[];
+
     const [rows] = await pool.query(`
       SELECT
         batch_id,
@@ -272,7 +277,7 @@ router.get('/:customerId/orders', auth, async (req: Request, res: Response) => {
       LIMIT ? OFFSET ?
     `, [customerId, limitNum, offset]) as any[];
 
-    res.json({ data: rows, meta: { page: pageNum, limit: limitNum, total: countRow.total } });
+    res.json({ data: rows, meta: { page: pageNum, limit: limitNum, total: countRow.total, purchases30d: purchases30dRow.count } });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Error';
     res.status(500).json({ error: message });
