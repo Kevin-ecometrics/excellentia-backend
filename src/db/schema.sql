@@ -18,13 +18,14 @@ CREATE TABLE IF NOT EXISTS `users` (
     `password`                  VARCHAR(255) NOT NULL,
     `refresh_token`             TEXT NULL,
     `refresh_token_expires_at`  BIGINT NULL,
-    `role`                      ENUM('admin', 'operator') NOT NULL DEFAULT 'operator',
+    `role`                      ENUM('admin', 'operator', 'almacenista') NOT NULL DEFAULT 'operator',
     `qb_class_id`               VARCHAR(50) NULL,
     `created_at`                TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Migración para DB existente (cPanel):
 -- ALTER TABLE users ADD COLUMN IF NOT EXISTS qb_class_id VARCHAR(50) NULL AFTER role;
+-- ALTER TABLE users MODIFY COLUMN role ENUM('admin','operator','almacenista') NOT NULL DEFAULT 'operator';
 
 -- -----------------------------------------------------------------------------
 -- 2. products
@@ -279,6 +280,48 @@ CREATE TABLE IF NOT EXISTS `pre_order_items` (
     `total`        DECIMAL(10,2) NOT NULL,
     FOREIGN KEY (`pre_order_id`) REFERENCES `pre_orders`(`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- -----------------------------------------------------------------------------
+-- 16. routes
+-- (depende de users por driver_user_id/created_by, sin FK — mismo criterio que pre_orders)
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `routes` (
+    `id`              INT AUTO_INCREMENT PRIMARY KEY,
+    `name`            VARCHAR(255) NOT NULL,
+    `scheduled_date`  DATE NOT NULL,
+    `driver_user_id`  INT DEFAULT NULL,
+    `status`          ENUM('PLANNED','IN_PROGRESS','COMPLETED','CANCELLED') DEFAULT 'PLANNED',
+    `notes`           TEXT DEFAULT NULL,
+    `created_by`      INT DEFAULT NULL,
+    `created_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- -----------------------------------------------------------------------------
+-- 17. route_stops
+-- (depende de routes; referencia orders.batch_id / pre_orders.id como string/id
+-- sueltos, no FK reales — mismo criterio que batch_damage/credit_transactions)
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `route_stops` (
+    `id`            INT AUTO_INCREMENT PRIMARY KEY,
+    `route_id`      INT NOT NULL,
+    `position`      INT NOT NULL,
+    `stop_type`     ENUM('BATCH','PRE_ORDER') NOT NULL,
+    `batch_id`      VARCHAR(50) DEFAULT NULL,
+    `pre_order_id`  INT DEFAULT NULL,
+    `customer_id`   VARCHAR(50) DEFAULT NULL,
+    `customer_name` VARCHAR(255) DEFAULT NULL,
+    `status`        ENUM('PENDING','DELIVERED','SKIPPED') DEFAULT 'PENDING',
+    `created_at`    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (`route_id`) REFERENCES `routes`(`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- =============================================================================
+-- Migración — Módulo Almacén (rutas de entrega): nuevo rol almacenista
+-- Para bases existentes (ejecutar una sola vez)
+-- =============================================================================
+
+ALTER TABLE users MODIFY COLUMN role ENUM('admin','operator','almacenista') NOT NULL DEFAULT 'operator';
 
 -- =============================================================================
 -- Migración — Fase 48: normalización de firmas + hidden products

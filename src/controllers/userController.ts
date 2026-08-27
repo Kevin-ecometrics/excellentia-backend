@@ -63,7 +63,7 @@ export async function updateUser(req: Request, res: Response): Promise<void> {
 export async function listSalespersons(_req: Request, res: Response): Promise<void> {
   try {
     const [rows] = await pool.query(
-      'SELECT id, name FROM users WHERE name IS NOT NULL ORDER BY name'
+      'SELECT id, name, role FROM users WHERE name IS NOT NULL ORDER BY name'
     ) as any[];
     res.json({ data: rows });
   } catch (err) {

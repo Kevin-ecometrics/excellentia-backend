@@ -58,7 +58,7 @@ export async function refresh(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    let decoded: { id: number; email: string; role: 'admin' | 'operator' };
+    let decoded: { id: number; email: string; role: 'admin' | 'operator' | 'almacenista' };
     try {
       decoded = verifyRefreshToken(refreshToken);
     } catch {

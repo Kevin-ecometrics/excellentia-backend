@@ -5,7 +5,7 @@ export interface User {
   password: string;
   refresh_token: string | null;
   refresh_token_expires_at: number | null;
-  role: 'admin' | 'operator';
+  role: 'admin' | 'operator' | 'almacenista';
   qb_class_id: string | null;
   created_at: Date;
 }

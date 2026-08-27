@@ -22,7 +22,7 @@ router.get('/', async (_req: Request, res: Response) => {
         password                 VARCHAR(255) NOT NULL,
         refresh_token            TEXT NULL,
         refresh_token_expires_at BIGINT NULL,
-        role                     ENUM('admin','operator') NOT NULL DEFAULT 'operator',
+        role                     ENUM('admin','operator','almacenista') NOT NULL DEFAULT 'operator',
         created_at               TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
       `CREATE TABLE IF NOT EXISTS products (
@@ -199,6 +199,30 @@ router.get('/', async (_req: Request, res: Response) => {
         case_qty     INT DEFAULT NULL,
         FOREIGN KEY (pre_order_id) REFERENCES pre_orders(id) ON DELETE CASCADE
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+      `CREATE TABLE IF NOT EXISTS routes (
+        id              INT AUTO_INCREMENT PRIMARY KEY,
+        name            VARCHAR(255) NOT NULL,
+        scheduled_date  DATE NOT NULL,
+        driver_user_id  INT DEFAULT NULL,
+        status          ENUM('PLANNED','IN_PROGRESS','COMPLETED','CANCELLED') DEFAULT 'PLANNED',
+        notes           TEXT DEFAULT NULL,
+        created_by      INT DEFAULT NULL,
+        created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+      `CREATE TABLE IF NOT EXISTS route_stops (
+        id            INT AUTO_INCREMENT PRIMARY KEY,
+        route_id      INT NOT NULL,
+        position      INT NOT NULL,
+        stop_type     ENUM('BATCH','PRE_ORDER') NOT NULL,
+        batch_id      VARCHAR(50) DEFAULT NULL,
+        pre_order_id  INT DEFAULT NULL,
+        customer_id   VARCHAR(50) DEFAULT NULL,
+        customer_name VARCHAR(255) DEFAULT NULL,
+        status        ENUM('PENDING','DELIVERED','SKIPPED') DEFAULT 'PENDING',
+        created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (route_id) REFERENCES routes(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
     ];
 
     for (const stmt of tableStatements) {
@@ -268,6 +292,7 @@ router.get('/', async (_req: Request, res: Response) => {
       ["ALTER TABLE pre_orders ADD COLUMN IF NOT EXISTS assigned_user_id INT DEFAULT NULL AFTER user_id", "pre_orders.assigned_user_id agregada"],
       ["ALTER TABLE products ADD COLUMN IF NOT EXISTS sku VARCHAR(50) UNIQUE AFTER barcode", "products.sku agregada"],
       ["UPDATE products SET sku = barcode WHERE sku IS NULL AND barcode IS NOT NULL", "products.sku — backfill desde barcode"],
+      ["ALTER TABLE users MODIFY COLUMN role ENUM('admin','operator','almacenista') NOT NULL DEFAULT 'operator'", "users.role: agregado almacenista"],
     ];
     for (const [sql, label] of migrations) {
       try {

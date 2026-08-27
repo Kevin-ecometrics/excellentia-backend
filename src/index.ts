@@ -24,6 +24,7 @@ import activityRoutes from './routes/activity.ts';
 import settingsRoutes from './routes/settings.ts';
 import setupRoutes from './routes/setup.ts';
 import preOrderRoutes from './routes/preOrders.ts';
+import deliveryRouteRoutes from './routes/deliveryRoutes.ts';
 import { auth } from './middleware/auth.ts';
 
 const startErrors: string[] = [];
@@ -124,6 +125,7 @@ app.use('/api/activity', activityRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/setup', setupRoutes);
 app.use('/api/preorders', preOrderRoutes);
+app.use('/api/routes', deliveryRouteRoutes);
 
 // Strip trailing slashes for frontend routes
 app.use((req, res, next) => {

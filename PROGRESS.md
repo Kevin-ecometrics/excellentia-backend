@@ -1,6 +1,6 @@
 # Excellentia — Progreso del Proyecto
 
-> Estado actual: **Fase 110 ✅ — Claude Design: aplicación completa del design system en Android (íconos, diálogos, inputs, bugs de tema)**
+> Estado actual: **Fase 111 🔄 — Módulo Almacén: rutas de entrega (backend + webapp). Arranca el ciclo post-v1.5.1 — ver nota de versión abajo**
 
 ---
 
@@ -3131,6 +3131,63 @@ Proyecto Android (`androidStudioProjects/test`). Se importó el mockup **"Mockup
 - Compilación verificada en cada paso: `gradlew :app:processDebugResources`, `:app:compileDebugKotlin`, y `:app:assembleDebug` completo al cierre — sin errores. Backend: `tsc --noEmit` con los mismos 9 errores preexistentes de siempre, ninguno nuevo.
 - Íconos, mockup y assets vía MCP `DesignSync` (`get_file`/`list_files` sobre el proyecto de Claude Design), no requirió tocar el proyecto de diseño en sí (solo lectura).
 - Pendiente de decisión del usuario, no implementado: ícono de "Entrada manual" en home (mockup usa lupa, se dejó el teclado por claridad de UX) y el ícono del botón "Seleccionar impresora" en Ajustes (usa el carrito por herencia del bug 110.1, sin ícono de printer/Bluetooth dedicado en el mockup).
+
+---
+
+## 📌 Corte de versión — Android v1.5.1 aprobada
+
+La Fase 110 (110.35/110.36) dejó el Android en **`versionName` 1.5.1 / `versionCode` 2**.
+Esa build es la **última aprobada antes** de arrancar el trabajo de la Fase 111 en
+adelante — el APK v1.5.1 sigue siendo el que se distribuye/usa en producción hasta
+que el módulo Almacén (y lo que siga) esté listo para su propia release.
+
+A partir de acá, todo el ciclo de trabajo (Fase 111+) está enfocado en el
+**módulo de almacenista/rutas de entrega**: primero webapp + backend (Fase 111),
+después el port a Android como fase separada — todavía no arrancada, se abre su
+propia fase cuando toque.
+
+---
+
+## Fase 111: Módulo Almacén — rutas de entrega (backend + webapp) 🔄
+
+Nuevo rol `almacenista`: arma **rutas de entrega** (repartidor + fecha + lista
+ordenada de paradas) tomando pedidos ya confirmados (`orders`, por `batch_id`) y
+pre-órdenes (`pre_orders`) sin asignar. Alcance de esta fase: solo backend +
+webapp. El port a la app Android queda para una fase futura, a pedido explícito
+del usuario ("primero webapp, luego lo paso a Android").
+
+### Backend (`excellentia/`)
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 111.1 | Rol `role` ampliado a `'admin' \| 'operator' \| 'almacenista'` | `types/index.ts` | ✅ |
+| 111.2 | Migración `ALTER TABLE users MODIFY COLUMN role ENUM('admin','operator','almacenista') ...` — agregada a `setup.ts`/`schema.sql`. **Ya aplicada y ejecutada por el usuario contra MySQL** | `routes/setup.ts`, `db/schema.sql` | ✅ |
+| 111.3 | Tablas nuevas `routes` (repartidor, fecha, estado, notas) y `route_stops` (parada ordenada — `stop_type` BATCH/PRE_ORDER, referencia suelta a `orders.batch_id` o `pre_orders.id`, mismo criterio que `batch_damage`/`credit_transactions`). Auto-creación vía `ensureTables()` (patrón de `pre_orders`) + documentadas en `schema.sql`/`setup.ts` | `controllers/routeController.ts`, `db/schema.sql`, `routes/setup.ts` | ✅ |
+| 111.4 | Middleware `warehouseOnly` (admin o almacenista) | `middleware/warehouseOnly.ts` | ✅ |
+| 111.5 | `routeController.ts` — CRUD de rutas, agregar/quitar/reordenar paradas, `listAvailable` (pedidos SENT/PENDING y pre-órdenes CONFIRMED sin asignar a ninguna ruta activa) | `controllers/routeController.ts` | ✅ |
+| 111.6 | Router montado en `/api/routes` | `routes/deliveryRoutes.ts`, `index.ts` | ✅ |
+| 111.7 | `GET /api/users/salespersons` ahora también devuelve `role` — reusado como picker de repartidor (filtrado a `operator` en el cliente) sin agregar endpoint nuevo | `controllers/userController.ts` | ✅ |
+| 111.8 | Fix de regresión: `authController.ts` (`refresh`) tenía el tipo de rol hardcodeado a 2 valores — lo rompía el ensanche del ENUM | `controllers/authController.ts` | ✅ |
+
+### Webapp (`excellentia-webapp/`)
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 111.9 | `CurrentUser.role` y `UserRow.role` ampliados a 3 valores | `app/lib/auth.ts`, `app/users/page.tsx` | ✅ |
+| 111.10 | Sidebar: gate binario `adminOnly` → `roles: Role[]` por ítem; nuevo ítem "Almacén" (`/warehouse`), visible solo `admin`/`almacenista`; badge de rol de 3 vías | `app/_components/Sidebar.tsx` | ✅ |
+| 111.11 | Claves i18n nuevas: `nav_warehouse`, `role_almacenista`, `usr_almacenista`, sección `wh_*` (título, estados de ruta, paradas, picker) | `app/lib/i18n.ts` | ✅ |
+| 111.12 | Alta/edición de usuarios: opción `almacenista` en el `<select>` de rol + badge + label helper `roleLabel()` | `app/users/_components/UsersClient.tsx` | ✅ |
+| 111.13 | `/warehouse` agregado a `protectedRoutes` (mismo nivel que `/dashboard`/`/products`) | `proxy.ts` | ✅ |
+| 111.14 | Página `/warehouse` — lista de rutas, filtro por fecha, redirect a `/orders` si `role === 'operator'` | `app/warehouse/page.tsx` | ✅ |
+| 111.15 | `WarehouseClient.tsx` — tarjetas de ruta expandibles, cambio de estado inline (PLANNED/IN_PROGRESS/COMPLETED/CANCELLED), paradas reordenables con botones ↑/↓ (sin librería de drag — no existía ninguna en el repo) | `app/warehouse/_components/WarehouseClient.tsx` | ✅ |
+| 111.16 | `RouteModal.tsx` (crear/editar ruta) y `StopPickerModal.tsx` (agregar parada desde pedidos/pre-órdenes disponibles) — mismo chrome/validación que `ProductModal.tsx` | `app/warehouse/_components/RouteModal.tsx`, `StopPickerModal.tsx` | ✅ |
+
+### Notas
+
+- `bun run build` verificado limpio (TypeScript incluido) en ambos repos — sin errores nuevos.
+- SQL de la Fase 111 (migración de rol + `CREATE TABLE routes`/`route_stops`) ya corrido a mano por el usuario contra MySQL local.
+- **No probado end-to-end contra datos reales todavía** — al momento de implementar, MySQL local no estaba levantado; falta ejercitar el flujo completo (crear almacenista → login → crear ruta → asignar pedido/pre-orden → reordenar → completar) una vez el usuario lo corra.
+- Pendiente explícito, fuera de esta fase: port del flujo de rutas a la app Android.
 
 ---
 
