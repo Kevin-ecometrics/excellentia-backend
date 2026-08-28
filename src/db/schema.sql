@@ -306,7 +306,7 @@ CREATE TABLE IF NOT EXISTS `route_stops` (
     `id`            INT AUTO_INCREMENT PRIMARY KEY,
     `route_id`      INT NOT NULL,
     `position`      INT NOT NULL,
-    `stop_type`     ENUM('BATCH','PRE_ORDER') NOT NULL,
+    `stop_type`     ENUM('BATCH','PRE_ORDER','CUSTOMER') NOT NULL,
     `batch_id`      VARCHAR(50) DEFAULT NULL,
     `pre_order_id`  INT DEFAULT NULL,
     `customer_id`   VARCHAR(50) DEFAULT NULL,
@@ -316,12 +316,40 @@ CREATE TABLE IF NOT EXISTS `route_stops` (
     FOREIGN KEY (`route_id`) REFERENCES `routes`(`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- -----------------------------------------------------------------------------
+-- 18. route_items
+-- Manifiesto de carga de la ruta: qué productos (y cuánta cantidad) escaneó el
+-- almacenista para cargar al camión, vía la app Android. No está atado a una
+-- parada/pedido puntual (route_stops) — es la carga de toda la ruta. Cada
+-- escaneo decrementa products.stock y sincroniza QtyOnHand a QBO
+-- (ver routeController.ts, addRouteItem/removeRouteItem).
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `route_items` (
+    `id`           INT AUTO_INCREMENT PRIMARY KEY,
+    `route_id`     INT NOT NULL,
+    `product_id`   INT NOT NULL,
+    `barcode`      VARCHAR(50) DEFAULT NULL,
+    `quantity`     INT NOT NULL DEFAULT 0,
+    `scanned_by`   INT DEFAULT NULL,
+    `created_at`   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY `route_product` (`route_id`, `product_id`),
+    FOREIGN KEY (`route_id`) REFERENCES `routes`(`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- =============================================================================
 -- Migración — Módulo Almacén (rutas de entrega): nuevo rol almacenista
 -- Para bases existentes (ejecutar una sola vez)
 -- =============================================================================
 
 ALTER TABLE users MODIFY COLUMN role ENUM('admin','operator','almacenista') NOT NULL DEFAULT 'operator';
+
+-- =============================================================================
+-- Migración — parada de ruta = cliente (sin pedido/pre-orden vinculado)
+-- Para bases existentes (ejecutar una sola vez)
+-- =============================================================================
+
+ALTER TABLE route_stops MODIFY COLUMN stop_type ENUM('BATCH','PRE_ORDER','CUSTOMER') NOT NULL;
 
 -- =============================================================================
 -- Migración — Fase 48: normalización de firmas + hidden products

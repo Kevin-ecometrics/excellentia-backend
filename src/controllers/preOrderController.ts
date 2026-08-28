@@ -155,6 +155,26 @@ export async function updatePreOrder(req: Request, res: Response): Promise<void>
       return;
     }
 
+    // Antes este endpoint pasaba `status` directo al UPDATE sin validar nada
+    // (cualquier string, incluso inválido, dependía del ENUM de MySQL para
+    // fallar) — ahora que la app realmente lo usa (botón "Confirmar
+    // pre-orden"), se valida el valor y se limita a la única transición que
+    // corresponde hacer por acá. CONVERTED pasa por convertPreOrder (precios/
+    // QBO) y CANCELLED por deletePreOrder — no por este endpoint genérico.
+    if (status !== undefined) {
+      const validStatuses = ['DRAFT', 'CONFIRMED', 'CONVERTED', 'CANCELLED'];
+      if (!validStatuses.includes(status)) {
+        res.status(400).json({ error: `status inválido: '${status}'` });
+        return;
+      }
+      const currentStatus = (existingRows as any[])[0].status;
+      const isConfirming = currentStatus === 'DRAFT' && status === 'CONFIRMED';
+      if (!isConfirming && status !== currentStatus) {
+        res.status(400).json({ error: `No se puede pasar de '${currentStatus}' a '${status}' por acá` });
+        return;
+      }
+    }
+
     const updates: string[] = ['updated_at = NOW()'];
     const updateParams: any[] = [];
     if (scheduled_date    !== undefined) { updates.push('scheduled_date = ?');    updateParams.push(scheduled_date); }

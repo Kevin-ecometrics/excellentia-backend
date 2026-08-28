@@ -3187,7 +3187,7 @@ del usuario ("primero webapp, luego lo paso a Android").
 - `bun run build` verificado limpio (TypeScript incluido) en ambos repos — sin errores nuevos.
 - SQL de la Fase 111 (migración de rol + `CREATE TABLE routes`/`route_stops`) ya corrido a mano por el usuario contra MySQL local.
 - **No probado end-to-end contra datos reales todavía** — al momento de implementar, MySQL local no estaba levantado; falta ejercitar el flujo completo (crear almacenista → login → crear ruta → asignar pedido/pre-orden → reordenar → completar) una vez el usuario lo corra.
-- Pendiente explícito, fuera de esta fase: port del flujo de rutas a la app Android.
+- Pendiente explícito, fuera de esta fase: port del flujo de rutas a la app Android. Requisito identificado para ese port: soporte offline de pre-órdenes (ver "Pendiente / Mejoras futuras → Android → Pre-órdenes offline", subida a prioridad Alta por esto mismo).
 
 ---
 
@@ -3212,7 +3212,7 @@ del usuario ("primero webapp, luego lo paso a Android").
 | Alta | **Badge crédito cliente activo** | Mostrar en `CurrentOrderActivity` si el cliente activo tiene crédito disponible por damage. Depende del sistema de créditos. |
 | Media | **Notificación sync pedido PENDING** | Pulir `OrderStatusWorker` — notificar al vendedor cuando un pedido PENDING se sincroniza exitosamente a QB |
 | Media | **Buscar cliente por nombre desde MainActivity** | Actualmente solo se puede escanear o ingresar código. Agregar búsqueda de cliente directamente desde la pantalla principal sin abrir `CustomerPickerActivity` |
-| Media | **Pre-órdenes offline** | Pre-órdenes funcionen sin internet usando SQLite local. Al recuperar red se sincronizan automáticamente vía `SyncWorker` |
+| Alta | **Pre-órdenes offline** | Pre-órdenes funcionen sin internet usando SQLite local (mismo patrón que `OrderRepository`: cola local + `SyncWorker` cada 15 min). Subida de prioridad (era Media) — se vuelve requisito real para el port de rutas de la Fase 111: una parada de tipo `PRE_ORDER` en una ruta tiene que poder verse/actuarse en campo con datos móviles intermitentes, y hoy solo `orders` tiene ese soporte offline |
 | Media | **Historial de precios mejorado** | En `ProductDetailActivity` mostrar el precio promedio que ese cliente ha pagado por el producto, además del historial de transacciones |
 
 ### Backend
