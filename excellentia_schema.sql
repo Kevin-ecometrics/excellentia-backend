@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS `users` (
     `password`                  VARCHAR(255) NOT NULL,
     `refresh_token`             TEXT NULL,
     `refresh_token_expires_at`  BIGINT NULL,
-    `role`                      ENUM('admin', 'operator') NOT NULL DEFAULT 'operator',
+    `role`                      ENUM('admin', 'operator', 'almacenista') NOT NULL DEFAULT 'operator',
+    `qb_class_id`               VARCHAR(50) NULL,
     `created_at`                TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -258,6 +259,207 @@ CREATE TABLE IF NOT EXISTS `pre_order_items` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- -----------------------------------------------------------------------------
+-- 16. warehouses
+-- Fase 112 — hoy la operación tiene un solo almacén físico (sembrado por
+-- ensureTables() en warehouseController.ts como "Almacén Principal" si la
+-- tabla está vacía), pero routes/product_lots/inventory_movements ya
+-- referencian warehouse_id desde el día 1 para no migrar de nuevo si se abre
+-- un segundo almacén.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `warehouses` (
+    `id`          INT AUTO_INCREMENT PRIMARY KEY,
+    `name`        VARCHAR(255) NOT NULL,
+    `is_active`   TINYINT(1) NOT NULL DEFAULT 1,
+    `created_at`  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- -----------------------------------------------------------------------------
+-- 17. routes
+-- (Fase 111 — depende de users por driver_user_id/created_by, sin FK — mismo
+-- criterio que pre_orders; warehouse_id sí es FK real a warehouses)
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `routes` (
+    `id`              INT AUTO_INCREMENT PRIMARY KEY,
+    `name`            VARCHAR(255) NOT NULL,
+    `scheduled_date`  DATE NOT NULL,
+    `driver_user_id`  INT DEFAULT NULL,
+    `warehouse_id`    INT DEFAULT NULL,
+    `status`          ENUM('PLANNED','IN_PROGRESS','COMPLETED','CANCELLED') DEFAULT 'PLANNED',
+    `notes`           TEXT DEFAULT NULL,
+    `created_by`      INT DEFAULT NULL,
+    `created_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (`warehouse_id`) REFERENCES `warehouses`(`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- -----------------------------------------------------------------------------
+-- 18. route_stops
+-- (Fase 111 — depende de routes; referencia orders.batch_id / pre_orders.id
+-- como string/id sueltos, no FK reales — mismo criterio que batch_damage)
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `route_stops` (
+    `id`            INT AUTO_INCREMENT PRIMARY KEY,
+    `route_id`      INT NOT NULL,
+    `position`      INT NOT NULL,
+    `stop_type`     ENUM('BATCH','PRE_ORDER','CUSTOMER') NOT NULL,
+    `batch_id`      VARCHAR(50) DEFAULT NULL,
+    `pre_order_id`  INT DEFAULT NULL,
+    `customer_id`   VARCHAR(50) DEFAULT NULL,
+    `customer_name` VARCHAR(255) DEFAULT NULL,
+    `status`        ENUM('PENDING','DELIVERED','SKIPPED') DEFAULT 'PENDING',
+    `created_at`    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (`route_id`) REFERENCES `routes`(`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- -----------------------------------------------------------------------------
+-- 19. route_items
+-- Manifiesto de carga de la ruta (Fase 111): qué productos/cantidad escaneó el
+-- almacenista para cargar al camión. Desde la Fase 112 cada escaneo asigna
+-- FIFO contra product_lots (ver route_item_lots) y decrementa products.stock
+-- localmente, pero YA NO sincroniza QtyOnHand a QBO al instante — eso se
+-- difiere a la liquidación diaria (inventory_movements/daily_settlements).
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `route_items` (
+    `id`           INT AUTO_INCREMENT PRIMARY KEY,
+    `route_id`     INT NOT NULL,
+    `product_id`   INT NOT NULL,
+    `barcode`      VARCHAR(50) DEFAULT NULL,
+    `quantity`     INT NOT NULL DEFAULT 0,
+    `scanned_by`   INT DEFAULT NULL,
+    `created_at`   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY `route_product` (`route_id`, `product_id`),
+    FOREIGN KEY (`route_id`) REFERENCES `routes`(`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- -----------------------------------------------------------------------------
+-- 20. product_lots
+-- Fase 112 — recepción de productos. Cada línea escaneada al recibir mercadería
+-- (código de barras + cantidad + fecha de expiración opcional) crea/alimenta un
+-- lote. remaining_qty es lo que queda disponible para asignar a una ruta vía
+-- FIFO (idx_lots_fifo ordena por expiration_date y luego received_at).
+-- receipt_batch_id agrupa las líneas de una misma sesión de recepción, mismo
+-- criterio suelto que orders.batch_id.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `product_lots` (
+    `id`               INT AUTO_INCREMENT PRIMARY KEY,
+    `receipt_batch_id` VARCHAR(50) NOT NULL,
+    `warehouse_id`     INT NOT NULL,
+    `product_id`       INT NOT NULL,
+    `barcode`          VARCHAR(50) DEFAULT NULL,
+    `expiration_date`  DATE DEFAULT NULL,
+    `received_qty`     DECIMAL(10,2) NOT NULL,
+    `remaining_qty`    DECIMAL(10,2) NOT NULL,
+    `status`           ENUM('ACTIVE','DEPLETED','DAMAGED','EXPIRED') DEFAULT 'ACTIVE',
+    `received_by`      INT DEFAULT NULL,
+    `received_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (`warehouse_id`) REFERENCES `warehouses`(`id`),
+    FOREIGN KEY (`product_id`) REFERENCES `products`(`id`),
+    INDEX `idx_lots_fifo` (`product_id`, `warehouse_id`, `status`, `expiration_date`, `received_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- -----------------------------------------------------------------------------
+-- 21. route_item_lots
+-- Qué lote(s) exactos alimentaron cada línea del manifiesto (route_items) —
+-- separado porque una misma línea puede partirse entre 2+ lotes si el primero
+-- no alcanza. used_suggested_lot queda en 0 cuando el almacenista pisa la
+-- sugerencia FIFO manualmente (override permitido, no es una regla dura).
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `route_item_lots` (
+    `id`                  INT AUTO_INCREMENT PRIMARY KEY,
+    `route_item_id`       INT NOT NULL,
+    `lot_id`              INT NOT NULL,
+    `quantity`            DECIMAL(10,2) NOT NULL,
+    `used_suggested_lot`  TINYINT(1) NOT NULL DEFAULT 1,
+    FOREIGN KEY (`route_item_id`) REFERENCES `route_items`(`id`) ON DELETE CASCADE,
+    FOREIGN KEY (`lot_id`) REFERENCES `product_lots`(`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- -----------------------------------------------------------------------------
+-- 22. inventory_movements
+-- Fase 112 — sub-inventario: ledger de todo movimiento físico (recepción, carga
+-- de ruta, devolución, daño/ajuste). Se aplica a product_lots/products.stock en
+-- el momento (fuente de verdad local inmediata) pero NO dispara ningún push a
+-- QBO por sí solo — settlement_id queda NULL hasta que la liquidación diaria lo
+-- incluye y empuja QtyOnHand una sola vez por producto.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `inventory_movements` (
+    `id`             INT AUTO_INCREMENT PRIMARY KEY,
+    `warehouse_id`   INT NOT NULL,
+    `product_id`     INT NOT NULL,
+    `lot_id`         INT DEFAULT NULL,
+    `movement_type`  ENUM('RECEIPT','ROUTE_LOAD','RETURN','DAMAGE','ADJUSTMENT') NOT NULL,
+    `quantity`       DECIMAL(10,2) NOT NULL,
+    `route_id`       INT DEFAULT NULL,
+    `settlement_id`  INT DEFAULT NULL,
+    `created_by`     INT DEFAULT NULL,
+    `created_at`     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (`warehouse_id`) REFERENCES `warehouses`(`id`),
+    FOREIGN KEY (`product_id`) REFERENCES `products`(`id`),
+    INDEX `idx_movements_pending` (`warehouse_id`, `settlement_id`),
+    INDEX `idx_movements_product` (`product_id`, `created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- -----------------------------------------------------------------------------
+-- 23. route_returns
+-- Fase 112 — revisión de devoluciones: lo que el almacén cuenta físicamente al
+-- volver una ruta (COMPLETED), con su condición. GOOD restituye remaining_qty a
+-- los lotes que esa ruta usó; DAMAGED/EXPIRED se da de baja permanente. El
+-- almacén audita lo que regresa, no re-valida lo que se vendió (ya en orders).
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `route_returns` (
+    `id`                 INT AUTO_INCREMENT PRIMARY KEY,
+    `route_id`           INT NOT NULL,
+    `product_id`         INT NOT NULL,
+    `quantity`           DECIMAL(10,2) NOT NULL,
+    `condition_status`   ENUM('GOOD','DAMAGED','EXPIRED') NOT NULL DEFAULT 'GOOD',
+    `notes`              TEXT DEFAULT NULL,
+    `reviewed_by`        INT NOT NULL,
+    `reviewed_at`        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (`route_id`) REFERENCES `routes`(`id`) ON DELETE CASCADE,
+    FOREIGN KEY (`product_id`) REFERENCES `products`(`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- -----------------------------------------------------------------------------
+-- 24. daily_settlements
+-- Fase 112 — liquidación diaria: un registro por almacén+día que agrupa todos
+-- los inventory_movements pendientes (settlement_id IS NULL) al momento del
+-- preview. Confirmar dispara el push real a QBO (ver settlement_lines) y
+-- estampa settlement_id en los movimientos incluidos.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `daily_settlements` (
+    `id`               INT AUTO_INCREMENT PRIMARY KEY,
+    `warehouse_id`     INT NOT NULL,
+    `settlement_date`  DATE NOT NULL,
+    `status`           ENUM('DRAFT','CONFIRMED') DEFAULT 'DRAFT',
+    `confirmed_by`     INT DEFAULT NULL,
+    `confirmed_at`     TIMESTAMP DEFAULT NULL,
+    `created_at`       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (`warehouse_id`) REFERENCES `warehouses`(`id`),
+    UNIQUE KEY `uq_settlement_day` (`warehouse_id`, `settlement_date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- -----------------------------------------------------------------------------
+-- 25. settlement_lines
+-- Detalle por producto de una liquidación — stock_after es lo que realmente se
+-- manda como QtyOnHand a QBO (valor absoluto, no delta); net_quantity/
+-- stock_before quedan solo para la pantalla de revisión.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `settlement_lines` (
+    `id`             INT AUTO_INCREMENT PRIMARY KEY,
+    `settlement_id`  INT NOT NULL,
+    `product_id`     INT NOT NULL,
+    `net_quantity`   DECIMAL(10,2) NOT NULL,
+    `stock_before`   DECIMAL(10,2) NOT NULL,
+    `stock_after`    DECIMAL(10,2) NOT NULL,
+    `qbo_synced`     TINYINT(1) NOT NULL DEFAULT 0,
+    `qbo_error`      TEXT DEFAULT NULL,
+    UNIQUE KEY `uq_settlement_product` (`settlement_id`, `product_id`),
+    FOREIGN KEY (`settlement_id`) REFERENCES `daily_settlements`(`id`) ON DELETE CASCADE,
+    FOREIGN KEY (`product_id`) REFERENCES `products`(`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- -----------------------------------------------------------------------------
 SET FOREIGN_KEY_CHECKS = 1;
 -- =============================================================================
 -- Migración — Fase 48: normalización de firmas + hidden products
@@ -279,5 +481,32 @@ ALTER TABLE orders DROP COLUMN IF EXISTS signature;
 ALTER TABLE products ADD COLUMN IF NOT EXISTS hidden TINYINT(1) NOT NULL DEFAULT 0 AFTER stock;
 
 -- =============================================================================
--- Fin del schema — 15 tablas + migración Fase 48
+-- Migración — Fase 111: Módulo Almacén (rutas de entrega), nuevo rol almacenista
+-- Para bases existentes (ejecutar una sola vez) — este archivo no traía estas
+-- tablas/ALTER hasta la Fase 112, quedaron corregidas de paso.
+-- =============================================================================
+
+ALTER TABLE users MODIFY COLUMN role ENUM('admin','operator','almacenista') NOT NULL DEFAULT 'operator';
+ALTER TABLE route_stops MODIFY COLUMN stop_type ENUM('BATCH','PRE_ORDER','CUSTOMER') NOT NULL;
+
+-- =============================================================================
+-- Migración — Fase 112: Almacén (recepción, FIFO, sub-inventario, liquidación,
+-- devoluciones y condición del producto)
+-- Para bases existentes (ejecutar una sola vez, en orden)
+-- =============================================================================
+
+-- 1. Sembrar el almacén único si no hay ninguno:
+INSERT INTO warehouses (name, is_active)
+SELECT 'Almacén Principal', 1
+WHERE NOT EXISTS (SELECT 1 FROM warehouses);
+
+-- 2. routes gana warehouse_id — backfill al único almacén sembrado.
+ALTER TABLE routes ADD COLUMN IF NOT EXISTS warehouse_id INT DEFAULT NULL AFTER driver_user_id;
+UPDATE routes SET warehouse_id = (SELECT id FROM warehouses ORDER BY id LIMIT 1) WHERE warehouse_id IS NULL;
+-- MySQL no soporta "ADD FOREIGN KEY IF NOT EXISTS" — chequear con SHOW CREATE
+-- TABLE routes antes de correr esta línea en una base ya migrada:
+-- ALTER TABLE routes ADD FOREIGN KEY (warehouse_id) REFERENCES warehouses(id);
+
+-- =============================================================================
+-- Fin del schema — 22 tablas + migraciones Fase 48, 111 y 112
 -- =============================================================================

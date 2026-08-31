@@ -56,6 +56,8 @@ src/
 | GET | `/api/settings` | JWT | Info de la empresa |
 | PUT | `/api/settings/invoice-counter` | JWT+admin | Reasigna el próximo número de factura QBO (`company_settings.invoice_counter`) — ver nota abajo |
 | POST | `/api/products/migrate-sku` | JWT+admin | Migración de una sola vez: adopta la nomenclatura NEW_SKU (marca+secuencia) del master sheet Excellentia-vs-QBO — ver nota abajo |
+| \* | `/api/routes/*` | JWT (+admin/almacenista en mutaciones) | Rutas de entrega, paradas y manifiesto de carga — ver "Módulo Almacén" abajo |
+| \* | `/api/warehouse/*` | JWT+admin/almacenista | Recepción, lotes/FIFO, sub-inventario y liquidación diaria — ver "Módulo Almacén" abajo |
 
 ## migrateSkuNomenclature — migración de una sola vez a la nomenclatura NEW_SKU
 
@@ -188,6 +190,15 @@ CREATE TABLE IF NOT EXISTS customer_credits (
   INDEX idx_customer_credits_batch (batch_id),
   INDEX idx_customer_credits_customer (customer_id)
 );
+-- Fase 112 (Almacén) — CREATE TABLE completos de warehouses/product_lots/
+-- route_item_lots/inventory_movements/route_returns/daily_settlements/
+-- settlement_lines en la sección "Migración — Fase 112" de db/schema.sql
+-- (muy largos para este bloque). Corren solos y son idempotentes; lo único
+-- que hace falta ejecutar a mano después es:
+INSERT INTO warehouses (name, is_active) SELECT 'Almacén Principal', 1 WHERE NOT EXISTS (SELECT 1 FROM warehouses);
+ALTER TABLE routes ADD COLUMN IF NOT EXISTS warehouse_id INT DEFAULT NULL AFTER driver_user_id;
+UPDATE routes SET warehouse_id = (SELECT id FROM warehouses ORDER BY id LIMIT 1) WHERE warehouse_id IS NULL;
+-- ALTER TABLE routes ADD FOREIGN KEY (warehouse_id) REFERENCES warehouses(id); -- solo si todavía no existe esa FK
 ```
 
 **`orders.unit`/`case_qty` — por qué importan para el ticket:** `unit` es el tipo de venta (Lbs/Case/Unit/Bucket) y `case_qty` las unidades por caja (`products.qty` cuando `unit = "Case"`, copiado al momento de la venta). Sin estos dos campos guardados en `orders`, reimprimir un pedido desde Historial no puede saber si era por peso o por caja — `listOrders` los expone ahora junto al resto de columnas.
@@ -296,6 +307,83 @@ directo) aplican el mismo criterio vía `canAccessPreOrder()` — devuelven 403 
 usuario no es admin ni el creador ni el asignado, para que la restricción no se pueda
 saltear conociendo el ID aunque no aparezca en el listado. Antes de esta fase estos
 cuatro endpoints no verificaban ownership en absoluto.
+
+## Módulo Almacén — rutas, recepción, FIFO, sub-inventario y liquidación (Fases 111-112)
+
+Rol `almacenista` (`users.role`, junto a `admin`/`operator`): arma rutas de
+entrega y opera el almacén. Middleware `warehouseOnly` (`admin` o
+`almacenista`) gatea las mutaciones; lecturas quedan abiertas a cualquier
+usuario autenticado, con el ownership resuelto dentro de cada controller
+(`operator` solo ve/opera sus propias rutas — mismo criterio que
+`canAccessPreOrder()`).
+
+**Rutas de entrega (Fase 111) — `routes`/`route_stops`/`route_items`.** Una
+ruta agrupa un repartidor, una fecha y paradas ordenadas (`BATCH` un pedido ya
+facturado, `PRE_ORDER` una pre-orden confirmada, o `CUSTOMER` una visita
+suelta). `route_items` es el manifiesto de carga del camión completo (no por
+parada) — lo arma el almacenista escaneando en la app Android
+(`WarehouseRouteDetailActivity`). Transiciones de estado forward-only
+(`PLANNED → IN_PROGRESS → COMPLETED`, `CANCELLED` terminal alcanzable desde
+cualquiera de los dos primeros); `maybeAutoCloseRoute` cierra sola la ruta
+(`COMPLETED` si hubo ≥1 entrega, `CANCELLED` si se saltearon todas) cuando ya
+no queda ninguna parada `PENDING`.
+
+**Recepción y FIFO (Fase 112) — `warehouses`/`product_lots`/`route_item_lots`.**
+Recibir mercadería (`POST /api/warehouse/receipts`) crea un `product_lots` por
+cada línea escaneada (código de barras + cantidad + fecha de expiración
+opcional) — cada escaneo es su propio lote, sin agrupar por producto/fecha,
+para no complicar el merge de dos recepciones separadas del mismo producto.
+Al cargar una ruta (`addRouteItem`), `computeFifoAllocation()` elige el/los
+lote(s) — orden `expiration_date ASC` (los lotes sin fecha quedan al final,
+no bloquean perecederos) y `received_at ASC` como desempate — y puede partir
+la cantidad entre varios lotes si el primero no alcanza. **Es sugerencia, no
+regla dura**: el almacenista puede pisarla a mano pasando `lot_id` en el
+body (`route_item_lots.used_suggested_lot = 0`), la app Android se lo ofrece
+tras mostrar la sugerencia. `removeRouteItem` revierte recorriendo
+`route_item_lots` de esa línea y restaurando `remaining_qty` en cada lote.
+
+**Sub-inventario y liquidación diaria (Fase 112) — `inventory_movements`/
+`daily_settlements`/`settlement_lines`.** Decisión de diseño central: **se
+difiere solo el push a QBO, no el registro local.** Cada movimiento
+(`RECEIPT`, `ROUTE_LOAD`, `RETURN`, `DAMAGE`) escribe de inmediato en
+`product_lots`/`products.stock` — sigue siendo la fuente de verdad local todo
+el día, igual que antes de esta fase — pero ya **no** dispara
+`updateItemQtyOnHand` al instante (ese código, `syncStockToQbo` en
+`routeController.ts`, se eliminó). El movimiento queda con `settlement_id
+NULL` (pendiente) hasta que la liquidación del día lo agrupa. Confirmar una
+liquidación (`POST /api/warehouse/settlements/:id/confirm`) es barato de
+razonar porque `updateItemQtyOnHand` ya trabaja con `QtyOnHand` **absoluto**,
+no delta: como `products.stock` local ya está siempre al día, liquidar es
+simplemente "por cada producto con movimientos pendientes, empujar el stock
+actual una sola vez" — no hace falta sumar deltas a mano.
+`confirmSettlement` recalcula fresco contra lo pendiente en el momento de
+confirmar (no contra lo que haya guardado el último preview, que puede haber
+quedado desactualizado) y no bloquea si el settlement ya estaba `CONFIRMED`
+— volver a confirmar reintenta las líneas que hayan fallado la sincronización
+sin perder lo ya logrado.
+
+**Revisión de devoluciones y condición del producto (Fase 112) —
+`route_returns`.** Solo con la ruta `COMPLETED`. `GOOD` restituye
+`remaining_qty` a los lotes que **esa ruta** usó para ese producto (recorre
+`route_item_lots`, el más recientemente cargado primero — no hay forma de
+saber de qué caja física vino lo que regresó) y revierte el descuento de
+`products.stock` de la carga original. `DAMAGED`/`EXPIRED` **no** revierte
+nada: el `ROUTE_LOAD` original ya restó esa cantidad al cargarla al camión, y
+sumar otro movimiento acá duplicaría el descuento — la condición del producto
+en sí (bueno/dañado/vencido) ya queda capturada en `condition_status`, sin
+necesitar tocar el ledger de nuevo. El almacén audita lo que regresa
+físicamente, no re-valida lo que se vendió (eso ya está en `orders`) —
+`GET /api/routes/:id/returns/expected` da la referencia (cargado − vendido −
+ya revisado) pero no bloquea si el conteo real no coincide.
+
+**Alcance de la Fase 112: backend + Android, sin Dashboard.** Mismo patrón
+que la Fase 111 pero al revés ("primero Android, después Dashboard/webapp") —
+a pedido explícito del usuario. Las pantallas nuevas en Android
+(`ReceivingActivity`, `RouteReturnsActivity`, `SettlementActivity`,
+`InventoryMovementsActivity`) son deliberadamente simples (listas y
+formularios, sin gráficos/reportes); `SettlementActivity` en particular es la
+primera candidata a moverse/duplicarse al Dashboard cuando se aborde esa
+fase, ya que es una tarea más de oficina que de piso de almacén.
 
 ## Notas de diseño
 

@@ -12,6 +12,9 @@ import {
   addRouteItem,
   removeRouteItem,
   listAvailable,
+  getExpectedReturns,
+  createReturns,
+  listReturns,
 } from '../controllers/routeController.ts';
 import { auth } from '../middleware/auth.ts';
 import { warehouseOnly } from '../middleware/warehouseOnly.ts';
@@ -35,5 +38,8 @@ router.delete('/:id/stops/:stopId',   auth, warehouseOnly, removeStop);
 router.put('/:id/stops/:stopId/status', auth, updateStopStatus);
 router.post('/:id/items',             auth, warehouseOnly, addRouteItem);
 router.delete('/:id/items/:itemId',   auth, warehouseOnly, removeRouteItem);
+router.get('/:id/returns/expected',   auth, getExpectedReturns);
+router.post('/:id/returns',           auth, warehouseOnly, createReturns);
+router.get('/:id/returns',            auth, listReturns);
 
 export default router;

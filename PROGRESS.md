@@ -3191,6 +3191,70 @@ del usuario ("primero webapp, luego lo paso a Android").
 
 ---
 
+## Fase 112: Almacén — recepción, FIFO, sub-inventario, liquidación diaria, revisión de devoluciones y condición del producto (backend + Android) 🔄
+
+Rediseña cómo se mueve el inventario físico dentro del almacén, sin tocar el
+flujo de ventas (`createBatchInvoice`, en tiempo real, no cambia). Alcance de
+esta fase: backend + app Android (mismo patrón que la Fase 111 pero al revés
+— "primero Android, después Dashboard/webapp"). El puerto Android del módulo
+de rutas de la Fase 111, marcado ahí como pendiente, en la práctica ya se
+había hecho en el repo de Android (`AndroidStudioProjects/test`, commit
+`56deaf0`) sin quedar documentado — esta fase lo encuentra y construye encima.
+
+**Decisión de diseño clave — liquidación diaria = diferir solo el push a
+QBO, no el registro local.** Cada movimiento (recepción, carga de ruta,
+devolución, daño) sigue escribiendo de inmediato en `product_lots`/
+`products.stock`/`inventory_movements` — es la fuente de verdad local todo el
+día. Lo único que se acumula sin tocar QBO es el `QtyOnHand`; recién se
+empuja **una vez por producto** al confirmar la liquidación
+(`settlement_lines.stock_after` ya es el valor absoluto de `products.stock`
+en ese momento, y `updateItemQtyOnHand` ya trabaja con valor absoluto — no
+hace falta sumar deltas). FIFO es sugerencia con override, no una regla
+dura: el sistema preselecciona el lote más próximo a vencer
+(`computeFifoAllocation`, `warehouseController.ts` — ordena por
+`expiration_date` con los lotes sin fecha al final, y `received_at` como
+desempate), pero el almacenista puede elegir otro lote a mano
+(`used_suggested_lot = 0`).
+
+### Backend (`excellentia/`)
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 112.1 | Tablas nuevas: `warehouses`, `product_lots`, `route_item_lots`, `inventory_movements`, `route_returns`, `daily_settlements`, `settlement_lines` — agregadas a `schema.sql`, `excellentia_schema.sql` y `ensureWarehouseTables()`/`ensureRouteLinkedWarehouseTables()` (auto-creación en runtime, dividida en dos porque `route_item_lots`/`route_returns` tienen FK real a `route_items`/`routes`) | `db/schema.sql`, `excellentia_schema.sql`, `controllers/warehouseController.ts` | ✅ |
+| 112.2 | `routes` gana `warehouse_id` (FK real a `warehouses`, a diferencia de `driver_user_id`/`created_by` que son sueltos) — hoy un solo almacén sembrado ("Almacén Principal"), pero el esquema soporta más | `db/schema.sql`, `excellentia_schema.sql`, `controllers/routeController.ts` | ✅ |
+| 112.3 | **Corrección de drift de la Fase 111**: `excellentia_schema.sql` nunca había recibido `routes`/`route_stops`/`route_items` ni las migraciones de rol/`stop_type` — quedaba desactualizado contra `schema.sql` desde esa fase. Corregido de paso | `excellentia_schema.sql` | ✅ |
+| 112.4 | `computeFifoAllocation`/`applyFifoAllocation`/`restoreLotQuantity` — helpers de asignación/reversión FIFO, reusados por recepción, carga de ruta y devoluciones | `controllers/warehouseController.ts` | ✅ |
+| 112.5 | `POST /api/warehouse/receipts` — recepción: cada línea escaneada (barcode/product_id + cantidad + expiración opcional) crea su propio lote (`product_lots`) agrupado por un `receipt_batch_id` sintético (mismo criterio que `orders.batch_id`) | `controllers/warehouseController.ts`, `routes/warehouseInventory.ts` | ✅ |
+| 112.6 | `GET /api/warehouse/lots`, `GET /api/warehouse/lots/suggest`, `POST /api/warehouse/lots/:id/condition` (marcar un lote `DAMAGED`/`EXPIRED` encontrado en el almacén, da de baja lo que le quedaba disponible) | `controllers/warehouseController.ts`, `routes/warehouseInventory.ts` | ✅ |
+| 112.7 | `addRouteItem`/`removeRouteItem` (`routeController.ts`) reescritos: asignan/revierten contra lotes vía FIFO (o `lot_id` de override), escriben `inventory_movements` (`ROUTE_LOAD`), y **ya no llaman a `syncStockToQbo`** — esa función se eliminó, el push a QBO ahora vive solo en la liquidación | `controllers/routeController.ts` | ✅ |
+| 112.8 | `GET /api/routes/:id/returns/expected` (referencia: cargado − vendido − ya revisado), `POST /api/routes/:id/returns` (solo con ruta `COMPLETED`; `GOOD` restituye a los lotes que la ruta usó, más reciente primero; `DAMAGED`/`EXPIRED` no restituye — el `ROUTE_LOAD` original ya la había restado, sumar otro movimiento duplicaría el descuento), `GET /api/routes/:id/returns` | `controllers/routeController.ts`, `routes/deliveryRoutes.ts` | ✅ |
+| 112.9 | `GET /api/warehouse/movements` — feed del sub-inventario (filtrable por almacén/producto/fecha/`settled`) | `controllers/warehouseController.ts`, `routes/warehouseInventory.ts` | ✅ |
+| 112.10 | `POST /api/warehouse/settlements/preview` (arma/actualiza el borrador del día) y `POST /api/warehouse/settlements/:id/confirm` (recalcula fresco contra lo pendiente AHORA, empuja `QtyOnHand` una vez por producto, reintenta líneas fallidas de una corrida anterior sin bloquear por estar ya `CONFIRMED`) + `GET .../settlements`, `GET .../settlements/:id` | `controllers/warehouseController.ts`, `routes/warehouseInventory.ts` | ✅ |
+| 112.11 | Router montado en `/api/warehouse` | `routes/warehouseInventory.ts`, `index.ts` | ✅ |
+
+### Android (`AndroidStudioProjects/test`)
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 112.12 | DTOs/endpoints nuevos (`WarehouseDto`, `ProductLotDto`, `FifoAllocationDto`, recepción, devoluciones, movimientos, liquidación) + `AddRouteItemRequest.lotId`, `RouteItemDto.minExpirationDate`/`usedOverride`, `RouteItemResponse.lots` — `usedOverride`/`qboSynced` como `Int` (0/1), no `Boolean`, mismo gotcha ya documentado para `qb_active` (Gson revienta si el campo declarado es Boolean y llega un número) | `data/Models.kt`, `data/network/ApiService.kt` | ✅ |
+| 112.13 | `WarehouseRouteDetailActivity` — al escanear, consulta la sugerencia FIFO antes de cargar y la muestra (fecha de expiración, lote); botón "Cambiar lote" abre un picker con los lotes disponibles para el override manual. Botón "Revisar devoluciones", visible solo con la ruta `COMPLETED` | `WarehouseRouteDetailActivity.kt`, `activity_warehouse_route_detail.xml` | ✅ |
+| 112.14 | `ReceivingActivity` — escanear/buscar producto → cantidad → fecha de expiración (opcional) → acumular líneas → confirmar de una vez. Mismo patrón scan-acumular-guardar que `IssueCreditActivity` | `ReceivingActivity.kt`, `activity_receiving.xml` | ✅ |
+| 112.15 | `RouteReturnsActivity` — por producto (desde `.../returns/expected`), cantidad regresada + selector de condición (Buena/Dañada/Vencida) | `RouteReturnsActivity.kt`, `activity_route_returns.xml` | ✅ |
+| 112.16 | `SettlementActivity` — generar/revisar la liquidación del día y confirmarla (push a QBO); pantalla deliberadamente simple, candidata a moverse/duplicarse al Dashboard web más adelante | `SettlementActivity.kt`, `activity_settlement.xml` | ✅ |
+| 112.17 | `InventoryMovementsActivity` — log de solo lectura del sub-inventario, sin gráficos/totales | `InventoryMovementsActivity.kt`, `activity_inventory_movements.xml` | ✅ |
+| 112.18 | Accesos directos (Recepción/Sub-inventario/Liquidación) agregados a `WarehouseActivity`; 4 activities nuevas registradas en el manifest; strings nuevas en `values/` y `values-es/` | `WarehouseActivity.kt`, `activity_warehouse.xml`, `AndroidManifest.xml`, `strings.xml` (ambos idiomas) | ✅ |
+
+### Notas
+
+- Reusa `DataWedgeScanner` (patrón ya establecido por `WarehouseRouteDetailActivity`/`CreatePreOrderActivity`) para el escaneo en `ReceivingActivity` — igual que el resto del módulo Almacén, estas pantallas nuevas quedan **online-only**, sin cola offline (no existe todavía para nada de este módulo).
+- `bun run build` (backend) y `./gradlew assembleDebug` (Android) verificados limpios — sin errores nuevos.
+- **Migración SQL ya corrida a mano por el usuario contra su base** (2026-08-31, mismo criterio que la Fase 111): las 7 tablas nuevas, `routes.warehouse_id` + su FK, y el seed de `warehouses`. Ver sección "Migración — Fase 112" al final de `schema.sql`/`excellentia_schema.sql` para el detalle exacto de lo ejecutado.
+- **No probado end-to-end contra datos reales todavía** — falta ejercitar el flujo completo (recibir con 2 lotes de distinta expiración → cargar una ruta y confirmar que la sugerencia FIFO elige el lote correcto → completar la ruta → revisar devoluciones → generar y confirmar la liquidación → verificar en QBO que `QtyOnHand` quedó con una sola llamada) una vez el usuario corra la migración.
+- Pendiente explícito, fuera de esta fase: pantallas de sub-inventario/liquidación en el Dashboard web (`excellentia-webapp`) — hoy solo existen en Android, a pedido del usuario ("backend + Android primero").
+- Gap de documentación pre-existente detectado (no cerrado en esta fase): el `CLAUDE.md` del repo Android no tiene ninguna sección sobre el módulo Almacén/rutas (Fase 111 se implementó ahí en un solo commit, `56deaf0`, sin dejar nota); esta fase tampoco lo documentó ahí — quedó solo en este `PROGRESS.md` del backend.
+
+---
+
 ## Pendiente / Mejoras futuras
 
 ### Android
@@ -3258,4 +3322,30 @@ del usuario ("primero webapp, luego lo paso a Android").
 
 | Prioridad | Feature | Detalle |
 |---|---|---|
-| Alta | **Módulo de inventario** | Hoy "stock" es solo un contador (`products.stock`) que baja al vender (`createBatch`) y se sincroniza con `QtyOnHand` de QBO — no hay pantalla ni endpoint dedicado a inventario, ni en backend, webapp o Android. Para que sea un módulo real falta: (1) cerrar el gap ya documentado de que `convertPreOrder` no descuenta stock (nota al final de la Fase 87); (2) recepción de mercadería — sumar stock al llegar un pedido de proveedor; hoy solo se edita el campo a mano en el modal de producto de la webapp, sin escaneo ni registro de qué entró y cuándo; (3) conteo físico / reconciliación con motivo registrado, no un pisado silencioso del número; (4) historial de movimientos auditable — mismo patrón que el ledger `credit_transactions` de la Fase 75, pero para stock (hoy un cambio no deja rastro de quién/cuándo/por qué); (5) decidir si los productos Lbs deben trackear peso real en stock o seguir contando solo eventos de venta — `Qty: 1` fijo a QBO es deliberado (Fase 39, para que QBO no descuente libras del inventario), pero eso también significa que el stock de Lbs hoy no representa peso disponible real; (6) alertas de stock bajo con punto de reorden — hoy solo hay color rojo/ámbar visual en la tabla de productos (ver fila "Alerta de stock bajo" en Webapp más arriba), sin notificación ni umbral configurable; (7) daños (`batch_damage`) no parecen ajustar `products.stock`, solo generan crédito en dólares — confirmar y cerrar si corresponde; (8) soporte offline si la recepción/conteo se hace en el TC22 sin señal, mismo patrón `SyncWorker` + Room que ya tienen pedidos/pre-órdenes. Preguntado por el usuario 2026-08-28; sin alcance ni fase asignada todavía |
+| Alta | **Módulo de inventario** | Hoy "stock" es solo un contador (`products.stock`) que baja al vender (`createBatch`) y se sincroniza con `QtyOnHand` de QBO — no hay pantalla ni endpoint dedicado a inventario, ni en backend, webapp o Android. Para que sea un módulo real falta: (1) cerrar el gap ya documentado de que `convertPreOrder` no descuenta stock (nota al final de la Fase 87) — **sigue sin cerrar**; (2) ~~recepción de mercadería~~ — **resuelto en la Fase 112** (`POST /api/warehouse/receipts`, `product_lots`); (3) conteo físico / reconciliación con motivo registrado — **sigue sin cerrar**: `inventory_movements.movement_type` ya tiene el valor `ADJUSTMENT` reservado en el ENUM, pero ningún endpoint lo usa todavía, no hay flujo de "conteo físico" real; (4) ~~historial de movimientos auditable~~ — **resuelto en la Fase 112** (`inventory_movements`, `GET /api/warehouse/movements`, `InventoryMovementsActivity` en Android); (5) Lbs y peso real en stock — la Fase 112 ya soporta cantidades `DECIMAL` en `product_lots`/recepción, así que técnicamente ya se puede recibir por peso, pero la decisión de política (¿debe el stock de Lbs reflejar peso real o seguir siendo solo un contador de eventos de venta, dado que `Qty: 1` fijo a QBO sigue vigente — Fase 39?) sigue sin tomarse; (6) alertas de stock bajo con punto de reorden — **sigue sin cerrar**, ver fila en Webapp más arriba; (7) daños (`batch_damage`) no parecen ajustar `products.stock`, solo generan crédito en dólares — **sigue sin confirmar**, distinto del daño de almacén de la Fase 112 (`route_returns`/`product_lots.status`), que sí ajusta stock; (8) soporte offline — **sigue sin cerrar**, la Fase 112 explícitamente dejó todo el módulo Almacén online-only, mismo criterio que rutas (Fase 111). Preguntado por el usuario 2026-08-28; puntos 2 y 4 cerrados por la Fase 112, el resto sigue abierto |
+
+### Almacén — próxima fase (planeada, sin implementar): rutas directas/consignación/cortesías, transporter damage y créditos
+
+Pedido por el usuario 2026-08-31, justo después de cerrar la Fase 112 (recepción,
+FIFO, sub-inventario, liquidación, devoluciones, condición del producto).
+Todavía **sin alcance ni número de fase asignado** — queda documentado acá para
+no perderlo, con el análisis de qué ya cubre la Fase 112 y qué es
+conceptualmente nuevo, para cuando se planifique en serio.
+
+| Feature (pedido del usuario) | Ya cubierto por la Fase 112 | Qué falta / es nuevo |
+|---|---|---|
+| **Rutas directas / no directas** | Nada — `routes` no distingue tipos hoy, toda ruta sigue el mismo flujo armar→cargar→repartir→completar→revisar devoluciones | Agregar algo como `routes.route_type` y definir con el usuario, antes de tocar schema, qué cambia exactamente entre "directa" y "no directa" en cada uno de: movimiento de producto, inventario, ventas y devoluciones — la descripción del ticket no lo especifica |
+| **Salida y regreso de productos** | Salida (`route_items`/`inventory_movements` `ROUTE_LOAD`) y regreso (`route_returns`) ya existen | Hoy `GET /api/routes/:id/returns/expected` es solo referencia, **no bloquea** si el conteo real no coincide (decisión explícita de la Fase 112). Esto pide una reconciliación formal — probablemente debería bloquear el cierre de la ruta o de la liquidación si enviado ≠ vendido + regresado + dañado + otra condición |
+| **Productos no vendidos** | Ya cubierto en la práctica: `route_returns.condition_status = 'GOOD'` repone `remaining_qty` del lote que la ruta usó | Definir si "no vendido" necesita ser una categoría propia separada de "regresó en buen estado" en general (reportería), o si alcanza con lo que ya hay |
+| **Consignación** | Nada — concepto nuevo | Requiere: relacionar clientes con la ruta/parada de consignación, precios propios (¿distintos del catálogo?), y un estado de inventario intermedio que hoy no existe — "en consignación en el cliente X" (ni en almacén ni vendido) hasta liquidar (parte se vende → factura, parte regresa → stock). `route_items` hoy solo modela "cargado en el camión", no "entregado a un tercero sin vender todavía" |
+| **Cortesías** | Nada — concepto nuevo | Necesita un flag/tipo en la línea de venta o el manifiesto (`orders`/`route_items`, ej. `COURTESY`) que descuente inventario sin generar ingreso — decidir si pasa por QBO con `Amount: 0` o no se factura en absoluto |
+| **Expired / Damaged en el nuevo flujo** | Prácticamente resuelto — `route_returns.condition_status` (`DAMAGED`/`EXPIRED`) y `product_lots.status` ya existen, y ninguno de los dos vuelve a entrar al pool FIFO (`computeFifoAllocation` solo toma lotes `ACTIVE`) | Más que construir, confirmar/pulir con casos reales una vez se pruebe la Fase 112 |
+| **Transporter Damage** | Nada — `route_returns.condition_status` hoy solo tiene `GOOD`/`DAMAGED`/`EXPIRED` | Agregar un 4° valor (ej. `TRANSPORTER_DAMAGE`) para diferenciar "se dañó en tránsito" (salió bueno del almacén) de "ya estaba dañado/vencido" — probablemente amerita reportería/responsabilidad distinta (reclamos al transportista) |
+| **Aplicación de créditos** | El sistema de créditos ya existe (`credit_transactions`, Fases 75/76) pero asume que el daño se detecta **en el momento de la venta** (`computeDamageCredit`) o sin venta asociada (`POST /api/credits/issue`) | `route_returns` hoy no tiene ningún vínculo con `orders`/`credit_transactions` — falta conectar devoluciones Expired/Damaged/Transporter Damage de una ruta directa o consignación con la orden/cliente real, para aplicar el crédito correspondiente y confirmar que el producto no vuelve a estar disponible para reenviarse (esto último ya lo garantiza la Fase 112: el producto dado de baja en `route_returns` no restituye `remaining_qty`) |
+
+**Nota para cuando se planifique:** varias de estas piezas (consignación,
+cortesías, rutas directas) son conceptos que no encajan del todo en el modelo
+actual de `route_items`/`route_stops` (pensado para "cargar el camión" +
+"parada = pedido/pre-orden/cliente"), así que probablemente convenga una
+sesión de diseño propia (como se hizo para la Fase 112) antes de tocar
+schema, en vez de ir agregando columnas sueltas a lo ya existente.

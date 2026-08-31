@@ -1,7 +1,15 @@
 import type { Request, Response } from 'express';
 import pool from '../db/connection.ts';
 import logger from '../services/logger.ts';
-import { updateItemQtyOnHand } from '../services/qbItems.ts';
+import {
+  ensureWarehouseTables,
+  ensureRouteLinkedWarehouseTables,
+  getDefaultWarehouseId,
+  computeFifoAllocation,
+  applyFifoAllocation,
+  restoreLotQuantity,
+  recordMovement,
+} from './warehouseController.ts';
 
 // Orden forward-only: PLANNED -> IN_PROGRESS -> COMPLETED, sin poder retroceder.
 // CANCELLED es terminal — se puede llegar desde PLANNED/IN_PROGRESS (no desde
@@ -18,6 +26,10 @@ function canTransitionStatus(current: string, next: string): boolean {
   return nextRank > currentRank;
 }
 
+// Requiere que warehouses ya exista (ensureWarehouseTables) — se llama antes
+// en cada handler para que la FK de routes.warehouse_id pueda crearse en una
+// base nueva. En una base existente sin la columna, esta CREATE TABLE IF NOT
+// EXISTS no hace nada — hace falta la migración manual (ver schema.sql).
 async function ensureTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS routes (
@@ -25,11 +37,13 @@ async function ensureTables() {
       name            VARCHAR(255) NOT NULL,
       scheduled_date  DATE NOT NULL,
       driver_user_id  INT DEFAULT NULL,
+      warehouse_id    INT DEFAULT NULL,
       status          ENUM('PLANNED','IN_PROGRESS','COMPLETED','CANCELLED') DEFAULT 'PLANNED',
       notes           TEXT DEFAULT NULL,
       created_by      INT DEFAULT NULL,
       created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      FOREIGN KEY (warehouse_id) REFERENCES warehouses(id)
     )
   `);
   await pool.query(`
@@ -64,6 +78,7 @@ async function ensureTables() {
 }
 
 export async function createRoute(req: Request, res: Response): Promise<void> {
+  await ensureWarehouseTables();
   await ensureTables();
   try {
     const { name, scheduled_date, driver_user_id, notes } = req.body;
@@ -85,9 +100,13 @@ export async function createRoute(req: Request, res: Response): Promise<void> {
       }
     }
 
+    // warehouse_id: hoy hay un solo almacén activo, se usa como default si no
+    // se manda uno explícito (Fase 112 — routes queda listo para más de uno).
+    const warehouseId = req.body.warehouse_id ?? await getDefaultWarehouseId();
+
     const [result] = await pool.query(
-      'INSERT INTO routes (name, scheduled_date, driver_user_id, notes, created_by) VALUES (?, ?, ?, ?, ?)',
-      [name, scheduled_date, driver_user_id ?? null, notes ?? null, req.user?.id ?? null]
+      'INSERT INTO routes (name, scheduled_date, driver_user_id, warehouse_id, notes, created_by) VALUES (?, ?, ?, ?, ?, ?)',
+      [name, scheduled_date, driver_user_id ?? null, warehouseId, notes ?? null, req.user?.id ?? null]
     ) as any;
     res.status(201).json({ id: result.insertId, status: 'PLANNED' });
   } catch (err) {
@@ -183,11 +202,21 @@ export async function getRoute(req: Request, res: Response): Promise<void> {
       }
     }
 
+    // min_expiration_date/used_override: resumen de qué lote(s) alimentaron
+    // esta línea (route_item_lots, Fase 112) — para que el detalle de la ruta
+    // muestre la expiración sin que Android tenga que pedir cada lote aparte.
     const [itemRows] = await pool.query(
       `SELECT ri.id, ri.route_id, ri.product_id, ri.barcode, ri.quantity, ri.scanned_by, ri.created_at, ri.updated_at,
-              p.name, p.sku, p.unit
-       FROM route_items ri JOIN products p ON p.id = ri.product_id
-       WHERE ri.route_id = ? ORDER BY ri.created_at`, [id]
+              p.name, p.sku, p.unit,
+              MIN(pl.expiration_date) AS min_expiration_date,
+              MAX(1 - ril.used_suggested_lot) AS used_override
+       FROM route_items ri
+       JOIN products p ON p.id = ri.product_id
+       LEFT JOIN route_item_lots ril ON ril.route_item_id = ri.id
+       LEFT JOIN product_lots pl ON pl.id = ril.lot_id
+       WHERE ri.route_id = ?
+       GROUP BY ri.id, ri.route_id, ri.product_id, ri.barcode, ri.quantity, ri.scanned_by, ri.created_at, ri.updated_at, p.name, p.sku, p.unit
+       ORDER BY ri.created_at`, [id]
     ) as any[];
 
     res.json({ data: { ...route, stops, items: itemRows } });
@@ -510,30 +539,19 @@ async function maybeAutoCloseRoute(routeId: string): Promise<string | null> {
   return newStatus;
 }
 
-// Sincroniza products.stock a QBO QtyOnHand y arma el { qbSynced, qbMessage }
-// que devuelven addRouteItem/removeRouteItem — mismo criterio que
-// updateProduct (productController.ts): el push a QBO nunca hace fallar la
-// operación en MySQL, pero acá sí se reporta el resultado al caller en vez de
-// solo loguearlo.
-async function syncStockToQbo(productId: number, newStock: number): Promise<{ qbSynced: boolean; qbMessage: string | null }> {
-  const [[product]] = await pool.query('SELECT qb_item_id FROM products WHERE id = ?', [productId]) as any[];
-  const qbItemId = product?.qb_item_id;
-  if (!qbItemId) return { qbSynced: false, qbMessage: 'Producto sin vincular a QBO — stock no sincronizado' };
-  try {
-    const result = await updateItemQtyOnHand(qbItemId, newStock);
-    if (result) return { qbSynced: true, qbMessage: null };
-    return { qbSynced: false, qbMessage: 'El ítem no es de tipo Inventory en QBO — stock no sincronizado' };
-  } catch (qbErr) {
-    logger.warn(`No se pudo sincronizar stock a QBO para producto ${productId}:`, qbErr);
-    return { qbSynced: false, qbMessage: 'No se pudo sincronizar el stock a QBO' };
-  }
-}
-
+// Fase 112 — ya no sincroniza QtyOnHand a QBO al instante (antes: syncStockToQbo
+// llamado directo desde acá). El stock local (products.stock/product_lots) se
+// sigue actualizando en el momento — es la fuente de verdad del día — pero el
+// push a QBO se difiere y se agrupa en la liquidación diaria
+// (warehouseController.ts: previewSettlement/confirmSettlement), para no
+// pegarle a QBO una vez por cada escaneo.
 export async function addRouteItem(req: Request, res: Response): Promise<void> {
+  await ensureWarehouseTables();
   await ensureTables();
+  await ensureRouteLinkedWarehouseTables();
   try {
     const { id } = req.params;
-    const { barcode, product_id } = req.body;
+    const { barcode, product_id, lot_id } = req.body;
     const quantity = req.body.quantity === undefined ? 1 : Number(req.body.quantity);
 
     // product_id cubre el ingreso manual (productos sin código de barras) —
@@ -547,7 +565,7 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    const [[routeRow]] = await pool.query('SELECT status FROM routes WHERE id = ?', [id]) as any[];
+    const [[routeRow]] = await pool.query('SELECT status, warehouse_id FROM routes WHERE id = ?', [id]) as any[];
     if (!routeRow) {
       res.status(404).json({ error: 'Ruta no encontrada' });
       return;
@@ -556,6 +574,7 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
       res.status(400).json({ error: 'Ruta cancelada: no se puede modificar' });
       return;
     }
+    const warehouseId = routeRow.warehouse_id ?? await getDefaultWarehouseId();
 
     const [[product]] = product_id
       ? await pool.query('SELECT id, barcode FROM products WHERE id = ?', [product_id]) as any[]
@@ -565,6 +584,37 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
       return;
     }
 
+    // Asignación FIFO: por default el sistema elige el/los lote(s) — puede
+    // partir la cantidad entre varios si el primero no alcanza. lot_id es el
+    // override manual (el almacenista eligió otro lote a mano) — ahí no se
+    // parte entre lotes, tiene que alcanzar con ese solo lote elegido.
+    let allocations: { lot_id: number; qty: number }[];
+    if (lot_id) {
+      const [[lot]] = await pool.query(
+        `SELECT id, remaining_qty FROM product_lots
+         WHERE id = ? AND product_id = ? AND warehouse_id = ? AND status = 'ACTIVE'`,
+        [lot_id, product.id, warehouseId]
+      ) as any[];
+      if (!lot) {
+        res.status(404).json({ error: 'Lote no encontrado o no disponible en este almacén' });
+        return;
+      }
+      if (Number(lot.remaining_qty) < quantity) {
+        res.status(409).json({ error: `El lote elegido solo tiene ${lot.remaining_qty} disponible` });
+        return;
+      }
+      allocations = [{ lot_id: lot.id, qty: quantity }];
+    } else {
+      try {
+        allocations = await computeFifoAllocation(product.id, warehouseId, quantity);
+      } catch (allocErr: any) {
+        res.status(409).json({ error: allocErr.message });
+        return;
+      }
+    }
+
+    await applyFifoAllocation(allocations);
+
     await pool.query(
       `INSERT INTO route_items (route_id, product_id, barcode, quantity, scanned_by)
        VALUES (?, ?, ?, ?, ?)
@@ -573,15 +623,32 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
     );
     await pool.query('UPDATE products SET stock = stock - ? WHERE id = ?', [quantity, product.id]);
 
+    const [[routeItem]] = await pool.query(
+      'SELECT id FROM route_items WHERE route_id = ? AND product_id = ?', [id, product.id]
+    ) as any[];
+    for (const a of allocations) {
+      await pool.query(
+        `INSERT INTO route_item_lots (route_item_id, lot_id, quantity, used_suggested_lot)
+         VALUES (?, ?, ?, ?)`,
+        [routeItem.id, a.lot_id, a.qty, lot_id ? 0 : 1]
+      );
+      await recordMovement({
+        warehouseId, productId: product.id, lotId: a.lot_id, movementType: 'ROUTE_LOAD',
+        quantity: -a.qty, routeId: Number(id), createdBy: req.user?.id ?? null,
+      });
+    }
+
     const [[item]] = await pool.query(
       `SELECT ri.id, ri.route_id, ri.product_id, ri.barcode, ri.quantity, p.name, p.sku, p.unit
        FROM route_items ri JOIN products p ON p.id = ri.product_id
        WHERE ri.route_id = ? AND ri.product_id = ?`, [id, product.id]
     ) as any[];
     const [[{ stock }]] = await pool.query('SELECT stock FROM products WHERE id = ?', [product.id]) as any[];
-    const { qbSynced, qbMessage } = await syncStockToQbo(product.id, stock);
 
-    res.status(201).json({ item, stock, qbSynced, qbMessage });
+    res.status(201).json({
+      item, stock, lots: allocations,
+      qbSynced: false, qbMessage: 'Pendiente de liquidación diaria',
+    });
   } catch (err) {
     logger.error('addRouteItem error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
@@ -589,10 +656,12 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
 }
 
 export async function removeRouteItem(req: Request, res: Response): Promise<void> {
+  await ensureWarehouseTables();
   await ensureTables();
+  await ensureRouteLinkedWarehouseTables();
   try {
     const { id, itemId } = req.params;
-    const [[routeRow]] = await pool.query('SELECT status FROM routes WHERE id = ?', [id]) as any[];
+    const [[routeRow]] = await pool.query('SELECT status, warehouse_id FROM routes WHERE id = ?', [id]) as any[];
     if (!routeRow) {
       res.status(404).json({ error: 'Ruta no encontrada' });
       return;
@@ -601,6 +670,7 @@ export async function removeRouteItem(req: Request, res: Response): Promise<void
       res.status(400).json({ error: 'Ruta cancelada: no se puede modificar' });
       return;
     }
+    const warehouseId = routeRow.warehouse_id ?? await getDefaultWarehouseId();
 
     const [[item]] = await pool.query(
       'SELECT product_id, quantity FROM route_items WHERE id = ? AND route_id = ?', [itemId, id]
@@ -610,13 +680,24 @@ export async function removeRouteItem(req: Request, res: Response): Promise<void
       return;
     }
 
+    const [lotRows] = await pool.query(
+      'SELECT id, lot_id, quantity FROM route_item_lots WHERE route_item_id = ?', [itemId]
+    ) as any[];
+    for (const lr of lotRows as any[]) {
+      await restoreLotQuantity(lr.lot_id, Number(lr.quantity));
+      await recordMovement({
+        warehouseId, productId: item.product_id, lotId: lr.lot_id, movementType: 'ROUTE_LOAD',
+        quantity: Number(lr.quantity), routeId: Number(id), createdBy: req.user?.id ?? null,
+      });
+    }
+    await pool.query('DELETE FROM route_item_lots WHERE route_item_id = ?', [itemId]);
+
     await pool.query('UPDATE products SET stock = stock + ? WHERE id = ?', [item.quantity, item.product_id]);
     await pool.query('DELETE FROM route_items WHERE id = ?', [itemId]);
 
     const [[{ stock }]] = await pool.query('SELECT stock FROM products WHERE id = ?', [item.product_id]) as any[];
-    const { qbSynced, qbMessage } = await syncStockToQbo(item.product_id, stock);
 
-    res.json({ message: 'Ítem eliminado', stock, qbSynced, qbMessage });
+    res.json({ message: 'Ítem eliminado', stock, qbSynced: false, qbMessage: 'Pendiente de liquidación diaria' });
   } catch (err) {
     logger.error('removeRouteItem error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
@@ -666,6 +747,177 @@ export async function listAvailable(req: Request, res: Response): Promise<void> 
     res.json({ orders: orderRows, preOrders: preOrderRows });
   } catch (err) {
     logger.error('listAvailable error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
+// Fase 112 — revisión de devoluciones. Referencia para el almacenista antes de
+// contar físicamente lo que regresó: cargado (route_items) − vendido (orders
+// de los stops BATCH de esta ruta, matcheado por barcode) − ya revisado
+// (route_returns) = lo que debería volver. Es solo informativo, no bloquea
+// createReturns si el conteo real no coincide (el almacén audita lo que
+// regresa, no re-valida lo que se vendió).
+export async function getExpectedReturns(req: Request, res: Response): Promise<void> {
+  await ensureWarehouseTables();
+  await ensureTables();
+  await ensureRouteLinkedWarehouseTables();
+  try {
+    const { id } = req.params;
+    const [[routeRow]] = await pool.query('SELECT id FROM routes WHERE id = ?', [id]) as any[];
+    if (!routeRow) {
+      res.status(404).json({ error: 'Ruta no encontrada' });
+      return;
+    }
+
+    const [loadedRows] = await pool.query(
+      `SELECT ri.product_id, ri.barcode, p.name, p.sku, ri.quantity AS loaded_qty
+       FROM route_items ri JOIN products p ON p.id = ri.product_id
+       WHERE ri.route_id = ?`, [id]
+    ) as any[];
+
+    const [soldRows] = await pool.query(
+      `SELECT o.barcode, SUM(o.quantity) AS sold_qty
+       FROM orders o
+       JOIN route_stops rs ON rs.batch_id = o.batch_id AND rs.stop_type = 'BATCH'
+       WHERE rs.route_id = ? AND o.status != 'CANCELLED'
+       GROUP BY o.barcode`, [id]
+    ) as any[];
+    const soldByBarcode = new Map<string, number>();
+    for (const r of soldRows as any[]) soldByBarcode.set(r.barcode, Number(r.sold_qty) || 0);
+
+    const [returnedRows] = await pool.query(
+      `SELECT product_id, SUM(quantity) AS returned_qty FROM route_returns WHERE route_id = ? GROUP BY product_id`, [id]
+    ) as any[];
+    const returnedByProduct = new Map<number, number>();
+    for (const r of returnedRows as any[]) returnedByProduct.set(r.product_id, Number(r.returned_qty) || 0);
+
+    const data = (loadedRows as any[]).map((row) => {
+      const sold = row.barcode ? (soldByBarcode.get(row.barcode) ?? 0) : 0;
+      const alreadyReturned = returnedByProduct.get(row.product_id) ?? 0;
+      const expected = Math.max(Number(row.loaded_qty) - sold - alreadyReturned, 0);
+      return {
+        product_id: row.product_id, name: row.name, sku: row.sku,
+        loaded_qty: Number(row.loaded_qty), sold_qty: sold,
+        already_returned_qty: alreadyReturned, expected_return_qty: expected,
+      };
+    });
+
+    res.json({ data });
+  } catch (err) {
+    logger.error('getExpectedReturns error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
+// Registra lo que el almacén cuenta físicamente al volver la ruta, con su
+// condición. GOOD reintegra al pool FIFO (route_item_lots de esta ruta, el
+// lote cargado más reciente primero — no se sabe de qué caja física viene lo
+// que regresa) y revierte el descuento de products.stock que hizo la carga.
+// DAMAGED/EXPIRED NO revierte nada: el ROUTE_LOAD original ya restó esa
+// cantidad de products.stock al cargarla al camión, y esa baja queda firme —
+// sumar otro movimiento acá duplicaría el descuento.
+export async function createReturns(req: Request, res: Response): Promise<void> {
+  await ensureWarehouseTables();
+  await ensureTables();
+  await ensureRouteLinkedWarehouseTables();
+  try {
+    const { id } = req.params;
+    const { items } = req.body;
+    if (!Array.isArray(items) || items.length === 0) {
+      res.status(400).json({ error: 'items debe ser un array no vacío' });
+      return;
+    }
+
+    const [[routeRow]] = await pool.query('SELECT status, warehouse_id FROM routes WHERE id = ?', [id]) as any[];
+    if (!routeRow) {
+      res.status(404).json({ error: 'Ruta no encontrada' });
+      return;
+    }
+    if (routeRow.status !== 'COMPLETED') {
+      res.status(400).json({ error: 'Solo se pueden revisar devoluciones de una ruta COMPLETED' });
+      return;
+    }
+    const warehouseId = routeRow.warehouse_id ?? await getDefaultWarehouseId();
+
+    const results: any[] = [];
+    for (const line of items) {
+      const { product_id, notes } = line;
+      const quantity = Number(line.quantity);
+      const conditionStatus = line.condition_status ?? 'GOOD';
+      if (!product_id || !Number.isFinite(quantity) || quantity <= 0) {
+        results.push({ error: 'product_id y quantity (>0) son requeridos', line });
+        continue;
+      }
+      if (!['GOOD', 'DAMAGED', 'EXPIRED'].includes(conditionStatus)) {
+        results.push({ error: "condition_status debe ser 'GOOD', 'DAMAGED' o 'EXPIRED'", line });
+        continue;
+      }
+
+      await pool.query(
+        `INSERT INTO route_returns (route_id, product_id, quantity, condition_status, notes, reviewed_by)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [id, product_id, quantity, conditionStatus, notes ?? null, req.user?.id ?? null]
+      );
+
+      if (conditionStatus === 'GOOD') {
+        const [routeLots] = await pool.query(
+          `SELECT ril.lot_id, ril.quantity
+           FROM route_item_lots ril
+           JOIN route_items ri ON ri.id = ril.route_item_id
+           WHERE ri.route_id = ? AND ri.product_id = ?
+           ORDER BY ril.id DESC`,
+          [id, product_id]
+        ) as any[];
+
+        let remaining = quantity;
+        for (const rl of routeLots as any[]) {
+          if (remaining <= 0) break;
+          const restoreQty = Math.min(Number(rl.quantity), remaining);
+          if (restoreQty <= 0) continue;
+          await restoreLotQuantity(rl.lot_id, restoreQty);
+          await recordMovement({
+            warehouseId, productId: product_id, lotId: rl.lot_id, movementType: 'RETURN',
+            quantity: restoreQty, routeId: Number(id), createdBy: req.user?.id ?? null,
+          });
+          remaining -= restoreQty;
+        }
+        // Si se marca como devuelto más de lo que esta ruta registró haber
+        // cargado de este producto (dato mal ingresado), el excedente igual
+        // entra como movimiento suelto sin lote — no se pierde el registro.
+        if (remaining > 0) {
+          await recordMovement({
+            warehouseId, productId: product_id, lotId: null, movementType: 'RETURN',
+            quantity: remaining, routeId: Number(id), createdBy: req.user?.id ?? null,
+          });
+        }
+        await pool.query('UPDATE products SET stock = stock + ? WHERE id = ?', [quantity, product_id]);
+      }
+      // DAMAGED/EXPIRED: sin cambios en stock/ledger — ver comentario de la función.
+
+      results.push({ product_id, quantity, condition_status: conditionStatus });
+    }
+
+    res.status(201).json({ items: results });
+  } catch (err) {
+    logger.error('createReturns error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
+export async function listReturns(req: Request, res: Response): Promise<void> {
+  await ensureWarehouseTables();
+  await ensureTables();
+  await ensureRouteLinkedWarehouseTables();
+  try {
+    const { id } = req.params;
+    const [rows] = await pool.query(
+      `SELECT rr.*, p.name, p.sku
+       FROM route_returns rr JOIN products p ON p.id = rr.product_id
+       WHERE rr.route_id = ? ORDER BY rr.reviewed_at DESC`, [id]
+    ) as any[];
+    res.json({ data: rows });
+  } catch (err) {
+    logger.error('listReturns error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 }
