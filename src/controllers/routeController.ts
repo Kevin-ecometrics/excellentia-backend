@@ -128,7 +128,7 @@ export async function listRoutes(req: Request, res: Response): Promise<void> {
     const driver_user_id = req.user?.role === 'operator' ? req.user.id : req.query.driver_user_id;
     let query = `
       SELECT r.id, r.name, r.scheduled_date, r.driver_user_id, u.name AS driver_name,
-             r.status, r.notes, r.created_by, r.returns_reviewed_at, r.created_at, r.updated_at,
+             r.status, r.notes, r.created_by, r.returns_reviewed_at, r.returns_reviewed_by, r.created_at, r.updated_at,
              COUNT(rs.id) AS stop_count
       FROM routes r
       LEFT JOIN users u ON u.id = r.driver_user_id
@@ -329,13 +329,17 @@ export async function addStop(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    const [routeRows] = await pool.query('SELECT id, status FROM routes WHERE id = ?', [id]) as any[];
+    const [routeRows] = await pool.query('SELECT id, status, returns_reviewed_at FROM routes WHERE id = ?', [id]) as any[];
     if ((routeRows as any[]).length === 0) {
       res.status(404).json({ error: 'Ruta no encontrada' });
       return;
     }
     if ((routeRows as any[])[0].status === 'CANCELLED') {
       res.status(400).json({ error: 'Ruta cancelada: no se puede modificar' });
+      return;
+    }
+    if ((routeRows as any[])[0].returns_reviewed_at) {
+      res.status(400).json({ error: 'Devoluciones ya revisadas: no se puede modificar esta ruta' });
       return;
     }
 
@@ -422,13 +426,17 @@ export async function reorderStops(req: Request, res: Response): Promise<void> {
       res.status(400).json({ error: 'stop_ids debe ser un array no vacío' });
       return;
     }
-    const [[routeRow]] = await pool.query('SELECT status FROM routes WHERE id = ?', [id]) as any[];
+    const [[routeRow]] = await pool.query('SELECT status, returns_reviewed_at FROM routes WHERE id = ?', [id]) as any[];
     if (!routeRow) {
       res.status(404).json({ error: 'Ruta no encontrada' });
       return;
     }
     if (routeRow.status === 'CANCELLED') {
       res.status(400).json({ error: 'Ruta cancelada: no se puede modificar' });
+      return;
+    }
+    if (routeRow.returns_reviewed_at) {
+      res.status(400).json({ error: 'Devoluciones ya revisadas: no se puede modificar esta ruta' });
       return;
     }
     for (let i = 0; i < stop_ids.length; i++) {
@@ -448,13 +456,17 @@ export async function removeStop(req: Request, res: Response): Promise<void> {
   await ensureTables();
   try {
     const { id, stopId } = req.params;
-    const [[routeRow]] = await pool.query('SELECT status FROM routes WHERE id = ?', [id]) as any[];
+    const [[routeRow]] = await pool.query('SELECT status, returns_reviewed_at FROM routes WHERE id = ?', [id]) as any[];
     if (!routeRow) {
       res.status(404).json({ error: 'Ruta no encontrada' });
       return;
     }
     if (routeRow.status === 'CANCELLED') {
       res.status(400).json({ error: 'Ruta cancelada: no se puede modificar' });
+      return;
+    }
+    if (routeRow.returns_reviewed_at) {
+      res.status(400).json({ error: 'Devoluciones ya revisadas: no se puede modificar esta ruta' });
       return;
     }
     const [result] = await pool.query(
@@ -568,13 +580,17 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    const [[routeRow]] = await pool.query('SELECT status, warehouse_id FROM routes WHERE id = ?', [id]) as any[];
+    const [[routeRow]] = await pool.query('SELECT status, warehouse_id, returns_reviewed_at FROM routes WHERE id = ?', [id]) as any[];
     if (!routeRow) {
       res.status(404).json({ error: 'Ruta no encontrada' });
       return;
     }
     if (routeRow.status === 'CANCELLED') {
       res.status(400).json({ error: 'Ruta cancelada: no se puede modificar' });
+      return;
+    }
+    if (routeRow.returns_reviewed_at) {
+      res.status(400).json({ error: 'Devoluciones ya revisadas: no se puede modificar esta ruta' });
       return;
     }
     const warehouseId = routeRow.warehouse_id ?? await getDefaultWarehouseId();
@@ -668,13 +684,17 @@ export async function removeRouteItem(req: Request, res: Response): Promise<void
   await ensureRouteLinkedWarehouseTables();
   try {
     const { id, itemId } = req.params;
-    const [[routeRow]] = await pool.query('SELECT status, warehouse_id FROM routes WHERE id = ?', [id]) as any[];
+    const [[routeRow]] = await pool.query('SELECT status, warehouse_id, returns_reviewed_at FROM routes WHERE id = ?', [id]) as any[];
     if (!routeRow) {
       res.status(404).json({ error: 'Ruta no encontrada' });
       return;
     }
     if (routeRow.status === 'CANCELLED') {
       res.status(400).json({ error: 'Ruta cancelada: no se puede modificar' });
+      return;
+    }
+    if (routeRow.returns_reviewed_at) {
+      res.status(400).json({ error: 'Devoluciones ya revisadas: no se puede modificar esta ruta' });
       return;
     }
     const warehouseId = routeRow.warehouse_id ?? await getDefaultWarehouseId();
@@ -776,9 +796,18 @@ export async function getExpectedReturns(req: Request, res: Response): Promise<v
       return;
     }
 
+    // scanned_by/created_at ya se graban al cargar (addRouteItem) — como ahí
+    // solo se puede cargar stock de lotes ACTIVE (nunca DAMAGED/EXPIRED, ver
+    // computeFifoAllocation), esa fila YA es la confirmación de que salió en
+    // buen estado. Se expone acá para que la revisión de devoluciones muestre
+    // la línea de base ("salió el X, cargado por Y") junto a lo que se cuenta
+    // ahora — sin agregar ningún paso ni columna nueva.
     const [loadedRows] = await pool.query(
-      `SELECT ri.product_id, ri.barcode, p.name, p.sku, ri.quantity AS loaded_qty
-       FROM route_items ri JOIN products p ON p.id = ri.product_id
+      `SELECT ri.product_id, ri.barcode, p.name, p.sku, ri.quantity AS loaded_qty,
+              ri.created_at AS loaded_at, u.name AS loaded_by_name
+       FROM route_items ri
+       JOIN products p ON p.id = ri.product_id
+       LEFT JOIN users u ON u.id = ri.scanned_by
        WHERE ri.route_id = ?`, [id]
     ) as any[];
 
@@ -812,6 +841,7 @@ export async function getExpectedReturns(req: Request, res: Response): Promise<v
         product_id: row.product_id, name: row.name, sku: row.sku,
         loaded_qty: Number(row.loaded_qty), sold_qty: sold,
         already_returned_qty: alreadyReturned, expected_return_qty: expected,
+        loaded_at: row.loaded_at, loaded_by_name: row.loaded_by_name,
       };
     });
 
@@ -846,7 +876,7 @@ export async function createReturns(req: Request, res: Response): Promise<void> 
       return;
     }
 
-    const [[routeRow]] = await pool.query('SELECT status, warehouse_id FROM routes WHERE id = ?', [id]) as any[];
+    const [[routeRow]] = await pool.query('SELECT status, warehouse_id, returns_reviewed_at FROM routes WHERE id = ?', [id]) as any[];
     if (!routeRow) {
       res.status(404).json({ error: 'Ruta no encontrada' });
       return;
@@ -855,9 +885,26 @@ export async function createReturns(req: Request, res: Response): Promise<void> 
       res.status(400).json({ error: 'Solo se pueden revisar devoluciones de una ruta COMPLETED' });
       return;
     }
+    // Guarda contra doble revisión: reenviar el mismo formulario (doble tap,
+    // reintento de red) volvería a sumar route_returns y a restituir stock de
+    // los productos GOOD por segunda vez. returns_reviewed_at ya es la marca
+    // que usa el resto del sistema para "esta ruta ya se revisó" — se usa acá
+    // también como guarda dura, no solo informativa.
+    if (routeRow.returns_reviewed_at) {
+      res.status(400).json({ error: 'Esta ruta ya fue revisada — no se puede volver a registrar devoluciones' });
+      return;
+    }
     const warehouseId = routeRow.warehouse_id ?? await getDefaultWarehouseId();
 
     const results: any[] = [];
+    // Un mismo producto puede volver parte bueno y parte dañado/vencido — el
+    // almacén ahora manda hasta 3 líneas por producto (una por condición).
+    // Solo GOOD restituye stock/lotes (ver más abajo); si dos líneas GOOD del
+    // mismo producto llegaran en la misma request, cada una recalcularía la
+    // restitución desde cero sobre los mismos route_item_lots y duplicaría el
+    // stock devuelto — se guarda acá aunque la UI de Android nunca debería
+    // mandar eso (a lo sumo una línea GOOD por producto).
+    const seenGoodProductIds = new Set<number>();
     for (const line of items) {
       const { product_id, notes } = line;
       const quantity = Number(line.quantity);
@@ -869,6 +916,21 @@ export async function createReturns(req: Request, res: Response): Promise<void> 
       if (!['GOOD', 'DAMAGED', 'EXPIRED'].includes(conditionStatus)) {
         results.push({ error: "condition_status debe ser 'GOOD', 'DAMAGED' o 'EXPIRED'", line });
         continue;
+      }
+      // Como la salida del almacén ya garantiza buen estado (solo se carga
+      // stock ACTIVE, ver getExpectedReturns), un producto que vuelve
+      // DAMAGED/EXPIRED implica que pasó durante la ruta — la nota es lo que
+      // documenta qué pasó, para auditoría o reclamo al transportista.
+      if (conditionStatus !== 'GOOD' && !notes?.trim()) {
+        results.push({ error: 'notes es requerido cuando condition_status es DAMAGED o EXPIRED', line });
+        continue;
+      }
+      if (conditionStatus === 'GOOD') {
+        if (seenGoodProductIds.has(product_id)) {
+          results.push({ error: 'Ya se registró una línea GOOD para este producto en esta revisión', line });
+          continue;
+        }
+        seenGoodProductIds.add(product_id);
       }
 
       await pool.query(
