@@ -236,6 +236,28 @@ export async function recordMovement(params: {
       params.createdBy ?? null,
     ]
   );
+  await syncProductStockToQbo(params.productId);
+}
+
+// recordMovement() es el único punto de paso de todo cambio de stock del
+// módulo Almacén (recepción, carga/descarga de ruta, devolución, daño,
+// ajuste) — sincronizar QBO acá adentro cubre los 6 call sites sin tocar
+// ninguno. Reemplaza la Liquidación diaria (antes agrupaba todo el día y
+// pedía confirmación manual del admin): a este volumen de uso no hace falta
+// batchear, así que se sincroniza al toque, mismo patrón "silencioso" que ya
+// usa updateProduct (productController.ts) — si QBO falla, no revierte nada
+// local, queda logueado como warning nomás. Si una sola acción genera varias
+// filas de movimiento para el mismo producto (ej. una carga partida entre 2
+// lotes), esto sincroniza QBO más de una vez seguida con el mismo valor
+// final — redundante pero inofensivo (manda el stock actual, no un delta).
+async function syncProductStockToQbo(productId: number): Promise<void> {
+  try {
+    const [[product]] = await pool.query('SELECT stock, qb_item_id FROM products WHERE id = ?', [productId]) as any[];
+    if (!product?.qb_item_id) return;
+    await updateItemQtyOnHand(product.qb_item_id, Number(product.stock) || 0);
+  } catch (err) {
+    logger.warn(`recordMovement: fallo al sincronizar stock a QBO (producto ${productId}):`, err);
+  }
 }
 
 export async function listWarehouses(_req: Request, res: Response): Promise<void> {
@@ -564,7 +586,11 @@ export async function updateLot(req: Request, res: Response): Promise<void> {
     await pool.query(`UPDATE product_lots SET ${updates.join(', ')} WHERE id = ?`, params);
 
     if (deltaQty !== 0) {
-      await pool.query('UPDATE products SET stock = stock + ? WHERE id = ?', [deltaQty, lot.product_id]);
+      // GREATEST(...,0): mismo piso que ya usa cualquier otro camino que resta
+      // stock (venta normal, carga de ruta, setLotCondition) — sin esto, bajar
+      // la cantidad de un lote por más de lo que products.stock realmente
+      // tenía sincronizado podía dejarlo en negativo.
+      await pool.query('UPDATE products SET stock = GREATEST(stock + ?, 0) WHERE id = ?', [deltaQty, lot.product_id]);
       await recordMovement({
         warehouseId: lot.warehouse_id, productId: lot.product_id, lotId: lot.id,
         movementType: 'ADJUSTMENT', quantity: deltaQty, createdBy: req.user?.id ?? null,
@@ -611,197 +637,3 @@ export async function listMovements(req: Request, res: Response): Promise<void> 
   }
 }
 
-async function aggregatePendingMovements(warehouseId: number): Promise<{ product_id: number; net_quantity: number }[]> {
-  const [rows] = await pool.query(
-    `SELECT product_id, SUM(quantity) AS net_quantity
-     FROM inventory_movements WHERE warehouse_id = ? AND settlement_id IS NULL
-     GROUP BY product_id`,
-    [warehouseId]
-  ) as any[];
-  return (rows as any[]).map((r) => ({ product_id: r.product_id, net_quantity: Number(r.net_quantity) || 0 }));
-}
-
-export async function listSettlements(req: Request, res: Response): Promise<void> {
-  await ensureWarehouseTables();
-  try {
-    const { warehouse_id } = req.query;
-    let query = 'SELECT * FROM daily_settlements WHERE 1=1';
-    const params: any[] = [];
-    if (warehouse_id) { query += ' AND warehouse_id = ?'; params.push(warehouse_id); }
-    query += ' ORDER BY settlement_date DESC, id DESC LIMIT 60';
-    const [rows] = await pool.query(query, params) as any[];
-    res.json({ data: rows });
-  } catch (err) {
-    logger.error('listSettlements error:', err);
-    res.status(500).json({ error: 'Error interno del servidor' });
-  }
-}
-
-export async function getSettlement(req: Request, res: Response): Promise<void> {
-  await ensureWarehouseTables();
-  try {
-    const { id } = req.params;
-    const [[settlement]] = await pool.query('SELECT * FROM daily_settlements WHERE id = ?', [id]) as any[];
-    if (!settlement) {
-      res.status(404).json({ error: 'Liquidación no encontrada' });
-      return;
-    }
-    const [lines] = await pool.query(
-      `SELECT sl.*, p.name AS product_name, p.sku
-       FROM settlement_lines sl JOIN products p ON p.id = sl.product_id
-       WHERE sl.settlement_id = ? ORDER BY p.name`,
-      [id]
-    ) as any[];
-    res.json({ data: { ...settlement, lines } });
-  } catch (err) {
-    logger.error('getSettlement error:', err);
-    res.status(500).json({ error: 'Error interno del servidor' });
-  }
-}
-
-// Preview: arma/actualiza el borrador del día agregando todo lo pendiente
-// (settlement_id IS NULL) en inventory_movements — sin importar de qué día
-// sea cada movimiento individual, la liquidación diaria es "todo lo que
-// todavía no se empujó a QBO", no un corte estricto por calendario. Solo
-// recalcula mientras el settlement sigue DRAFT — uno ya CONFIRMED se muestra
-// tal cual quedó, no se vuelve a tocar acá (confirmSettlement si reprocesa).
-export async function previewSettlement(req: Request, res: Response): Promise<void> {
-  await ensureWarehouseTables();
-  try {
-    let warehouseId = req.body.warehouse_id;
-    let date = req.body.date;
-    warehouseId = warehouseId ?? await getDefaultWarehouseId();
-    date = date || new Date().toISOString().slice(0, 10);
-
-    const pending = await aggregatePendingMovements(warehouseId);
-
-    let [[settlement]] = await pool.query(
-      'SELECT * FROM daily_settlements WHERE warehouse_id = ? AND settlement_date = ?', [warehouseId, date]
-    ) as any[];
-    if (!settlement) {
-      const [result] = await pool.query(
-        'INSERT INTO daily_settlements (warehouse_id, settlement_date) VALUES (?, ?)', [warehouseId, date]
-      ) as any;
-      [[settlement]] = await pool.query('SELECT * FROM daily_settlements WHERE id = ?', [result.insertId]) as any[];
-    }
-
-    if (settlement.status === 'DRAFT') {
-      await pool.query('DELETE FROM settlement_lines WHERE settlement_id = ?', [settlement.id]);
-      for (const p of pending) {
-        const [[product]] = await pool.query('SELECT stock FROM products WHERE id = ?', [p.product_id]) as any[];
-        const stockAfter = Number(product?.stock) || 0;
-        const stockBefore = stockAfter - p.net_quantity;
-        await pool.query(
-          `INSERT INTO settlement_lines (settlement_id, product_id, net_quantity, stock_before, stock_after)
-           VALUES (?, ?, ?, ?, ?)`,
-          [settlement.id, p.product_id, p.net_quantity, stockBefore, stockAfter]
-        );
-      }
-    }
-
-    const [lines] = await pool.query(
-      `SELECT sl.*, p.name AS product_name, p.sku
-       FROM settlement_lines sl JOIN products p ON p.id = sl.product_id
-       WHERE sl.settlement_id = ? ORDER BY p.name`,
-      [settlement.id]
-    ) as any[];
-
-    res.json({ data: { ...settlement, lines } });
-  } catch (err) {
-    logger.error('previewSettlement error:', err);
-    res.status(500).json({ error: 'Error interno del servidor' });
-  }
-}
-
-// Confirmar es lo que realmente empuja QtyOnHand a QBO — una sola llamada por
-// producto con movimientos pendientes, sin importar cuántos movimientos
-// individuales se acumularon. Recalcula fresco contra lo pendiente AHORA (no
-// contra lo que haya guardado el último preview, que puede haber quedado
-// desactualizado) y también reintenta cualquier línea previa que haya fallado.
-// No bloquea si ya estaba CONFIRMED — confirmar de nuevo es la forma de
-// reintentar sincronizaciones fallidas sin perder el estado ya logrado.
-export async function confirmSettlement(req: Request, res: Response): Promise<void> {
-  await ensureWarehouseTables();
-  try {
-    const { id } = req.params;
-    const [[settlement]] = await pool.query('SELECT * FROM daily_settlements WHERE id = ?', [id]) as any[];
-    if (!settlement) {
-      res.status(404).json({ error: 'Liquidación no encontrada' });
-      return;
-    }
-
-    const pending = await aggregatePendingMovements(settlement.warehouse_id);
-    const [existingLines] = await pool.query(
-      'SELECT * FROM settlement_lines WHERE settlement_id = ?', [id]
-    ) as any[];
-    const failedLines = (existingLines as any[]).filter((l) => !l.qbo_synced);
-
-    const productIds = new Set<number>([
-      ...pending.map((p) => p.product_id),
-      ...failedLines.map((l) => l.product_id),
-    ]);
-
-    const resultLines: any[] = [];
-    for (const productId of productIds) {
-      const pendingRow = pending.find((p) => p.product_id === productId);
-      const [[product]] = await pool.query('SELECT stock, qb_item_id FROM products WHERE id = ?', [productId]) as any[];
-      const stockAfter = Number(product?.stock) || 0;
-      const netQuantity = pendingRow?.net_quantity ?? 0;
-      const stockBefore = stockAfter - netQuantity;
-
-      let qboSynced = false;
-      let qboError: string | null = null;
-      if (!product?.qb_item_id) {
-        qboSynced = true;
-        qboError = 'Producto sin vincular a QBO — no se sincronizó';
-      } else {
-        try {
-          const result = await updateItemQtyOnHand(product.qb_item_id, stockAfter);
-          if (result) {
-            qboSynced = true;
-          } else {
-            qboSynced = true;
-            qboError = 'El ítem no es de tipo Inventory en QBO — no se sincronizó';
-          }
-        } catch (qbErr: any) {
-          qboSynced = false;
-          qboError = qbErr?.message ?? 'No se pudo sincronizar a QBO';
-          logger.warn(`confirmSettlement: fallo al sincronizar producto ${productId}:`, qbErr);
-        }
-      }
-
-      await pool.query(
-        `INSERT INTO settlement_lines (settlement_id, product_id, net_quantity, stock_before, stock_after, qbo_synced, qbo_error)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE net_quantity = VALUES(net_quantity), stock_before = VALUES(stock_before),
-           stock_after = VALUES(stock_after), qbo_synced = VALUES(qbo_synced), qbo_error = VALUES(qbo_error)`,
-        [id, productId, netQuantity, stockBefore, stockAfter, qboSynced ? 1 : 0, qboError]
-      );
-      resultLines.push({
-        product_id: productId, net_quantity: netQuantity, stock_before: stockBefore,
-        stock_after: stockAfter, qbo_synced: qboSynced, qbo_error: qboError,
-      });
-    }
-
-    // El valor que se sincroniza es siempre el stock ABSOLUTO actual — si una
-    // línea puntual falla, el movimiento igual se marca liquidado porque la
-    // próxima liquidación va a reintentar mandando el stock corriente (no un
-    // delta), así que no hace falta dejarlo "pendiente" para no perder nada.
-    if (pending.length > 0) {
-      await pool.query(
-        'UPDATE inventory_movements SET settlement_id = ? WHERE warehouse_id = ? AND settlement_id IS NULL',
-        [id, settlement.warehouse_id]
-      );
-    }
-
-    await pool.query(
-      `UPDATE daily_settlements SET status = 'CONFIRMED', confirmed_by = ?, confirmed_at = NOW() WHERE id = ?`,
-      [req.user?.id ?? null, id]
-    );
-
-    res.json({ message: 'Liquidación confirmada', lines: resultLines });
-  } catch (err) {
-    logger.error('confirmSettlement error:', err);
-    res.status(500).json({ error: 'Error interno del servidor' });
-  }
-}

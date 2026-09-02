@@ -9,10 +9,6 @@ import {
   setLotCondition,
   updateLot,
   listMovements,
-  listSettlements,
-  getSettlement,
-  previewSettlement,
-  confirmSettlement,
 } from '../controllers/warehouseController.ts';
 import { auth } from '../middleware/auth.ts';
 import { warehouseOnly } from '../middleware/warehouseOnly.ts';
@@ -27,17 +23,11 @@ router.get('/lots/suggest',              auth, warehouseOnly, suggestLots);
 router.get('/lots/available-products',   auth, warehouseOnly, listAvailableProducts);
 // Backfill de apertura: convierte stock pre-existente (sin lote) en lotes
 // reales, para que el FIFO de rutas lo pueda usar — adminOnly, es una
-// operación de una sola vez sobre datos históricos, mismo criterio que
-// Liquidación diaria (no es una tarea diaria del almacenista).
+// operación de una sola vez sobre datos históricos, no una tarea diaria del
+// almacenista.
 router.post('/lots/backfill',            auth, adminOnly,     backfillLots);
 router.post('/lots/:id/condition',       auth, warehouseOnly, setLotCondition);
 router.put('/lots/:id',                  auth, warehouseOnly, updateLot);
 router.get('/movements',                 auth, warehouseOnly, listMovements);
-// Liquidación diaria: a pedido del usuario, es tarea exclusiva del admin
-// desde la webapp — el almacenista ya no la ve ni en Android ni acá.
-router.get('/settlements',               auth, adminOnly,     listSettlements);
-router.get('/settlements/:id',           auth, adminOnly,     getSettlement);
-router.post('/settlements/preview',      auth, adminOnly,     previewSettlement);
-router.post('/settlements/:id/confirm',  auth, adminOnly,     confirmSettlement);
 
 export default router;

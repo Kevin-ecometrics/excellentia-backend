@@ -561,12 +561,11 @@ async function maybeAutoCloseRoute(routeId: string): Promise<string | null> {
   return newStatus;
 }
 
-// Fase 112 — ya no sincroniza QtyOnHand a QBO al instante (antes: syncStockToQbo
-// llamado directo desde acá). El stock local (products.stock/product_lots) se
-// sigue actualizando en el momento — es la fuente de verdad del día — pero el
-// push a QBO se difiere y se agrupa en la liquidación diaria
-// (warehouseController.ts: previewSettlement/confirmSettlement), para no
-// pegarle a QBO una vez por cada escaneo.
+// El stock local (products.stock/product_lots) se actualiza en el momento —
+// es la fuente de verdad del día — y recordMovement() (warehouseController.ts)
+// sincroniza QtyOnHand a QBO al toque, sin ningún paso manual de por medio
+// (se eliminó la Liquidación diaria que agrupaba esto — a pedido del usuario,
+// no hacía falta batchear al volumen de uso real).
 export async function addRouteItem(req: Request, res: Response): Promise<void> {
   await ensureWarehouseTables();
   await ensureTables();
@@ -701,7 +700,7 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
 
     res.status(201).json({
       item, stock, lots: allocations,
-      qbSynced: false, qbMessage: 'Pendiente de liquidación diaria',
+      qbSynced: true,
     });
   } catch (err) {
     logger.error('addRouteItem error:', err);
@@ -764,7 +763,7 @@ export async function removeRouteItem(req: Request, res: Response): Promise<void
 
     const [[{ stock }]] = await pool.query('SELECT stock FROM products WHERE id = ?', [item.product_id]) as any[];
 
-    res.json({ message: 'Ítem eliminado', stock, qbSynced: false, qbMessage: 'Pendiente de liquidación diaria' });
+    res.json({ message: 'Ítem eliminado', stock, qbSynced: true });
   } catch (err) {
     logger.error('removeRouteItem error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });

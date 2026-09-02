@@ -3877,6 +3877,120 @@ tocar la base a mano.
 `bun run build` verificado limpio (dos errores preexistentes de `tsc` en
 `decryptToken()`, sin relación, ya estaban antes de esta sesión).
 
+---
+
+## Fix (2026-09-02): botón "Retry" en `/orders` no refrescaba la UI sola
+
+Reportado por el usuario: el botón de reintentar el envío a QBO de un batch
+funcionaba (confirmado del lado del backend), pero la fila no se actualizaba
+en pantalla — había que apretar F5 para ver el cambio de estado.
+
+**Causa raíz:** `app/orders/page.tsx` es un componente cliente (`'use client'`)
+que trae las órdenes en un `useEffect` con `[]` de dependencias — no es data
+de servidor. Los handlers de reintentar/reconciliar/aprobar, y el botón
+manual "Refresh", llamaban a `router.refresh()` (`next/navigation`), que
+**solo** vuelve a ejecutar componentes/data de servidor — es un no-op sobre
+estado traído del lado del cliente. El backend confirmaba bien, pero nada
+disparaba de nuevo el fetch.
+
+**Fix:** se extrajo la lógica de fetch a una función `fetchOrders()`
+reusable en `page.tsx`, pasada hacia `OrdersClient` como prop `onRefresh`.
+Las 4 llamadas a `router.refresh()` en `OrdersClient.tsx` (reintentar,
+reconciliar, aprobar, y el botón "Refresh") se reemplazaron por `onRefresh()`.
+Se sacó el import de `useRouter`, que quedó sin otro uso.
+
+`./node_modules/.bin/tsc --noEmit` verificado limpio.
+
+---
+
+## Feature (2026-09-02): Fase 114 — revisión de devoluciones 2.0, Sub-inventario en la webapp, backfill, carga por stock general, "Devolver" y eliminación de Liquidación diaria
+
+Serie larga de pedidos del usuario sobre el módulo Almacén ya construido en
+las Fases 111-112, todos en la misma sesión y encadenados — cada mejora
+exponía el siguiente hueco. Toca las tres partes: backend, Android y webapp.
+
+**1. Bloqueo real de ruta con devoluciones revisadas.** Antes solo
+`CANCELLED` bloqueaba `addStop`/`removeStop`/`reorderStops`/`addRouteItem`/
+`removeRouteItem` — una ruta ya revisada seguía editable por API aunque la
+UI no ofreciera el botón. Los cinco ahora rechazan (`400`) si
+`returns_reviewed_at` está seteado. Android: badge "Revisado"/"Falta
+revisar" en la lista de rutas, banner + botones deshabilitados en el
+detalle, y `onResume()` ahora refresca (antes volver de revisar devoluciones
+dejaba la pantalla con el estado viejo).
+
+**2. Sub-inventario Android rediseñado.** `InventoryMovementsActivity` pasó
+de una lista plana a dos pestañas — **Disponible** (stock agrupado por
+producto, con vencimientos, único lugar donde vive "Editar" un lote) e
+**Historial** (badge de color por tipo de movimiento, filtro por fecha/tipo,
+agrupado por día, badge "Disponible" cruzado contra los lotes vivos,
+alerta de vencimiento ≤7 días, referencia a la ruta).
+
+**3. Revisión de devoluciones — condición por línea.** Antes: una cantidad +
+una condición por producto para toda la ruta (no se podía decir "volvieron
+5, 3 buenas y 2 dañadas"). Ahora cada producto tiene 3 campos — Bueno /
+Dañado / Vencido — con nota obligatoria si hay dañado o vencido (validado en
+cliente y en `createReturns`). `createReturns` suma dos guardas nuevas: sin
+doble línea `GOOD` del mismo producto (duplicaría la restitución de stock a
+los lotes) y sin volver a revisar una ruta ya revisada. Se agregó también la
+**confirmación de salida** sin ningún paso ni columna nueva —
+`route_items.scanned_by`/`created_at` ya probaban que un producto salió en
+buen estado (solo se puede cargar stock `ACTIVE`); `getExpectedReturns` y
+`getRoute` ahora exponen `loaded_at`/`loaded_by_name`, mostrado como "Salió
+el... cargado por... — confirmado en buen estado" en Android y en la webapp.
+
+**4. Sub-inventario nuevo en la webapp (`/warehouse/inventory`).** La webapp
+no tenía ningún equivalente — un admin no podía ver stock ni movimientos sin
+abrir la app. Mismas dos pestañas que Android, mismos endpoints ya
+existentes (`GET /api/warehouse/lots`, `GET /api/warehouse/movements`), sin
+backend nuevo. Nuevo token de color `--ec-info`/`--ec-info-bg` en
+`globals.css` para el badge de `ROUTE_LOAD`.
+
+**5. Backfill de stock sin lote.** `POST /api/warehouse/lots/backfill`
+(admin-only, dry-run/`apply=true` como `migrateSkuNomenclature`) — para
+stock real que nunca pasó por Recepción y por eso no se puede cargar a una
+ruta (el FIFO solo ve `product_lots`). Crea un lote de apertura por la
+diferencia entre `products.stock` y lo ya cubierto por lotes, **sin** tocar
+`products.stock` ni generar un movimiento (no fue un movimiento físico
+real). Botón admin-only en Disponible, webapp.
+
+**6. Cargar a una ruta directo del stock general.** Alternativa al backfill
+para el día a día: `addRouteItem` acepta `source: 'STOCK'` (default `'LOT'`,
+sin romper nada existente) — salta el FIFO, valida que `products.stock`
+alcance, descuenta directo. Android: checkbox "Usar stock general (tengo N)"
+al escanear/ingresar un producto para cargar.
+
+**7. "Devolver" un lote sin usar.** Botón nuevo junto a "Editar" (Android,
+pestaña Disponible) — reusa `updateLot` sin backend nuevo, mandando
+`quantity = received_qty - remaining_qty` (nunca `0` a secas) para devolver
+solo lo que sigue en el almacén sin pisar lo ya cargado a una ruta.
+
+**Fix de paso:** `updateLot` restaba de `products.stock` sin el piso
+`GREATEST(...,0)` que sí tiene cualquier otro camino que resta stock —
+bajar la cantidad de un lote por más de lo sincronizado podía dejarlo
+negativo (se vio en datos de prueba). Corregido.
+
+**8. Eliminación completa de la Liquidación diaria.** El usuario decidió
+sacarla — con todo lo de arriba ya dando visibilidad completa, el paso
+manual de "confirmar" para agrupar el push a QBO por día dejó de tener
+sentido; la razón original (cuidar el rate limit de QBO) no es un problema
+real a este volumen de uso. Reemplazo: `recordMovement()` — el único punto
+de paso de todo cambio de stock del módulo Almacén (recepción, carga/baja
+de ruta en sus dos orígenes, devolución, daño, ajuste) — ahora sincroniza
+`QtyOnHand` a QBO al toque, mismo patrón silencioso que ya usa
+`updateProduct`. Se borraron `previewSettlement`/`confirmSettlement`/
+`listSettlements`/`getSettlement`/`aggregatePendingMovements` + sus 4 rutas,
+`/warehouse/settlement` entero en la webapp, el botón "Liquidación", y el
+badge Draft/Confirmado del historial (Android y webapp). **Sin tocar el
+schema** — `daily_settlements`/`settlement_lines` quedan definidas sin uso,
+mismo criterio de nunca dropear tablas del resto del proyecto.
+
+`./node_modules/.bin/tsc --noEmit` verificado limpio (backend: mismos 27
+errores preexistentes sin relación; webapp: 0) y `./gradlew assembleDebug`
+verificado limpio en Android. **Pendiente de deploy en las tres partes** al
+cierre de esta sesión — nada de esto llegó todavía a
+`app.excellentiafoods.com`, a la webapp de producción, ni a un APK nuevo
+para los TC22.
+
 ## Pendiente / Mejoras futuras
 
 ### Android
@@ -3957,7 +4071,7 @@ conceptualmente nuevo, para cuando se planifique en serio.
 | Feature (pedido del usuario) | Ya cubierto por la Fase 112 | Qué falta / es nuevo |
 |---|---|---|
 | **Rutas directas / no directas** | Nada — `routes` no distingue tipos hoy, toda ruta sigue el mismo flujo armar→cargar→repartir→completar→revisar devoluciones | Agregar algo como `routes.route_type` y definir con el usuario, antes de tocar schema, qué cambia exactamente entre "directa" y "no directa" en cada uno de: movimiento de producto, inventario, ventas y devoluciones — la descripción del ticket no lo especifica |
-| **Salida y regreso de productos** | Salida (`route_items`/`inventory_movements` `ROUTE_LOAD`) y regreso (`route_returns`) ya existen | Hoy `GET /api/routes/:id/returns/expected` es solo referencia, **no bloquea** si el conteo real no coincide (decisión explícita de la Fase 112). Esto pide una reconciliación formal — probablemente debería bloquear el cierre de la ruta o de la liquidación si enviado ≠ vendido + regresado + dañado + otra condición |
+| **Salida y regreso de productos** | Salida (`route_items`/`inventory_movements` `ROUTE_LOAD`) y regreso (`route_returns`) ya existen | Hoy `GET /api/routes/:id/returns/expected` es solo referencia, **no bloquea** si el conteo real no coincide (decisión explícita de la Fase 112, se mantuvo en la Fase 114). Esto pide una reconciliación formal — probablemente debería bloquear el cierre de la ruta si enviado ≠ vendido + regresado + dañado + otra condición (la Liquidación diaria que existía como otro posible punto de bloqueo se eliminó en la Fase 114 — QBO se sincroniza al toque, ya no hay un paso de cierre aparte) |
 | **Productos no vendidos** | Ya cubierto en la práctica: `route_returns.condition_status = 'GOOD'` repone `remaining_qty` del lote que la ruta usó | Definir si "no vendido" necesita ser una categoría propia separada de "regresó en buen estado" en general (reportería), o si alcanza con lo que ya hay |
 | **Consignación** | Nada — concepto nuevo | Requiere: relacionar clientes con la ruta/parada de consignación, precios propios (¿distintos del catálogo?), y un estado de inventario intermedio que hoy no existe — "en consignación en el cliente X" (ni en almacén ni vendido) hasta liquidar (parte se vende → factura, parte regresa → stock). `route_items` hoy solo modela "cargado en el camión", no "entregado a un tercero sin vender todavía" |
 | **Cortesías** | Nada — concepto nuevo | Necesita un flag/tipo en la línea de venta o el manifiesto (`orders`/`route_items`, ej. `COURTESY`) que descuente inventario sin generar ingreso — decidir si pasa por QBO con `Amount: 0` o no se factura en absoluto |
