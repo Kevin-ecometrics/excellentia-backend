@@ -3250,10 +3250,632 @@ desempate), pero el almacenista puede elegir otro lote a mano
 - `bun run build` (backend) y `./gradlew assembleDebug` (Android) verificados limpios — sin errores nuevos.
 - **Migración SQL ya corrida a mano por el usuario contra su base** (2026-08-31, mismo criterio que la Fase 111): las 7 tablas nuevas, `routes.warehouse_id` + su FK, y el seed de `warehouses`. Ver sección "Migración — Fase 112" al final de `schema.sql`/`excellentia_schema.sql` para el detalle exacto de lo ejecutado.
 - **No probado end-to-end contra datos reales todavía** — falta ejercitar el flujo completo (recibir con 2 lotes de distinta expiración → cargar una ruta y confirmar que la sugerencia FIFO elige el lote correcto → completar la ruta → revisar devoluciones → generar y confirmar la liquidación → verificar en QBO que `QtyOnHand` quedó con una sola llamada) una vez el usuario corra la migración.
-- Pendiente explícito, fuera de esta fase: pantallas de sub-inventario/liquidación en el Dashboard web (`excellentia-webapp`) — hoy solo existen en Android, a pedido del usuario ("backend + Android primero").
+- Pendiente explícito, fuera de esta fase: pantallas de sub-inventario/liquidación en el Dashboard web (`excellentia-webapp`) — hoy solo existen en Android, a pedido del usuario ("backend + Android primero"). **Actualización 2026-08-31, mismo día:** Liquidación terminó moviéndose al Dashboard igual — ver más abajo "Rediseño (2026-08-31): Liquidación diaria pasa de Android/almacenista a webapp/admin". Sub-inventario se queda en Android sin cambios.
 - Gap de documentación pre-existente detectado (no cerrado en esta fase): el `CLAUDE.md` del repo Android no tiene ninguna sección sobre el módulo Almacén/rutas (Fase 111 se implementó ahí en un solo commit, `56deaf0`, sin dejar nota); esta fase tampoco lo documentó ahí — quedó solo en este `PROGRESS.md` del backend.
 
 ---
+
+## Fix (2026-08-31): botones invisibles en Android — `OutlinedButton` sobre fondo del mismo color
+
+Detectado por el usuario en dos rondas separadas, mismo bug de raíz cada vez.
+Las pantallas nuevas del módulo Almacén usan `android:background="@color/background"`
+en la raíz del layout, que resuelve a `ex_green` (`#023334`, un verde casi
+negro) — y ese es el **mismo valor** que `colorPrimary` del tema
+(`values/themes.xml`). `Widget.MaterialComponents.Button.OutlinedButton` usa
+`colorPrimary` por default para el texto y el borde — texto y fondo quedaban
+con el mismo color exacto, no solo bajo contraste: invisible de verdad.
+
+- **Ronda 1:** los 3 botones de acceso rápido nuevos en `WarehouseActivity`
+  (Recepción/Sub-inventario/Liquidación) y `btnDateFilter` (este último
+  detectado pero no corregido en el momento, quedó pendiente).
+- **Ronda 2:** `btnDateFilter` (ahora sí) y `btnGenerate` ("Generar
+  liquidación de hoy", `SettlementActivity` — esa pantalla se eliminó de
+  Android más tarde el mismo día, ver el rediseño de Liquidación más abajo,
+  así que este fix puntual quedó sin efecto práctico, pero el patrón
+  aplicado sigue vigente en los botones que sí quedaron).
+
+**Fix:** `android:textColor="@color/white"` + `app:strokeColor="@color/white"`
++ `app:rippleColor="@color/ex_green_tint"` explícitos en cada
+`OutlinedButton` que se apoya directo sobre ese fondo — mismo criterio que
+ya usaba `btnNewRoute` (toolbar) para resolver el mismo problema en la Fase
+111. Los textos secundarios (hints, "vacío") en gris oscuro (`text_secondary`/
+`text_primary`) **no** se tocaron — tienen contraste real (colores
+distintos, no idénticos) y coinciden con un patrón ya usado en pantallas
+pre-existentes (ej. `tvEmpty` en `WarehouseActivity`), así que no era el
+mismo bug.
+
+`./gradlew assembleDebug` verificado limpio después de cada ronda.
+
+---
+
+## Fix (2026-08-31): condición de carrera en la numeración de facturas (`invoice_counter`)
+
+Detectado en conversación con el usuario a raíz de una pregunta sobre qué pasa
+si dos ventas se generan casi al mismo tiempo — no es parte de la Fase 112,
+es un bug pre-existente en el flujo de facturación normal (`createOrder`/
+`createBatch`/`retryBatchSync` en `orderController.ts`, `convertPreOrder` en
+`preOrderController.ts`, `processPendingOrders` en `syncEngine.ts`).
+
+Los 5 lugares leían `company_settings.invoice_counter`, llamaban a QBO (HTTP,
+no instantáneo) y recién después incrementaban el contador — sin que leer +
+incrementar fuera una sola operación atómica. Dos ventas casi simultáneas
+podían leer el mismo número antes de que cualquiera de las dos llegara a
+incrementarlo; QBO rechaza el segundo intento por `DocNumber` duplicado, esa
+orden quedaba `PENDING`/`FAILED` para reintentar — no se llegaban a crear dos
+facturas con el mismo número, pero era un fallo evitable en un dato sensible
+(numeración fiscal).
+
+**Fix:** nuevo `src/services/invoiceCounter.ts` (`withInvoiceNumber`) que
+serializa lectura + llamada a QBO + incremento con un *named lock* de MySQL
+(`GET_LOCK`/`RELEASE_LOCK`, no un `SELECT ... FOR UPDATE` — evita mantener
+una fila trabada durante toda la llamada externa). Los 5 call sites se
+reescribieron para usarlo. De paso se corrigió un segundo bug relacionado en
+`createBatch`: la respuesta HTTP releía `invoice_counter` y restaba 1 para
+reportar `invoiceNumber`, lo que bajo la misma concurrencia podía devolver el
+número de **otra** venta — ahora usa directamente el número ya reservado
+para ese batch. Detalle completo en `CLAUDE.md` → "invoice_counter —
+numeración de facturas QBO" → "Fix (2026-08-31)".
+
+`bun run build` verificado limpio. **No introduce cambios de schema ni
+requiere migración.** Archivos tocados: `src/services/invoiceCounter.ts`
+(nuevo), `src/controllers/orderController.ts`, `src/controllers/preOrderController.ts`,
+`src/services/syncEngine.ts`.
+
+**Bug relacionado, encontrado en el mismo repaso y corregido a pedido del
+usuario el mismo día:** en `createBatch` (`orderController.ts`), el bloque
+`catch (syncErr)` que arma la respuesta cuando falla el sync a QBO
+referenciaba `creditApplied`, pero esa variable se declaraba con `let`
+**dentro** del bloque `try` que ese mismo `catch` atrapa — en JS/TS, un `let`
+de un `try` no es visible en su `catch` (son bloques hermanos, no anidados).
+`tsc --noEmit` lo marcaba como error (`TS18004`). En la práctica, cada vez
+que la sincronización a QBO de un batch fallaba (red, QBO caído, cliente
+inválido, etc. — un caso rutinario, no raro), ese `catch` tiraba su propio
+`ReferenceError` al intentar construir el JSON de respuesta, que terminaba
+cayendo en el `catch` externo de la función y devolviendo `500 Error interno
+del servidor` en vez del `201` con la orden en `PENDING` que la lógica
+pretendía dar. La orden sí quedaba bien guardada en MySQL (el insert ya
+pasa antes de este bloque) — era solo la respuesta HTTP la que salía mal, lo
+cual podía confundir a la app Android (ve "error de servidor" en vez de
+"guardado, pendiente de sync"). Pre-existente, no lo causó esta fase ni el
+fix de arriba. **Fix:** se movió `let creditApplied = 0;` de adentro del
+`try` a justo antes, así queda en el scope que envuelve a ambos (`try` y
+`catch`). `tsc --noEmit` y `bun run build` verificados limpios después del
+cambio — el error `TS18004` en `orderController.ts` ya no aparece.
+
+---
+
+## Feature (2026-08-31): editar una recepción desde el sub-inventario (Fase 112)
+
+Pedido por el usuario al probar Recepción — una vez guardada, no había forma
+de corregir un error de tipeo (cantidad o fecha de expiración) sin editar la
+base a mano.
+
+**Backend:**
+- `updateLot` (`warehouseController.ts`), `PUT /api/warehouse/lots/:id`
+  (`warehouseOnly`), body `{ quantity?, expiration_date? }`. Solo permite
+  editar mientras el lote sigue `ACTIVE` (si ya se dio de baja por
+  daño/vencimiento, rechaza con 400). Si se baja la cantidad, no deja bajar
+  de lo que ya se asignó a una ruta (`received_qty - remaining_qty`, 409 si
+  se intenta). El delta de cantidad se aplica al instante a `products.stock`
+  y queda registrado como un movimiento `ADJUSTMENT` (pendiente de liquidar,
+  igual que cualquier otro) — usa por primera vez ese valor del ENUM
+  `movement_type`, reservado desde el diseño original de la Fase 112 pero sin
+  ningún endpoint que lo generara hasta ahora. El movimiento `RECEIPT`
+  original **no se toca ni se reclasifica** — queda como registro histórico
+  de auditoría; la corrección es un movimiento aparte.
+- `listMovements` ahora hace `LEFT JOIN product_lots` y expone
+  `lot_expiration_date`/`lot_status`/`lot_received_qty` en cada fila — así el
+  cliente puede ofrecer "Editar" y prellenar el diálogo sin una consulta
+  aparte por cada movimiento.
+
+**Android:**
+- `InventoryMovementsActivity` — las filas `RECEIPT` cuyo lote sigue `ACTIVE`
+  muestran un botón de lápiz que abre un diálogo (cantidad + fecha de
+  expiración) y llama al endpoint nuevo; la lista se refresca al guardar.
+- `UpdateLotRequest` (Models.kt) + `updateLot()` (ApiService.kt).
+
+`bun run build` y `./gradlew assembleDebug` verificados limpios. No requiere
+migración — usa tablas/columnas ya existentes desde la Fase 112.
+
+**Fuera de alcance, a propósito:** corregir el *producto* de una recepción
+mal escaneada (no solo cantidad/expiración) — se consideró un caso más raro
+y más complejo (implicaría mover stock entre dos productos distintos); si
+pasa, la vía es marcar el lote mal cargado como dañado/vencido
+(`setLotCondition`) y recibir de nuevo correctamente.
+
+---
+
+## Feature (2026-08-31): reemplazar el 409 crudo al cargar una ruta por un modal + auto-reintento
+
+Detectado por el usuario al probar el flujo real: todo producto con
+`products.stock` de **antes** de la Fase 112 (nunca "recibido" por la
+pantalla nueva) no tiene ningún `product_lots` detrás — invisible para el
+FIFO, aunque el contador viejo diga que hay. Cargarlo a una ruta tira 409.
+Encima, la app ni mostraba el texto del error del backend, solo
+`getString(R.string.msg_server_error, code)` genérico — de ahí que se viera
+como "el error 409" a secas.
+
+**Backend:** `InsufficientStockError` (`warehouseController.ts`), clase de
+error con `available`/`requested` como campos propios en vez de un string a
+parsear. `computeFifoAllocation` la tira en vez de un `Error` genérico;
+`addRouteItem` (`routeController.ts`) y `suggestLots` (`warehouseController.ts`)
+la detectan con `instanceof` y devuelven `{ error, available, requested }` en
+el 409 (antes solo `{ error }`).
+
+**Android:** `WarehouseRouteDetailActivity.handleInsufficientStock()`
+distingue los dos casos:
+- `available == 0` → modal "Producto sin recibir" con **Cerrar** / **Recibirlo**
+  — este último abre `ReceivingActivity` con el barcode ya cargado
+  (`ReceivingActivity` ahora acepta un extra `barcode` opcional y salta
+  directo al diálogo de cantidad/expiración, sin buscar de nuevo) y, al volver
+  con éxito, **reintenta solo** el mismo `addRouteItem` que había fallado
+  (`receivingLauncher`, `pendingRetryProduct`/`pendingRetryQuantity`) — no
+  hace falta volver a escanear en la pantalla de la ruta.
+- `available > 0` pero no alcanza → modal informativo distinto ("Solo hay X
+  disponible"), sin la opción de crear (el producto ya existe, solo falta
+  cantidad).
+
+`bun run build` y `./gradlew assembleDebug` verificados limpios. No requiere
+migración.
+
+**Pendiente, ofrecido al usuario y todavía sin confirmar:** un script SQL de
+una sola vez que le cree un "lote heredado" (sin expiración, cantidad =
+`products.stock` actual) a cada producto con stock que nunca pasó por
+Recepción — evitaría tener que ir resolviendo el modal "Producto sin
+recibir" producto por producto para todo el catálogo existente. No se
+implementó todavía porque la conversación derivó hacia este fix del modal
+antes de confirmarlo.
+
+---
+
+## Feature (2026-08-31): "Cargar desde recepción" — tercer botón en la ruta, alternativa a escanear
+
+Pedido por el usuario para agilizar el caso de cargar varios productos que se
+acaban de recibir, sin escanear caja por caja.
+
+**Backend:** `GET /api/warehouse/lots/available-products` (`listAvailableProducts`,
+`warehouseController.ts`) — productos con al menos un lote `ACTIVE` con
+`remaining_qty > 0`, agrupados por producto con la cantidad total sumada
+(`SUM(pl.remaining_qty) AS available_qty`). Devuelve el mismo shape que
+`ProductDto` (Android lo reusa directo para entrar al flujo existente de
+`showQuantityDialog` → sugerencia FIFO, como si fuera un escaneo) más el
+campo `available_qty`. Reusa `normalizeQbActive()` (exportado desde
+`productController.ts` para esto) — mismo gotcha de `qb_active` que cualquier
+otro endpoint que devuelva `ProductDto`.
+
+**Android:** botón **"Cargar desde recepción"** en `WarehouseRouteDetailActivity`
+(debajo del prompt de escaneo), junto a "Ingresar manualmente" — abre una
+lista de lo disponible en el almacén con la cantidad de cada uno.
+
+Ajustado dos veces el mismo día tras probarlo en el dispositivo real (la
+segunda, deshaciendo la primera al reconsiderarlo). Estado final:
+`showQuantityDialogForAvailable()` — al tocar un producto de la lista, pide
+la cantidad precargada con lo disponible (editable, por si se quiere cargar
+solo una parte y dejar algo para otra ruta), pero **sin** pasar por el modal
+de sugerencia FIFO — ese paso tiene sentido escaneando a ciegas, es
+redundante si ya se eligió el producto de esta lista. Se probó también la
+variante "cargar el 100% sin ningún diálogo" y se descartó — el usuario
+reconsideró que a veces sí hace falta dejar parte del stock para otra ruta,
+así que preguntar la cantidad se mantiene. El backend sigue asignando el
+lote correcto por FIFO puertas adentro (`computeFifoAllocation` no cambió)
+en cualquiera de las variantes — lo único que varió es la confirmación en
+pantalla, no la lógica de asignación.
+
+`bun run build` y `./gradlew assembleDebug` verificados limpios. No requiere
+migración — usa `product_lots`, ya existente desde la Fase 112.
+
+---
+
+## Fix (2026-08-31): "sync failed" aparecía en toda vista previa de liquidación, sin haber sincronizado nada
+
+Detectado por el usuario al probar "Generar liquidación de hoy" — todas las
+líneas mostraban "sync failed" en rojo antes de tocar siquiera "Confirmar".
+
+**Causa:** `settlement_lines.qbo_synced` arranca en `0` por default en toda
+línea nueva (`previewSettlement` solo arma el borrador, nunca llama a QBO).
+`SettlementActivity.renderLines()` (Android) mostraba el sufijo "sync failed"
+en rojo con la única condición `qboSynced != 1` — sin distinguir "todavía no
+se intentó" (`DRAFT`, el caso normal de cualquier preview) de "se intentó de
+verdad y falló" (`CONFIRMED`).
+
+**Fix:** `renderLines(lines, isConfirmed)` — el sufijo/color de error solo se
+aplica cuando `isConfirmed == true` (el settlement ya está `CONFIRMED`, sea
+porque se acaba de confirmar o porque se vuelve a generar la vista de un día
+ya cerrado). En un `DRAFT` (toda vista previa antes de confirmar) las líneas
+se muestran en gris normal, sin ninguna alusión a sync — porque todavía no
+se intentó nada. Sin cambios de backend, es puramente cómo Android interpreta
+el dato que ya devolvía la API.
+
+`./gradlew assembleDebug` verificado limpio.
+
+---
+
+## Rediseño (2026-08-31): Liquidación diaria pasa de Android/almacenista a webapp/admin
+
+A pedido del usuario, reconsiderando el reparto de responsabilidades de la
+Fase 112: el almacenista arma/carga rutas y revisa devoluciones (eso se
+queda en Android, sin cambios), pero el **cierre a QBO** (liquidación
+diaria) pasa a ser tarea exclusiva del **admin desde la webapp** — el admin
+revisa lo que se generó por ruta (entregado, no vendido, devuelto) y desde
+ahí decide cuándo liquidar. Se descartó la idea original de dejarlo
+disponible desde el TC22.
+
+**Backend:** `/api/warehouse/settlements/*` (preview/confirm/list/get) pasó
+de `warehouseOnly` (admin+almacenista) a `adminOnly` — protegido también del
+lado del servidor, no solo ocultando el botón en el cliente. Nada más
+cambió ahí (misma lógica de `previewSettlement`/`confirmSettlement`).
+
+**Android — removido por completo:** `SettlementActivity.kt` +
+`activity_settlement.xml` eliminados; entrada en `AndroidManifest.xml`,
+botón en `WarehouseActivity` (layout + Kotlin), y los métodos/DTOs de
+liquidación en `ApiService.kt`/`Models.kt` (`listSettlements`,
+`getSettlement`, `previewSettlement`, `confirmSettlement`,
+`DailySettlementDto`, `SettlementLineDto`, `PreviewSettlementRequest`,
+`ConfirmSettlementResponse`) — todo borrado, no dejado como código muerto.
+Strings de liquidación limpiadas de `values/`/`values-es/`, salvo
+`wh_settlement_status_draft`/`_confirmed`, que `InventoryMovementsActivity`
+sigue usando para marcar cada movimiento como liquidado o pendiente.
+`./gradlew assembleDebug` verificado limpio tras la limpieza.
+
+**Webapp — nuevo panel admin-only:**
+- `app/warehouse/settlement/page.tsx` — gate por rol (`role !== 'admin'` →
+  redirect a `/warehouse`), mismo criterio que `/dashboard`.
+- `app/warehouse/settlement/_components/SettlementClient.tsx` — "Generar
+  liquidación de hoy" → lista de líneas (producto, neto, stock antes→después)
+  → "Confirmar liquidación" detrás de `ConfirmModal` (componente ya existente
+  en `app/warehouse/_components/`, reusado tal cual) — es el modal
+  anti-miss-click que pidió el usuario. Mismo cuidado que se corrigió en
+  Android: el aviso de "falló la sincronización" en una línea solo se
+  muestra si el settlement ya está `CONFIRMED` de verdad, nunca en un
+  `DRAFT` recién generado.
+- Acceso: botón "Liquidación" (admin-only, `isAdmin` vía `getUserInfo()`)
+  en el header de `/warehouse`, junto al filtro de fecha.
+- **Nueva sección "Devoluciones"** en el detalle expandido de cada ruta
+  (`WarehouseClient.tsx`) — trae `GET /api/routes/:id/returns` aparte
+  (no viene en `GET /api/routes/:id`) y muestra cada línea con su condición
+  (Buena/Dañada/Vencida, badge de color) — esto es lo que permite que el
+  admin "vea lo que se generó en cada ruta" antes de liquidar. Visible tanto
+  para admin como almacenista (la página `/warehouse` ya era compartida).
+- `app/lib/i18n.ts` — claves nuevas `wh_returns*`/`wh_settlementNav` (es/en)
+  y sección completa `wst_*` para la pantalla de liquidación.
+
+`npx next build` (incluye chequeo de TypeScript) verificado limpio —
+`/warehouse/settlement` aparece como página estática generada.
+
+---
+
+## Feature (2026-08-31): marca explícita "devoluciones revisadas" por ruta + avisos
+
+Surgió de una pregunta del usuario: ¿hay alguna validación entre que el
+almacén revisa devoluciones y que el admin la ve/liquida en la webapp? La
+respuesta era que no, y peor: no había forma de **distinguir** "todavía no
+se revisó" de "se revisó y no había nada que devolver" (ej. una ruta 100%
+vendida) — antes se inferría (mal) de si `route_returns` tenía filas, y las
+dos situaciones se veían idénticas (lista vacía). Se evaluaron dos opciones
+— aviso visual vs. bloqueo duro — y se recomendó el aviso: un bloqueo
+basado en "cero filas en route_returns" trabaría también el caso normal de
+una ruta sin nada que devolver, no solo el error real que se quería evitar.
+
+**Backend:**
+- `routes` gana `returns_reviewed_at`/`returns_reviewed_by` (nullable) —
+  ver migración abajo. `listRoutes` ahora lo expone (`getRoute` ya lo traía
+  gratis vía `SELECT r.*`).
+- `createReturns` (`routeController.ts`) — **ya no rechaza `items: []`**.
+  Antes exigía al menos un producto, lo que hacía imposible confirmar
+  "revisé, no hay nada que devolver" en una ruta 100% vendida. Ahora, al
+  final de la función, siempre marca `returns_reviewed_at = NOW()` +
+  `returns_reviewed_by`, haya o no líneas — es la fuente de verdad real de
+  "ya se revisó", no una inferencia.
+
+**Android:** `RouteReturnsActivity.saveReturns()` — si no se cargó ninguna
+cantidad, ya no bloquea con "agregá al menos un producto": pide una
+confirmación explícita ("¿Confirmás que no volvió nada de esta ruta?") y
+manda `items: []`, que ahora el backend acepta. La confirmación extra es
+para no perder la protección contra un olvido real de completar los campos
+— un envío vacío sigue siendo una acción deliberada, no un descuido
+silencioso.
+
+**Webapp — avisos, sin bloquear nada:**
+- Lista de rutas en `/warehouse`: badge amarillo "Devoluciones sin revisar"
+  en cualquier ruta `COMPLETED` con `returns_reviewed_at` nulo.
+- Detalle expandido de la ruta: la sección "Devoluciones" ahora distingue
+  tres estados — no revisado todavía (aviso amarillo), revisado sin nada
+  que devolver, y revisado con la lista real (antes solo existían los
+  últimos dos, indistinguibles entre sí).
+- `/warehouse/settlement`: banner de advertencia (no bloqueante) si hay
+  rutas `COMPLETED` sin revisar antes de generar/confirmar — lista los
+  nombres de esas rutas con un link de vuelta a `/warehouse`. El admin
+  puede liquidar igual si decide que corresponde.
+
+**Migración SQL** (agregar a lo ya corrido de la Fase 112 — ver bloque
+completo más abajo en esta conversación):
+```sql
+ALTER TABLE routes ADD COLUMN IF NOT EXISTS returns_reviewed_at TIMESTAMP DEFAULT NULL AFTER created_by;
+ALTER TABLE routes ADD COLUMN IF NOT EXISTS returns_reviewed_by INT DEFAULT NULL AFTER returns_reviewed_at;
+```
+
+`bun run build`, `./gradlew assembleDebug` y `npx next build` verificados
+limpios en los tres proyectos.
+
+---
+
+## Feature (2026-09-01): aprobación de admin antes de enviar una venta a QBO (Fase 113)
+
+Cierra el pendiente 🔴 URGENTE anotado el 2026-08-31 (mismo espíritu que el
+rediseño de Liquidación diaria: "que el admin revise antes de que algo le
+pegue a QBO", ahora aplicado a ventas/facturación). Las 4 preguntas que
+habían quedado sin responder se resolvieron en la conversación del
+2026-09-01 antes de escribir código:
+
+1. **Rechazo:** no existe a nivel de venta individual — si algo está mal, el
+   mecanismo es cancelar la ruta completa (ya existía, caso excepcional). No
+   hizo falta diseñar un flujo de "número de factura anulado".
+2. **Alcance: todas las ventas**, no solo las de ruta de entrega.
+3. **Estado nuevo** `AWAITING_APPROVAL`, distinto de `PENDING`, para que el
+   SyncEngine no lo mande solo.
+4. El admin revisa **ruta (si tiene) + orden + ticket** antes de aprobar.
+
+Detalle técnico completo (estado, `reserveInvoiceNumber()`, `approveBatch`,
+fix de `retryBatchSync`/SyncEngine para no reservar un segundo número, y el
+efecto secundario aceptado en stats/revenue) en `CLAUDE.md` → "Aprobación de
+admin antes de enviar una venta a QBO (Fase 113)".
+
+**`createOrder` (endpoint de un solo item) ganó `batch_id`** — antes no
+tenía, lo que lo hacía imposible de aprobar con el mismo mecanismo basado en
+`batch_id`. Ahora genera uno igual que `createBatch`, así toda venta —
+tenga uno o varios items — se aprueba por el mismo
+`POST /api/orders/batch/:batchId/approve`.
+
+**Webapp:** se reusó la pantalla `/orders` ya existente (no una nueva) —
+chip de filtro "Por aprobar", botón "Aprobar y enviar a QBO" (admin-only,
+mismo `ConfirmModal` que ya usa `/warehouse/settlement`) y un tag de ruta
+junto al ID del batch cuando la venta está atada a una.
+
+`bun run build`, `npx tsc --noEmit` (backend) y `npx next build` (webapp)
+verificados limpios.
+
+**Migración SQL** (agregar a la ya corrida — ver bloque completo en
+`schema.sql`/`excellentia_schema.sql`, sección "Migración (2026-09-01)"):
+```sql
+ALTER TABLE orders MODIFY COLUMN status ENUM('AWAITING_APPROVAL','PENDING','SENT','FAILED','CANCELLED') DEFAULT 'PENDING';
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS reserved_invoice_number INT NULL AFTER qb_invoice_id;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS approved_by INT NULL AFTER reserved_invoice_number;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP NULL AFTER approved_by;
+```
+**Migración corrida por el usuario contra su base el mismo día.**
+
+**Repo Android sí se tocó, en ronda aparte el mismo día** — ver las
+entradas de más abajo ("guard contra bypass...", "vender 'por scratch'...",
+"estados distintivos en Historial..."). Tampoco se implementó ningún
+aviso/notificación proactiva al admin de que hay ventas esperando
+aprobación más allá del chip/badge en `/orders` — el admin tiene que entrar
+a mirar (sigue pendiente).
+
+---
+
+## Fix (2026-09-01): guard contra saltearse la aprobación + reimpresión de ticket en Android (Fase 113, ronda 2)
+
+Repaso del repo Android (`AndroidStudioProjects/test`) a pedido del usuario
+("revisa eso como OPERATOR"), disparado por la pregunta de si el ticket se
+imprime bien con el número reservado. La impresión en sí andaba perfecta
+(`PrintService`/`OrderSuccessActivity` ya priorizaban `invoiceNumber` sobre
+`invoiceId`), pero aparecieron dos problemas reales al revisar:
+
+**Bug de seguridad encontrado y corregido en el backend:** `retryBatchSync`
+(no es admin-only, lo puede llamar el operador dueño del batch) y
+`forceSync` (admin-only) no excluían `AWAITING_APPROVAL` — un operador
+podía tocar "Reintentar QBO" desde `TicketDetailActivity` sobre una venta
+que todavía esperaba aprobación del admin y esto la mandaba a QBO directo,
+saltándose por completo la revisión (justo lo que la Fase 113 quería
+evitar). Fix: ambos responden 400 ahora si el batch/orden está
+`AWAITING_APPROVAL`, antes de tocar nada. `orderController.ts`.
+
+**Reimpresión de ticket sin número de factura, en Android:**
+- `CurrentOrderActivity.kt`/`PreOrderDetailActivity.kt` — el texto
+  "Generando factura..." usaba `response.invoiceId` (null hasta aprobar) en
+  vez de `response.invoiceNumber` (poblado desde la creación) — mostraba
+  "—" un instante aunque el ticket que se imprimía segundos después sí
+  traía el número bien.
+- `data/Models.kt` — `OrderDto` no tenía `reserved_invoice_number`, así que
+  **reimprimir** un ticket desde Historial (`HistoryActivity.kt`,
+  `ClientHistoryActivity.kt`) para una venta todavía `AWAITING_APPROVAL` no
+  mostraba ningún número — el original impreso al momento de la venta sí lo
+  tenía, pero no había forma de recuperarlo después. Se agregó el campo
+  (mapea `reserved_invoice_number` del backend) y ambas pantallas de
+  Historial ahora se lo pasan a `TicketDetailActivity` vía extra
+  `invoice_number`.
+- `TicketDetailActivity.kt` — el botón "Reintentar QBO" quedaba oculto por
+  accidente para estas ventas (el cálculo de `orderStatus` no reconocía
+  `AWAITING_APPROVAL`, caía a `null`) — ahora lo excluye a propósito,
+  documentado, en vez de depender de esa casualidad.
+
+`./gradlew assembleDebug`, `bun run build` y `tsc --noEmit` verificados
+limpios.
+
+---
+
+## Feature (2026-09-01): vender "por scratch" desde una parada de ruta, sin volver a la pantalla de escaneo (Android, operator)
+
+Pedido del usuario: en una parada tipo `CUSTOMER` (venta sin pre-orden), el
+repartidor tocaba "Vender" y la app lo mandaba a `MainActivity` a escanear
+producto por producto — aunque el camión ya tiene cargado exactamente qué
+lleva (`route_items`, mostrado en la misma pantalla, hasta ahora de solo
+lectura). Pidió poder tocar directo esa lista, marcada en rojo/verde según
+si ya está en el carrito.
+
+**Decisión de UX acordada (AskUserQuestion):** el atajo reemplaza la
+navegación a `MainActivity` — no una pantalla nueva aparte.
+
+`MyRouteDetailActivity.kt`:
+- `activateCustomerAndSell()` ya no navega — solo setea cliente/parada
+  activos (mecanismo que ya existía) y re-renderiza la misma pantalla.
+- La parada activa muestra un chip "Seleccionando productos" en vez del
+  botón, mientras dura la selección.
+- La lista de productos de la ruta se vuelve tocable: verde
+  (`success_light`) si el barcode ya está en el carrito local
+  (`orderRepository.getPendingOrders()`), rojo (`error_light`) si no —
+  tocar abre `ProductDetailActivity` para ese barcode (mismos extras que ya
+  arma `MainActivity.openDetail()`).
+- Dos botones nuevos, visibles solo con una venta en curso: "Escanear otro
+  producto" (escape hatch a `MainActivity`, sin `CLEAR_TOP` para que atrás
+  vuelva acá) e "Ir a la venta" (→ `CurrentOrderActivity`, revisar/enviar).
+
+`activity_my_route_detail.xml` — card nueva con los 2 botones (oculta por
+default). **Ojo evitado a tiempo:** un `LinearLayout` suelto ahí (sin card
+blanca de fondo) hubiera reproducido el bug ya documentado el 2026-08-31
+("botones invisibles — `OutlinedButton` sobre `@color/background`, mismo
+valor que `@color/primary`") — se envolvió en `MaterialCardView` como el
+resto de las secciones de la pantalla, evitándolo de raíz.
+
+No toca backend — reusa 100% el mecanismo de "cliente activo + parada
+activa" que ya existía y que ya hace que `CurrentOrderActivity` marque la
+parada `DELIVERED` sola al mandar la venta.
+
+`./gradlew assembleDebug` verificado limpio.
+
+---
+
+## Feature (2026-09-01): estados distintivos en Historial Android — `AWAITING_APPROVAL` ya no se confunde con `PENDING`/`FAILED`
+
+Detectado por el usuario: en Historial, tanto "esperando aprobación del
+admin" como "hubo un problema técnico de sync" se veían idénticos —
+"PENDIENTE" a secas. Un operador no podía distinguir a simple vista si una
+venta estaba bien encaminada (solo esperando al admin) o si algo había
+fallado de verdad.
+
+- `HistoryActivity.kt` / `ClientHistoryActivity.kt` — el badge de estado
+  por batch pasa de 2 a 4 estados: Completado (verde), **Por aprobar**
+  (teal, nuevo), Fallido (rojo — antes también caía como "Pendiente"),
+  Pendiente (dorado, genérico).
+- `TicketDetailActivity.kt` — al abrir el detalle, ahora reconoce
+  `AWAITING_APPROVAL` en el cálculo de `orderStatus` y muestra "POR
+  APROBAR" en la sección de estado del ticket en vez de omitirla en
+  silencio; el botón "Reintentar QBO" se excluye explícitamente para este
+  estado (ver entrada de arriba).
+
+Strings nuevas `label_awaiting_approval` (es/en). `./gradlew assembleDebug`
+verificado limpio.
+
+---
+
+## Fix (2026-09-01): timeout de QBO se registraba como fallo aunque la factura sí se hubiera creado (riesgo de duplicado)
+
+Detectado en producción: una venta ("Gelatinas", cliente Pancho Villa - SD,
+factura #52566) se aprobó, `createBatchInvoice` tardó más de 30s en
+responder y el timeout hizo que quedara `FAILED` local — pero la factura
+**sí se había creado** en QBO (confirmado por el usuario ahí mismo). Un
+reintento posterior sobre el mismo número reservado hubiera arriesgado un
+duplicado. Se corrigió a mano en la DB por esa vez
+(`UPDATE orders SET status='SENT', qb_invoice_id='52566', error_log=NULL
+WHERE batch_id=...`) y se blindó el sistema para que no vuelva a pasar:
+
+- `qbInvoices.ts` — timeout de `createInvoice`/`createBatchInvoice` subido
+  de 30000ms (default de `intuit-oauth`) a 60000ms.
+- Nueva `findInvoiceByDocNumber(docNumber)` — consulta QBO por `DocNumber`.
+  `approveBatch` y `retryBatchSync` la llaman en su `catch` **antes** de
+  marcar la venta como fallida: si la factura ya existe en QBO con ese
+  número, se toma como éxito real (`SENT` + `qb_invoice_id`) en vez de
+  `FAILED`/`PENDING`.
+- **Nuevo `POST /api/orders/batch/:batchId/reconcile`** (admin-only) — para
+  el hueco que dejan los dos puntos de arriba: su reconciliación automática
+  solo corre dentro de un intento de envío real, pero "Forzar sync"
+  (`forceSync`) no llama a QBO al instante, solo reencola para el
+  SyncEngine — así que una venta `FAILED`/`PENDING` por timeout, pero ya
+  creada en QBO, podía quedar sin reconciliar hasta el próximo ciclo (o
+  hasta arreglarla a mano, como pasó acá). Es de **solo lectura contra
+  QBO** — no reintenta el envío, cero riesgo de duplicado. Botón
+  "Verificar en QBO" nuevo en `/orders`, junto a "Reintentar".
+- **`OrdersClient.tsx` — "Forzar sync" reemplazado por "Reintentar",
+  apuntando a `retryBatchSync` en vez de `forceSync`.** El viejo botón
+  llamaba `/api/orders/:id/sync` **por cada línea suelta** del batch, lo
+  que reencolaba cada producto como venta individual para el SyncEngine —
+  terminaba creando **una factura separada por producto** en vez de una
+  sola agrupada como la original. `retryBatchSync` manda el batch entero
+  como una factura, reusa el número ya reservado, y responde al instante
+  (no espera el próximo ciclo del SyncEngine).
+
+`bun run build`, `tsc --noEmit` y `npx next build` verificados limpios.
+
+**Nota aparte, no relacionada con este fix:** el mismo día apareció un
+incidente del lado de Intuit (confirmado en status.quickbooks.intuit.com,
+"internal incident", timeouts intermitentes en las APIs de QBO, arrancó
+2026-09-01 ~13:44 PDT, sin resolver a la fecha) que causó una tanda de
+timeouts en producción sin relación con el código — se investigó a fondo
+antes de identificarlo como ajeno; no requirió ningún cambio.
+
+---
+
+## Fix (2026-09-01): doble descuento de inventario en ventas de ruta + ventas "por scratch" no contadas como vendidas
+
+Detectado por el usuario razonando sobre Revisar Devoluciones: "si no
+volvió nada de la ruta (se vendió todo), eso debería restar del
+inventario — ¿está bien implementado?". No estaba.
+
+**El bug:** `addRouteItem` (`routeController.ts`) ya resta `products.stock`
+al cargar una ruta — correcto. Pero `createBatch` (`orderController.ts`)
+resta **de nuevo, 1 por línea, para toda venta, sin ninguna noción de
+rutas**. Un producto cargado en una ruta y vendido durante esa ruta (ej.
+vía "Vender por scratch") quedaba descontado dos veces — cargar 10 y
+vender las 10 dejaba el stock en -20 en vez de -10.
+
+**Problema relacionado:** una venta hecha desde una parada `CUSTOMER`
+nunca quedaba vinculada a `route_stops` (ningún `UPDATE ... SET batch_id`
+existía para ese caso) — así que `getExpectedReturns` nunca la contaba
+como "vendida" para esa ruta, y la cantidad "esperada de vuelta" en
+Revisar Devoluciones quedaba inflada, con o sin el bug de stock.
+
+**Fix:**
+- `createBatch` acepta `route_id`/`stop_id` opcionales. Si `route_id`
+  viene, arma un set de barcodes cargados en esa ruta
+  (`route_items`) y **salta el descuento** para cualquier línea cuyo
+  barcode ya esté ahí (ya se descontó al cargar). Si `stop_id` viene,
+  vincula la venta (`UPDATE route_stops SET batch_id = ? WHERE id = ? AND
+  stop_type = 'CUSTOMER' AND batch_id IS NULL`) — sin tocar `stop_type`.
+- `getExpectedReturns` — el join de `soldRows` ya no exige
+  `stop_type = 'BATCH'`, solo `rs.batch_id = o.batch_id` — con el `UPDATE`
+  de arriba, ahora también cuenta paradas `CUSTOMER` recién vendidas.
+- Android — `OrderRepository.sendBatch()` manda `route_id`/`stop_id` en el
+  body cuando hay una venta de ruta en curso (`securePrefs.getActiveRouteId()`/
+  `getActiveStopId()`, ya seteados en ese punto — se limpian recién
+  después de que el envío tiene éxito). `BatchRequest` (`Models.kt`) gana
+  ambos campos, nullable.
+
+**Fuera de alcance, a propósito:** paradas `PRE_ORDER` — `convertPreOrder`
+no descuenta stock en absoluto hoy (gap preexistente de la Fase 87, sin
+relación), así que no hay doble descuento ahí; su posible sub-conteo en
+"esperado de vuelta" queda para más adelante si hace falta.
+
+`bun run build`/`tsc --noEmit` y `./gradlew assembleDebug` verificados
+limpios.
+
+---
+
+## Fix (2026-09-01): `refreshToken()` borraba el refresh token de QBO si Intuit no devolvía uno nuevo
+
+Producción quedó con la integración de QBO totalmente muerta
+("Failed to refresh token: The Refresh token is missing") en medio del
+incidente de Intuit del mismo día (ver nota más arriba). Causa raíz en
+`qbAuth.ts` → `refreshToken()`: la respuesta de un refresh no siempre trae
+un `refresh_token` nuevo (comportamiento normal de OAuth2 cuando el
+proveedor no rota el token en cada refresh — QBO lo omite en algunos
+casos, y bajo su incidente interno lo omitió esta vez). El código hacía
+`token.refresh_token ?? ''` — al venir vacío, **pisó el refresh token
+válido guardado en `qb_tokens` con un string vacío**, dejando la
+integración sin forma de volver a autenticarse hasta reconectar
+manualmente desde `/settings`.
+
+**Fix:** se captura el refresh token actual (`oauthClient.getToken().refresh_token`)
+**antes** de llamar a `.refresh()`; si la respuesta no trae uno nuevo, se
+sigue usando el que ya había en vez de pisarlo con vacío.
+`handleCallback` (el flujo completo de reconexión, no el refresh
+periódico) no se tocó — ese usa `createToken()` con un código de
+autorización, que sí siempre devuelve un refresh_token nuevo por
+especificación de OAuth2, y de todos modos hace un `UPDATE` que reemplaza
+la fila entera de `qb_tokens` — reconectar arregla la corrupción sola, sin
+tocar la base a mano.
+
+`bun run build` verificado limpio (dos errores preexistentes de `tsc` en
+`decryptToken()`, sin relación, ya estaban antes de esta sesión).
 
 ## Pendiente / Mejoras futuras
 

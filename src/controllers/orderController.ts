@@ -1,8 +1,9 @@
 import type { Request, Response } from 'express';
 import pool from '../db/connection.ts';
-import { createInvoice, createBatchInvoice } from '../services/qbInvoices.ts';
+import { createBatchInvoice, findInvoiceByDocNumber } from '../services/qbInvoices.ts';
 import { computeDamageCredit } from '../services/creditCalculator.ts';
 import { getCustomerBalance, applyCustomerCredit } from '../services/creditController.ts';
+import { withInvoiceNumber, reserveInvoiceNumber } from '../services/invoiceCounter.ts';
 import logger from '../services/logger.ts';
 import { logActivity } from '../services/activityLog.ts';
 
@@ -30,57 +31,30 @@ export async function createOrder(req: Request, res: Response): Promise<void> {
 
     const finalTotal = total !== undefined ? total : price * quantity;
 
+    // batch_id propio aunque sea un solo item — mismo generador que
+    // createBatch — así esta orden se aprueba con el mismo
+    // approveBatch/POST /api/orders/batch/:batchId/approve en vez de
+    // necesitar un endpoint de aprobación aparte para el caso "sin batch".
+    const batchId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
     const [result] = await pool.query(
-      "INSERT INTO orders (barcode, product_name, price, quantity, total, device_id, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      [barcode, product_name, price, quantity, finalTotal, device_id ?? null, req.user?.id ?? null]
+      "INSERT INTO orders (barcode, product_name, price, quantity, total, batch_id, device_id, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      [barcode, product_name, price, quantity, finalTotal, batchId, device_id ?? null, req.user?.id ?? null]
     ) as any;
 
     const orderId = result.insertId;
-    let status = 'PENDING';
 
-    // Try immediate sync to QBO
-    try {
-      const [productRows] = await pool.query(
-        'SELECT qb_item_id FROM products WHERE barcode = ?',
-        [barcode]
-      ) as any[];
-      const qbItemId = productRows[0]?.qb_item_id;
+    // El número de factura se reserva al instante (el ticket sale con un
+    // número real y secuencial), pero la venta queda AWAITING_APPROVAL — el
+    // push real a QBO recién pasa cuando un admin aprueba
+    // (POST /api/orders/batch/:batchId/approve, ver approveBatch más abajo).
+    const invoiceNumber = await reserveInvoiceNumber();
+    await pool.query(
+      "UPDATE orders SET status = 'AWAITING_APPROVAL', reserved_invoice_number = ? WHERE id = ?",
+      [invoiceNumber, orderId]
+    );
 
-      if (qbItemId) {
-        const [[{ invoice_counter }]] = await pool.query(
-          'SELECT invoice_counter FROM company_settings WHERE id = 1'
-        ) as any[];
-
-        const [orderRows] = await pool.query('SELECT * FROM orders WHERE id = ?', [orderId]) as any[];
-        const invoice = await createInvoice(orderRows[0], qbItemId, req.user?.qb_class_id ?? null, invoice_counter);
-        const invoiceId = invoice.Invoice?.DocNumber;
-
-        await pool.query(
-          "UPDATE orders SET status = 'SENT', qb_invoice_id = ? WHERE id = ?",
-          [invoiceId ?? null, orderId]
-        );
-
-        await pool.query(
-          "INSERT INTO sync_log (entity_type, entity_id, action, qb_status, qb_id) VALUES ('order', ?, 'create_invoice', 'SUCCESS', ?)",
-          [orderId, invoiceId ?? null]
-        );
-
-        if (invoiceId) {
-          await pool.query(
-            'UPDATE company_settings SET invoice_counter = invoice_counter + 1 WHERE id = 1'
-          );
-        }
-
-        status = 'SENT';
-        logger.info(`Pedido ${orderId} sincronizado a QBO al instante (#${invoice_counter})`);
-      } else {
-        logger.warn(`Producto ${barcode} sin qb_item_id, pedido ${orderId} queda PENDING`);
-      }
-    } catch (syncErr) {
-      logger.warn(`Sync inmediato falló para pedido ${orderId} (queda PENDING):`, syncErr);
-    }
-
-    res.status(201).json({ id: orderId, barcode, status });
+    res.status(201).json({ id: orderId, barcode, batchId, status: 'AWAITING_APPROVAL', invoiceNumber });
   } catch (err) {
     logger.error('createOrder error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
@@ -94,7 +68,12 @@ export async function listOrders(req: Request, res: Response): Promise<void> {
     const limitNum = parseInt(limit as string) || 20;
     const offset = (pageNum - 1) * limitNum;
 
-    let query = 'SELECT o.id, o.barcode, o.product_name, o.price, o.quantity, o.total, o.status, o.batch_id, o.qb_invoice_id, o.device_id, o.user_id, o.customer_id, o.customer_name, o.unit, o.case_qty, o.payment_method, o.check_number, o.credit_applied, o.created_at, u.email AS user_email, u.name AS user_name, (SELECT COALESCE(SUM(bd.amount), 0) FROM batch_damage bd WHERE bd.batch_id = o.batch_id AND bd.qty > 0) AS damage_credits FROM orders o LEFT JOIN users u ON o.user_id = u.id WHERE 1=1';
+    let query = `SELECT o.id, o.barcode, o.product_name, o.price, o.quantity, o.total, o.status, o.batch_id, o.qb_invoice_id, o.reserved_invoice_number, o.device_id, o.user_id, o.customer_id, o.customer_name, o.unit, o.case_qty, o.payment_method, o.check_number, o.credit_applied, o.created_at, u.email AS user_email, u.name AS user_name,
+      (SELECT COALESCE(SUM(bd.amount), 0) FROM batch_damage bd WHERE bd.batch_id = o.batch_id AND bd.qty > 0) AS damage_credits,
+      (SELECT r.id FROM route_stops rs JOIN routes r ON r.id = rs.route_id WHERE rs.batch_id = o.batch_id AND rs.stop_type = 'BATCH' LIMIT 1) AS route_id,
+      (SELECT r.name FROM route_stops rs JOIN routes r ON r.id = rs.route_id WHERE rs.batch_id = o.batch_id AND rs.stop_type = 'BATCH' LIMIT 1) AS route_name,
+      (SELECT r.scheduled_date FROM route_stops rs JOIN routes r ON r.id = rs.route_id WHERE rs.batch_id = o.batch_id AND rs.stop_type = 'BATCH' LIMIT 1) AS route_date
+      FROM orders o LEFT JOIN users u ON o.user_id = u.id WHERE 1=1`;
     const params: any[] = [];
 
     if (req.user?.role === 'operator') { query += ' AND o.user_id = ?'; params.push(req.user.id); }
@@ -105,7 +84,7 @@ export async function listOrders(req: Request, res: Response): Promise<void> {
     if (date_from)   { query += ' AND o.created_at >= ?'; params.push(date_from); }
     if (date_to)   { query += ' AND o.created_at <= ?'; params.push(date_to); }
 
-    let countQuery = query.replace(/^SELECT .* FROM orders/, 'SELECT COUNT(*) as total FROM orders');
+    let countQuery = query.replace(/^SELECT .* FROM orders/s, 'SELECT COUNT(*) as total FROM orders');
     const [countResult] = await pool.query(countQuery, params) as any[];
 
     query += ' ORDER BY o.created_at DESC LIMIT ? OFFSET ?';
@@ -142,7 +121,7 @@ export async function updateOrderStatus(req: Request, res: Response): Promise<vo
   try {
     const { id } = req.params;
     const { status } = req.body;
-    const validStatuses = ['PENDING', 'SENT', 'FAILED', 'CANCELLED'];
+    const validStatuses = ['AWAITING_APPROVAL', 'PENDING', 'SENT', 'FAILED', 'CANCELLED'];
 
     if (!validStatuses.includes(status)) {
       res.status(400).json({ error: `Status inválido. Valores: ${validStatuses.join(', ')}` });
@@ -163,7 +142,7 @@ export async function updateOrderStatus(req: Request, res: Response): Promise<vo
 
 export async function createBatch(req: Request, res: Response): Promise<void> {
   try {
-    const { items, customer_id, customer_name, signature, damage_items, payment_method, check_number, apply_credit } = req.body;
+    const { items, customer_id, customer_name, signature, damage_items, payment_method, check_number, apply_credit, route_id, stop_id } = req.body;
     if (!items || !Array.isArray(items) || items.length === 0) {
       res.status(400).json({ error: 'Se requiere un array de items' });
       return;
@@ -196,11 +175,38 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
       inserted.push({ id: result.insertId, barcode, product_name, price, quantity, total: total ?? price * quantity, qb_item_id: qbItemId });
     }
 
-    // Descontar stock: 1 unidad por línea de ítem vendido
+    // Descontar stock: 1 unidad por línea de ítem vendido — salvo que el
+    // producto ya se haya descontado al cargar esta ruta (route_id viene
+    // del cliente cuando hay una venta "por scratch"/de ruta en curso, ver
+    // MyRouteDetailActivity.kt → OrderRepository.sendBatch()). Sin este
+    // check, un producto route-loaded quedaba descontado DOS veces: una al
+    // cargar la ruta (addRouteItem) y otra acá — con una ruta 100% vendida,
+    // el stock terminaba el doble de bajo de lo real.
+    let routeLoadedBarcodes: Set<string> | null = null;
+    if (route_id) {
+      const [routeItemRows] = await pool.query(
+        'SELECT barcode FROM route_items WHERE route_id = ? AND barcode IS NOT NULL',
+        [route_id]
+      ) as any[];
+      routeLoadedBarcodes = new Set((routeItemRows as any[]).map(r => r.barcode));
+    }
     for (const item of inserted) {
+      if (routeLoadedBarcodes?.has(item.barcode)) continue;
       await pool.query(
         'UPDATE products SET stock = GREATEST(stock - 1, 0) WHERE barcode = ?',
         [item.barcode]
+      );
+    }
+
+    // Vincula esta venta a la parada de ruta que la originó (solo paradas
+    // CUSTOMER — las BATCH ya nacen con batch_id seteado en addStop, las
+    // PRE_ORDER usan pre_order_id, no batch_id). Sin esto, getExpectedReturns
+    // nunca contaba estas ventas como "vendido" para la ruta — la cantidad
+    // "esperada de vuelta" en Revisar Devoluciones quedaba inflada.
+    if (stop_id) {
+      await pool.query(
+        "UPDATE route_stops SET batch_id = ? WHERE id = ? AND stop_type = 'CUSTOMER' AND batch_id IS NULL",
+        [batchId, stop_id]
       );
     }
 
@@ -254,106 +260,302 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
       logger.info(`[damage] sin damage_items — batch_damage no modificado`);
     }
 
-    // Try immediate sync to QBO as batch
-    try {
-      const validItems = inserted.filter(i => i.qb_item_id) as { id: number; qb_item_id: string; product_name: string; price: number; quantity: number; total: number }[];
-
-      // Calcular crédito disponible antes de la factura (necesitamos el monto para QBO)
-      let creditApplied = 0;
-      if (apply_credit && apply_credit > 0 && customer_id) {
-        try {
-          const { balance } = await getCustomerBalance(customer_id);
-          creditApplied = Math.round(Math.min(Number(apply_credit), balance) * 100) / 100;
-        } catch (creditErr: any) {
-          logger.warn(`[credit] Error al consultar saldo para batch ${batchId}: ${creditErr.message}`);
+    // Crédito de cliente aplicado (apply_credit) — se aplica de inmediato,
+    // igual que el crédito EARNED de arriba, con invoiceId=NULL por ahora.
+    // approveBatch() backfillea credit_transactions.invoice_id cuando la
+    // factura real de QBO exista (mismo patrón que ya usa EARNED más abajo).
+    let creditApplied = 0;
+    if (apply_credit && apply_credit > 0 && customer_id) {
+      try {
+        const { balance } = await getCustomerBalance(customer_id);
+        creditApplied = Math.round(Math.min(Number(apply_credit), balance) * 100) / 100;
+        if (creditApplied > 0) {
+          await applyCustomerCredit(customer_id, customer_name ?? null, creditApplied, batchId, null);
+          await pool.query(
+            "UPDATE orders SET credit_applied = ? WHERE batch_id = ?",
+            [creditApplied, batchId]
+          );
         }
+      } catch (creditErr: any) {
+        logger.warn(`[credit] Error al aplicar crédito para batch ${batchId}: ${creditErr.message}`);
+        creditApplied = 0;
       }
-
-      if (validItems.length > 0) {
-        // Leer y reservar número de factura
-        const [[{ invoice_counter }]] = await pool.query(
-          'SELECT invoice_counter FROM company_settings WHERE id = 1'
-        ) as any[];
-        const docNumber = invoice_counter;
-
-        const invoice = await createBatchInvoice(
-          validItems, customer_id ?? null, damage_items ?? [],
-          payment_method ?? null, check_number ?? null, req.user?.qb_class_id ?? null, docNumber, creditsTotal, damageComputed, creditApplied > 0 ? creditApplied : undefined
-        );
-        const invoiceId = invoice.Invoice?.DocNumber;
-
-        await pool.query(
-          "UPDATE orders SET status = 'SENT', qb_invoice_id = ? WHERE batch_id = ?",
-          [invoiceId ?? null, batchId]
-        );
-
-        for (const item of validItems) {
-          await pool.query(
-            "INSERT INTO sync_log (entity_type, entity_id, action, qb_status, qb_id) VALUES ('order', ?, 'create_invoice', 'SUCCESS', ?)",
-            [item.id, invoiceId ?? null]
-          );
-        }
-
-        // Incrementar contador SOLO si QBO respondió con Id
-        if (invoiceId) {
-          await pool.query(
-            'UPDATE company_settings SET invoice_counter = invoice_counter + 1 WHERE id = 1'
-          );
-        }
-
-        // Aplicar crédito disponible DESPUÉS de la factura (necesitamos el invoiceId)
-        if (creditApplied > 0 && customer_id && invoiceId) {
-          try {
-            await applyCustomerCredit(customer_id, customer_name ?? null, creditApplied, batchId, invoiceId);
-            await pool.query(
-              "UPDATE orders SET credit_applied = ? WHERE batch_id = ?",
-              [creditApplied, batchId]
-            );
-          } catch (creditErr: any) {
-            logger.warn(`[credit] Error al persistir crédito para batch ${batchId}: ${creditErr.message}`);
-          }
-        }
-
-        // Vincular invoice_id a las transacciones EARNED de este batch
-        if (invoiceId && creditsTotal > 0) {
-          await pool.query(
-            "UPDATE credit_transactions SET invoice_id = ? WHERE reference_batch_id = ? AND type = 'EARNED' AND invoice_id IS NULL",
-            [invoiceId, batchId]
-          );
-        }
-
-        logger.info(`Batch ${batchId} enviado a QBO, invoice ${invoiceId} (#${docNumber})`);
-      } else {
-        logger.warn(`Batch ${batchId}: ningún item tiene qb_item_id, quedan PENDING`);
-      }
-
-      logActivity({ userId: req.user?.id, userEmail: req.user?.email, action: 'BATCH_CREATED', entityType: 'batch', entityId: batchId, details: `${inserted.length} items, customer: ${customer_name ?? 'N/A'}`, ip: req.ip });
-
-      // Leer el invoiceId real que quedó guardado en la DB
-      const [[firstOrder]] = await pool.query(
-        'SELECT qb_invoice_id FROM orders WHERE batch_id = ? AND qb_invoice_id IS NOT NULL LIMIT 1',
-        [batchId]
-      ) as any[];
-
-      // Leer el invoice_counter actual (ya incrementado si QBO ok)
-      const [[{ invoice_counter: currentCounter }]] = await pool.query(
-        'SELECT invoice_counter FROM company_settings WHERE id = 1'
-      ) as any[];
-
-      res.status(201).json({
-        batchId,
-        invoiceId: firstOrder?.qb_invoice_id ?? null,
-        invoiceNumber: firstOrder?.qb_invoice_id ? currentCounter - 1 : null,
-        orders: inserted.map(i => ({ id: i.id, barcode: i.barcode, status: i.qb_item_id ? 'SENT' : 'PENDING' })),
-        creditsTotal,
-        creditApplied,
-      });
-    } catch (syncErr) {
-      logger.warn(`Batch ${batchId}: sync falló, items quedan PENDING para SyncEngine:`, syncErr);
-      res.status(201).json({ batchId, invoiceId: null, invoiceNumber: null, orders: inserted.map(i => ({ id: i.id, barcode: i.barcode, status: 'PENDING' })), creditsTotal, creditApplied });
     }
+
+    // El envío real a QBO se difiere hasta que un admin apruebe (approveBatch,
+    // POST /api/orders/batch/:batchId/approve) — acá solo se reserva el
+    // número de factura, para que el ticket salga con un número real.
+    const invoiceNumber = await reserveInvoiceNumber();
+    await pool.query(
+      "UPDATE orders SET status = 'AWAITING_APPROVAL', reserved_invoice_number = ? WHERE batch_id = ?",
+      [invoiceNumber, batchId]
+    );
+
+    logActivity({ userId: req.user?.id, userEmail: req.user?.email, action: 'BATCH_CREATED', entityType: 'batch', entityId: batchId, details: `${inserted.length} items, customer: ${customer_name ?? 'N/A'}`, ip: req.ip });
+
+    res.status(201).json({
+      batchId,
+      invoiceId: null,
+      invoiceNumber,
+      orders: inserted.map(i => ({ id: i.id, barcode: i.barcode, status: 'AWAITING_APPROVAL' })),
+      creditsTotal,
+      creditApplied,
+    });
   } catch (err) {
     logger.error('createBatch error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
+// POST /api/orders/batch/:batchId/approve — admin-only. Único lugar que
+// llama de verdad a QBO para un batch AWAITING_APPROVAL (createBatch/
+// createOrder/convertPreOrder solo reservan el número e insertan localmente
+// — ver esos controllers). Usa reserved_invoice_number ya guardado, no
+// reserva uno nuevo (el contador ya avanzó al crear el batch, cuando se
+// imprimió el ticket). Mismas validaciones de qb_item_id/qb_active que
+// retryBatchSync, que es lo que se usa para reintentar si esto falla.
+export async function approveBatch(req: Request, res: Response): Promise<void> {
+  try {
+    const { batchId } = req.params;
+
+    const [orderRows] = await pool.query(
+      `SELECT o.*, p.qb_item_id, p.qb_active FROM orders o
+       LEFT JOIN products p ON o.barcode = p.barcode
+       WHERE o.batch_id = ?`,
+      [batchId]
+    ) as any[];
+
+    if (orderRows.length === 0) {
+      res.status(404).json({ error: 'Pedido no encontrado' });
+      return;
+    }
+
+    const toApprove = orderRows.filter((o: any) => o.status === 'AWAITING_APPROVAL');
+    if (toApprove.length === 0) {
+      res.status(400).json({ error: `Este batch no está esperando aprobación (status actual: ${orderRows[0].status})` });
+      return;
+    }
+
+    const missingQbItem = toApprove.filter((o: any) => !o.qb_item_id);
+    if (missingQbItem.length > 0) {
+      await pool.query(
+        "UPDATE orders SET status = 'FAILED', error_log = ? WHERE id IN (?)",
+        ['Producto sin qb_item_id en QBO', missingQbItem.map((o: any) => o.id)]
+      );
+    }
+
+    const inactiveInQbo = toApprove.filter((o: any) => o.qb_item_id && o.qb_active === 0);
+    if (inactiveInQbo.length > 0) {
+      await pool.query(
+        "UPDATE orders SET status = 'FAILED', error_log = ? WHERE id IN (?)",
+        ['Item inactivo en QuickBooks — hay que reactivarlo en QBO antes de reintentar', inactiveInQbo.map((o: any) => o.id)]
+      );
+    }
+
+    const validItems = toApprove.filter((o: any) => o.qb_item_id && o.qb_active !== 0);
+    if (validItems.length === 0) {
+      if (inactiveInQbo.length > 0) {
+        res.status(400).json({ error: 'El producto está inactivo en QuickBooks. Reactivalo en QBO (Products and Services) y volvé a intentar.' });
+      } else {
+        res.status(400).json({ error: 'Ningún producto de este pedido está vinculado a QuickBooks (falta qb_item_id). Contactá al administrador.' });
+      }
+      return;
+    }
+
+    const reservedInvoiceNumber = validItems[0].reserved_invoice_number ?? await reserveInvoiceNumber();
+
+    const [damageRows] = await pool.query(
+      'SELECT barcode, product_name, qty, unit, unit_price, amount, qb_item_id FROM batch_damage WHERE batch_id = ? AND qty > 0',
+      [batchId]
+    ) as any[];
+    const creditsTotal = (damageRows as any[]).reduce((sum, r) => sum + (Number(r.amount) || 0), 0);
+    const creditApplied = Number(validItems[0].credit_applied) || 0;
+
+    const items = validItems.map((o: any) => ({
+      qb_item_id: o.qb_item_id,
+      product_name: o.product_name,
+      price: o.price,
+      quantity: o.quantity,
+      total: o.total,
+    }));
+
+    // Finaliza como SENT — reusado tanto si createBatchInvoice devuelve
+    // éxito directo como si, tras un error (típicamente timeout), la
+    // reconciliación contra QBO confirma que la factura sí se creó.
+    const finalizeApproved = async (invoiceId: string | null) => {
+      await pool.query(
+        "UPDATE orders SET status = 'SENT', qb_invoice_id = ?, error_log = NULL, approved_by = ?, approved_at = NOW() WHERE batch_id = ?",
+        [invoiceId, req.user?.id ?? null, batchId]
+      );
+
+      for (const o of validItems) {
+        await pool.query(
+          "INSERT INTO sync_log (entity_type, entity_id, action, qb_status, qb_id) VALUES ('order', ?, 'create_invoice', 'SUCCESS', ?)",
+          [o.id, invoiceId]
+        );
+      }
+
+      if (invoiceId && creditApplied > 0) {
+        await pool.query(
+          "UPDATE credit_transactions SET invoice_id = ? WHERE reference_batch_id = ? AND type = 'USED' AND invoice_id IS NULL",
+          [invoiceId, batchId]
+        );
+      }
+      if (invoiceId && creditsTotal > 0) {
+        await pool.query(
+          "UPDATE credit_transactions SET invoice_id = ? WHERE reference_batch_id = ? AND type = 'EARNED' AND invoice_id IS NULL",
+          [invoiceId, batchId]
+        );
+      }
+
+      logActivity({ userId: req.user?.id, userEmail: req.user?.email, action: 'BATCH_APPROVED', entityType: 'batch', entityId: String(batchId), details: `${validItems.length} items aprobados y enviados a QBO`, ip: req.ip });
+
+      res.json({ batchId, status: 'SENT', invoiceId, invoiceNumber: reservedInvoiceNumber });
+    };
+
+    try {
+      const invoice = await createBatchInvoice(
+        items, validItems[0].customer_id ?? null, damageRows, validItems[0].payment_method ?? null,
+        validItems[0].check_number ?? null, req.user?.qb_class_id ?? null, reservedInvoiceNumber,
+        creditsTotal, damageRows as any[], creditApplied > 0 ? creditApplied : undefined
+      );
+      const invoiceId = invoice.Invoice?.DocNumber ?? null;
+      await finalizeApproved(invoiceId);
+    } catch (syncErr) {
+      const message = extractQboErrorMessage(syncErr);
+
+      // El error (típicamente un timeout) no confirma que QBO haya
+      // rechazado la factura — puede haberla creado igual, con la
+      // respuesta perdida en el camino. Se verifica por DocNumber antes de
+      // declarar la venta como fallida, para no arriesgar un duplicado si
+      // más tarde se reintenta.
+      let reconciled: { Id: string; DocNumber: string } | null = null;
+      try {
+        reconciled = await findInvoiceByDocNumber(reservedInvoiceNumber);
+      } catch (lookupErr) {
+        logger.warn(`approveBatch: no se pudo verificar contra QBO si la factura #${reservedInvoiceNumber} ya existe:`, lookupErr);
+      }
+
+      if (reconciled) {
+        logger.info(`approveBatch: batch ${batchId} había fallado (${message}) pero la factura #${reservedInvoiceNumber} sí existe en QBO — se toma como éxito`);
+        await finalizeApproved(reconciled.DocNumber ?? String(reservedInvoiceNumber));
+        return;
+      }
+
+      await pool.query(
+        "UPDATE orders SET status = 'FAILED', error_log = ? WHERE id IN (?)",
+        [message, validItems.map((o: any) => o.id)]
+      );
+
+      for (const o of validItems) {
+        await pool.query(
+          "INSERT INTO sync_log (entity_type, entity_id, action, qb_status, error) VALUES ('order', ?, 'create_invoice', 'FAILED', ?)",
+          [o.id, message]
+        );
+      }
+
+      logger.warn(`approveBatch: batch ${batchId} falló al enviar a QBO:`, syncErr);
+      res.status(502).json({ error: message });
+    }
+  } catch (err) {
+    logger.error('approveBatch error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
+// POST /api/orders/batch/:batchId/reconcile — admin-only. Chequeo de solo
+// lectura contra QBO para un batch FAILED/PENDING: pregunta si ya existe una
+// factura con el DocNumber reservado, sin reintentar el envío (cero riesgo
+// de duplicado). Pensado para el caso "un timeout dejó la venta en
+// FAILED/PENDING pero en QBO sí está" cuando ni approveBatch ni
+// retryBatchSync llegaron a correr su reconciliación automática (ej.
+// "Forzar sync" solo reencola, no llama a QBO al instante — ver forceSync).
+export async function reconcileBatch(req: Request, res: Response): Promise<void> {
+  try {
+    const { batchId } = req.params;
+
+    const [orderRows] = await pool.query(
+      'SELECT * FROM orders WHERE batch_id = ?',
+      [batchId]
+    ) as any[];
+
+    if (orderRows.length === 0) {
+      res.status(404).json({ error: 'Pedido no encontrado' });
+      return;
+    }
+
+    if (orderRows.every((o: any) => o.status === 'SENT')) {
+      res.json({ batchId, status: 'SENT', invoiceId: orderRows[0].qb_invoice_id ?? null, reconciled: false, message: 'Esta venta ya estaba marcada como enviada.' });
+      return;
+    }
+
+    if (orderRows.some((o: any) => o.status === 'AWAITING_APPROVAL')) {
+      res.status(400).json({ error: 'Esta venta todavía no se intentó enviar — no hay nada que verificar en QBO todavía.' });
+      return;
+    }
+
+    const docNumber = orderRows[0].reserved_invoice_number ?? orderRows[0].qb_invoice_id ?? null;
+    if (!docNumber) {
+      res.status(400).json({ error: 'Esta orden no tiene un número de factura reservado para verificar contra QuickBooks.' });
+      return;
+    }
+
+    let found: { Id: string; DocNumber: string } | null = null;
+    try {
+      found = await findInvoiceByDocNumber(docNumber);
+    } catch (lookupErr) {
+      logger.warn(`reconcileBatch: error consultando QBO para batch ${batchId}:`, lookupErr);
+      res.status(502).json({ error: 'No se pudo consultar QuickBooks en este momento. Probá de nuevo en unos minutos.' });
+      return;
+    }
+
+    if (!found) {
+      res.json({ batchId, reconciled: false, message: `No se encontró ninguna factura #${docNumber} en QuickBooks todavía — es seguro reintentar el envío.` });
+      return;
+    }
+
+    const invoiceId = found.DocNumber ?? String(docNumber);
+
+    await pool.query(
+      "UPDATE orders SET status = 'SENT', qb_invoice_id = ?, error_log = NULL WHERE batch_id = ?",
+      [invoiceId, batchId]
+    );
+
+    for (const o of orderRows) {
+      await pool.query(
+        "INSERT INTO sync_log (entity_type, entity_id, action, qb_status, qb_id) VALUES ('order', ?, 'create_invoice', 'SUCCESS', ?)",
+        [o.id, invoiceId]
+      );
+    }
+
+    // Backfill de invoice_id en credit_transactions — mismo criterio que
+    // approveBatch, por si el batch tenía crédito por daño (EARNED) o
+    // crédito de cliente aplicado (USED) esperando el número real.
+    const [damageRows] = await pool.query(
+      'SELECT COALESCE(SUM(amount), 0) AS total FROM batch_damage WHERE batch_id = ? AND qty > 0',
+      [batchId]
+    ) as any[];
+    const creditsTotal = Number(damageRows[0]?.total) || 0;
+    const creditApplied = Number(orderRows[0].credit_applied) || 0;
+
+    if (creditApplied > 0) {
+      await pool.query(
+        "UPDATE credit_transactions SET invoice_id = ? WHERE reference_batch_id = ? AND type = 'USED' AND invoice_id IS NULL",
+        [invoiceId, batchId]
+      );
+    }
+    if (creditsTotal > 0) {
+      await pool.query(
+        "UPDATE credit_transactions SET invoice_id = ? WHERE reference_batch_id = ? AND type = 'EARNED' AND invoice_id IS NULL",
+        [invoiceId, batchId]
+      );
+    }
+
+    logActivity({ userId: req.user?.id, userEmail: req.user?.email, action: 'BATCH_RECONCILED', entityType: 'batch', entityId: String(batchId), details: `Factura #${invoiceId} encontrada en QBO y sincronizada localmente`, ip: req.ip });
+
+    res.json({ batchId, status: 'SENT', invoiceId, reconciled: true, message: `Factura #${invoiceId} encontrada en QuickBooks — actualizada a Enviado.` });
+  } catch (err) {
+    logger.error('reconcileBatch error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 }
@@ -467,6 +669,17 @@ export async function retryBatchSync(req: Request, res: Response): Promise<void>
       return;
     }
 
+    // Guard: un batch AWAITING_APPROVAL no se puede "reintentar" — todavía
+    // no se intentó nada, está esperando al admin a propósito. Sin este
+    // check, un operador (retryBatchSync no es admin-only, es para el dueño
+    // del batch) podría llamar este endpoint y saltarse por completo la
+    // aprobación — createBatchInvoice se dispararía igual, solo que desde
+    // acá en vez de approveBatch.
+    if (orderRows.some((o: any) => o.status === 'AWAITING_APPROVAL')) {
+      res.status(400).json({ error: 'Esta venta está esperando aprobación del administrador antes de poder enviarse a QuickBooks.' });
+      return;
+    }
+
     const toRetry = orderRows.filter((o: any) => o.status !== 'SENT');
     if (toRetry.length === 0) {
       res.json({ batchId, status: 'SENT', invoiceId: orderRows[0].qb_invoice_id ?? null });
@@ -502,10 +715,6 @@ export async function retryBatchSync(req: Request, res: Response): Promise<void>
       return;
     }
 
-    const [[{ invoice_counter }]] = await pool.query(
-      'SELECT invoice_counter FROM company_settings WHERE id = 1'
-    ) as any[];
-
     const [damageRows] = await pool.query(
       'SELECT barcode, product_name, qty, unit, unit_price, amount, qb_item_id FROM batch_damage WHERE batch_id = ? AND qty > 0',
       [batchId]
@@ -523,21 +732,44 @@ export async function retryBatchSync(req: Request, res: Response): Promise<void>
       total: o.total,
     }));
 
+    // Declarado ANTES del try (no adentro): el catch de abajo lo necesita
+    // para la reconciliación contra QBO, y un `let` de un try no es visible
+    // en su catch — mismo gotcha ya documentado en createBatch más arriba
+    // (bloques hermanos, no anidados).
+    let docNumber: number | null = null;
     try {
       const creditAppliedRetry = Number(validItems[0].credit_applied) || 0;
-      const invoice = await createBatchInvoice(
-        items, validItems[0].customer_id ?? null, damageRows, validItems[0].payment_method ?? null, validItems[0].check_number ?? null, req.user?.qb_class_id ?? null, invoice_counter, creditAmount, damageRows as any[], creditAppliedRetry > 0 ? creditAppliedRetry : undefined
-      );
-      const invoiceId = invoice.Invoice?.DocNumber;
+      // Si el batch ya tiene un número reservado (flujo de aprobación —
+      // ver approveBatch), se reusa tal cual: el contador ya avanzó cuando
+      // se creó/imprimió el ticket, así que reservar uno nuevo acá
+      // reservaría un SEGUNDO número para la misma venta. Solo se reserva
+      // uno nuevo (withInvoiceNumber, con su semántica "no quema el número
+      // si QBO falla") para batches viejos que nunca pasaron por ese flujo.
+      const alreadyReserved: number | null = validItems[0].reserved_invoice_number ?? null;
+      docNumber = alreadyReserved;
+      let invoiceId: string | undefined;
+
+      if (alreadyReserved) {
+        const invoice = await createBatchInvoice(
+          items, validItems[0].customer_id ?? null, damageRows, validItems[0].payment_method ?? null, validItems[0].check_number ?? null, req.user?.qb_class_id ?? null, alreadyReserved, creditAmount, damageRows as any[], creditAppliedRetry > 0 ? creditAppliedRetry : undefined
+        );
+        invoiceId = invoice.Invoice?.DocNumber;
+      } else {
+        invoiceId = await withInvoiceNumber(async (invoiceNumber, markSuccess) => {
+          docNumber = invoiceNumber;
+          const invoice = await createBatchInvoice(
+            items, validItems[0].customer_id ?? null, damageRows, validItems[0].payment_method ?? null, validItems[0].check_number ?? null, req.user?.qb_class_id ?? null, invoiceNumber, creditAmount, damageRows as any[], creditAppliedRetry > 0 ? creditAppliedRetry : undefined
+          );
+          const id = invoice.Invoice?.DocNumber;
+          if (id) await markSuccess();
+          return id;
+        });
+      }
 
       await pool.query(
         "UPDATE orders SET status = 'SENT', qb_invoice_id = ?, error_log = NULL WHERE batch_id = ?",
         [invoiceId ?? null, batchId]
       );
-
-      if (invoiceId) {
-        await pool.query('UPDATE company_settings SET invoice_counter = invoice_counter + 1 WHERE id = 1');
-      }
 
       for (const o of validItems) {
         await pool.query(
@@ -552,14 +784,55 @@ export async function retryBatchSync(req: Request, res: Response): Promise<void>
         batchId,
         status: 'SENT',
         invoiceId: invoiceId ?? null,
-        invoiceNumber: invoiceId ? invoice_counter : null,
+        invoiceNumber: invoiceId ? docNumber : null,
       });
     } catch (syncErr) {
       const message = extractQboErrorMessage(syncErr);
 
+      // El error (típicamente un timeout) no confirma que QBO haya
+      // rechazado la factura — puede haberla creado igual, con la
+      // respuesta perdida en el camino (ver approveBatch, mismo criterio).
+      // Se verifica por DocNumber antes de declarar el reintento fallido.
+      // Nota: si el número se reservó recién acá (rama sin
+      // reserved_invoice_number previo), un éxito reconciliado no vuelve a
+      // incrementar invoice_counter — ese contador ya quedó "atrás" en un
+      // caso así (edge case pre-existente, no introducido por este fix).
+      let reconciled: { Id: string; DocNumber: string } | null = null;
+      if (docNumber) {
+        try {
+          reconciled = await findInvoiceByDocNumber(docNumber);
+        } catch (lookupErr) {
+          logger.warn(`retryBatchSync: no se pudo verificar contra QBO si la factura #${docNumber} ya existe:`, lookupErr);
+        }
+      }
+
+      if (reconciled) {
+        logger.info(`retryBatchSync: batch ${batchId} había fallado (${message}) pero la factura #${docNumber} sí existe en QBO — se toma como éxito`);
+        const confirmedInvoiceId = reconciled.DocNumber ?? String(docNumber);
+        await pool.query(
+          "UPDATE orders SET status = 'SENT', qb_invoice_id = ?, error_log = NULL WHERE batch_id = ?",
+          [confirmedInvoiceId, batchId]
+        );
+        for (const o of validItems) {
+          await pool.query(
+            "INSERT INTO sync_log (entity_type, entity_id, action, qb_status, qb_id) VALUES ('order', ?, 'create_invoice', 'SUCCESS', ?)",
+            [o.id, confirmedInvoiceId]
+          );
+        }
+        logActivity({ userId: req.user?.id, userEmail: req.user?.email, action: 'BATCH_RETRY_SUCCESS', entityType: 'batch', entityId: String(batchId), details: `${validItems.length} items reenviados a QBO (reconciliado tras timeout)`, ip: req.ip });
+        res.json({ batchId, status: 'SENT', invoiceId: confirmedInvoiceId, invoiceNumber: docNumber });
+        return;
+      }
+
+      // Con número ya reservado (flujo de aprobación), un reintento fallido
+      // vuelve a FAILED — no PENDING — para que el SyncEngine (que solo
+      // procesa PENDING) no lo levante solo y reserve un número nuevo por
+      // accidente. Sin número reservado (batches viejos), se mantiene el
+      // comportamiento previo: PENDING, para que el SyncEngine reintente.
+      const nextStatus = validItems[0].reserved_invoice_number ? 'FAILED' : 'PENDING';
       await pool.query(
-        "UPDATE orders SET status = 'PENDING', error_log = ?, retry_count = 0 WHERE id IN (?)",
-        [message, validItems.map((o: any) => o.id)]
+        'UPDATE orders SET status = ?, error_log = ?, retry_count = 0 WHERE id IN (?)',
+        [nextStatus, message, validItems.map((o: any) => o.id)]
       );
 
       for (const o of validItems) {
@@ -584,6 +857,14 @@ export async function forceSync(req: Request, res: Response): Promise<void> {
     const [rows] = await pool.query('SELECT * FROM orders WHERE id = ?', [id]) as any[];
     if (rows.length === 0) {
       res.status(404).json({ error: 'Pedido no encontrado' });
+      return;
+    }
+    // Igual que retryBatchSync: no dejar que esto reencole para el
+    // SyncEngine (que solo procesa PENDING) una orden AWAITING_APPROVAL —
+    // eso saltearía la aprobación del admin, que es todo el punto de ese
+    // estado. La vía correcta es approveBatch.
+    if (rows[0].status === 'AWAITING_APPROVAL') {
+      res.status(400).json({ error: 'Esta venta está esperando aprobación del administrador antes de poder enviarse a QuickBooks.' });
       return;
     }
     await pool.query("UPDATE orders SET status = 'PENDING', retry_count = 0 WHERE id = ?", [id]);

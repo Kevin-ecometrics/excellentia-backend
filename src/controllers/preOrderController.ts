@@ -1,9 +1,9 @@
 import type { Request, Response } from 'express';
 import pool from '../db/connection.ts';
 import logger from '../services/logger.ts';
-import { createBatchInvoice } from '../services/qbInvoices.ts';
 import { computeDamageCredit } from '../services/creditCalculator.ts';
 import { getCustomerBalance, applyCustomerCredit } from '../services/creditController.ts';
+import { reserveInvoiceNumber } from '../services/invoiceCounter.ts';
 
 async function ensureTables() {
   await pool.query("CREATE TABLE IF NOT EXISTS pre_orders (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, assigned_user_id INT DEFAULT NULL, customer_id VARCHAR(100) NOT NULL, customer_name VARCHAR(255) NOT NULL, salesperson_name VARCHAR(255) DEFAULT NULL, scheduled_date DATE, notes TEXT, status ENUM('DRAFT','CONFIRMED','CONVERTED','CANCELLED') DEFAULT 'DRAFT', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
@@ -285,21 +285,17 @@ export async function convertPreOrder(req: Request, res: Response): Promise<void
     }
 
     const batchId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-    const inserted: { id: number; barcode: string; qb_item_id: string | null; product_name: string; price: number; quantity: number; total: number }[] = [];
+    const inserted: { id: number; barcode: string; product_name: string; price: number; quantity: number; total: number }[] = [];
 
     for (const item of items as any[]) {
       const { barcode, product_name, price, quantity, total, unit, case_qty } = item;
-      const [productRows] = await pool.query(
-        'SELECT qb_item_id FROM products WHERE barcode = ?', [barcode]
-      ) as any[];
-      const qbItemId = productRows[0]?.qb_item_id ?? null;
       const finalTotal = total ?? (price != null && quantity != null ? price * quantity : 0);
       const [result] = await pool.query(
         "INSERT INTO orders (barcode, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name, unit, case_qty, payment_method, check_number, credit_applied, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')",
         [barcode, product_name, price ?? 0, quantity ?? 0, finalTotal,
          batchId, req.user?.id ?? null, preOrder.customer_id, preOrder.customer_name, unit ?? null, case_qty ?? null, payment_method ?? null, check_number ?? null, null]
       ) as any;
-      inserted.push({ id: result.insertId, barcode, qb_item_id: qbItemId, product_name, price: price ?? 0, quantity: quantity ?? 0, total: finalTotal });
+      inserted.push({ id: result.insertId, barcode, product_name, price: price ?? 0, quantity: quantity ?? 0, total: finalTotal });
     }
 
     // Persistir el detalle finalizado de vuelta en pre_order_items — así
@@ -355,60 +351,39 @@ export async function convertPreOrder(req: Request, res: Response): Promise<void
 
     await pool.query("UPDATE pre_orders SET status = 'CONVERTED' WHERE id = ?", [id]);
 
-    // Calcular crédito disponible antes de la factura (necesitamos el monto para QBO)
+    // Crédito de cliente aplicado — igual criterio que createBatch: se
+    // aplica de inmediato (invoiceId=NULL por ahora), approveBatch
+    // (orderController.ts) backfillea invoice_id cuando la factura real de
+    // QBO exista.
     let creditApplied = 0;
     if (apply_credit && apply_credit > 0 && preOrder.customer_id) {
       try {
         const { balance } = await getCustomerBalance(preOrder.customer_id);
         creditApplied = Math.round(Math.min(Number(apply_credit), balance) * 100) / 100;
-      } catch (creditErr: any) {
-        logger.warn(`[credit] Error al consultar saldo en convertPreOrder batch ${batchId}: ${creditErr.message}`);
-      }
-    }
-
-    let invoiceId: string | null = null;
-    let invoiceNumber: number | null = null;
-    try {
-      const validItems = inserted.filter(i => i.qb_item_id) as { id: number; qb_item_id: string; product_name: string; price: number; quantity: number; total: number }[];
-      if (validItems.length > 0) {
-        const [[{ invoice_counter }]] = await pool.query(
-          'SELECT invoice_counter FROM company_settings WHERE id = 1'
-        ) as any[];
-
-        const invoice = await createBatchInvoice(validItems, preOrder.customer_id, damage_items ?? [], payment_method ?? null, check_number ?? null, req.user?.qb_class_id ?? null, invoice_counter, creditsTotal, damageComputed, creditApplied > 0 ? creditApplied : undefined);
-        invoiceId = invoice.Invoice?.DocNumber ?? null;
-        if (invoiceId) {
-          invoiceNumber = invoice_counter;
-          await pool.query('UPDATE company_settings SET invoice_counter = invoice_counter + 1 WHERE id = 1');
-        }
-        await pool.query("UPDATE orders SET status = 'SENT', qb_invoice_id = ? WHERE batch_id = ?", [invoiceId, batchId]);
-
-        // Aplicar crédito DESPUÉS de la factura (necesitamos el invoiceId)
-        if (creditApplied > 0 && preOrder.customer_id && invoiceId) {
-          try {
-            await applyCustomerCredit(preOrder.customer_id, preOrder.customer_name ?? null, creditApplied, batchId, invoiceId);
-            await pool.query(
-              "UPDATE orders SET credit_applied = ? WHERE batch_id = ?",
-              [creditApplied, batchId]
-            );
-          } catch (creditErr: any) {
-            logger.warn(`[credit] Error al persistir crédito en convertPreOrder batch ${batchId}: ${creditErr.message}`);
-          }
-        }
-
-        // Vincular invoice_id a las transacciones EARNED de este batch
-        if (invoiceId && creditsTotal > 0) {
+        if (creditApplied > 0) {
+          await applyCustomerCredit(preOrder.customer_id, preOrder.customer_name ?? null, creditApplied, batchId, null);
           await pool.query(
-            "UPDATE credit_transactions SET invoice_id = ? WHERE reference_batch_id = ? AND type = 'EARNED' AND invoice_id IS NULL",
-            [invoiceId, batchId]
+            "UPDATE orders SET credit_applied = ? WHERE batch_id = ?",
+            [creditApplied, batchId]
           );
         }
+      } catch (creditErr: any) {
+        logger.warn(`[credit] Error al aplicar crédito en convertPreOrder batch ${batchId}: ${creditErr.message}`);
+        creditApplied = 0;
       }
-    } catch (syncErr) {
-      logger.warn(`convertPreOrder batch ${batchId}: sync a QBO falló, queda PENDING`, syncErr);
     }
 
-    res.status(201).json({ batchId, invoiceId, invoiceNumber, preOrderId: id, creditsTotal, creditApplied });
+    // El envío real a QBO se difiere hasta que un admin apruebe
+    // (POST /api/orders/batch/:batchId/approve, approveBatch en
+    // orderController.ts) — acá solo se reserva el número de factura, para
+    // que el ticket salga con un número real.
+    const invoiceNumber = await reserveInvoiceNumber();
+    await pool.query(
+      "UPDATE orders SET status = 'AWAITING_APPROVAL', reserved_invoice_number = ? WHERE batch_id = ?",
+      [invoiceNumber, batchId]
+    );
+
+    res.status(201).json({ batchId, invoiceId: null, invoiceNumber, preOrderId: id, creditsTotal, creditApplied });
   } catch (err) {
     logger.error('convertPreOrder error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });

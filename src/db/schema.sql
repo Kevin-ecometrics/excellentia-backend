@@ -98,7 +98,10 @@ CREATE TABLE IF NOT EXISTS `orders` (
     `customer_id`   VARCHAR(50) NULL,
     `customer_name` VARCHAR(255) NULL,
     `qb_invoice_id` VARCHAR(50),
-    `status`        ENUM('PENDING', 'SENT', 'FAILED', 'CANCELLED') DEFAULT 'PENDING',
+    `reserved_invoice_number` INT NULL,
+    `approved_by`   INT NULL,
+    `approved_at`   TIMESTAMP NULL,
+    `status`        ENUM('AWAITING_APPROVAL', 'PENDING', 'SENT', 'FAILED', 'CANCELLED') DEFAULT 'PENDING',
     `error_log`     TEXT,
     `retry_count`   INT DEFAULT 0,
     `unit`          VARCHAR(20) NULL,
@@ -310,6 +313,8 @@ CREATE TABLE IF NOT EXISTS `routes` (
     `status`          ENUM('PLANNED','IN_PROGRESS','COMPLETED','CANCELLED') DEFAULT 'PLANNED',
     `notes`           TEXT DEFAULT NULL,
     `created_by`      INT DEFAULT NULL,
+    `returns_reviewed_at` TIMESTAMP DEFAULT NULL,
+    `returns_reviewed_by` INT DEFAULT NULL,
     `created_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     `updated_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (`warehouse_id`) REFERENCES `warehouses`(`id`)
@@ -318,6 +323,8 @@ CREATE TABLE IF NOT EXISTS `routes` (
 -- Migración para DB existente (cPanel):
 -- ALTER TABLE routes ADD COLUMN IF NOT EXISTS warehouse_id INT DEFAULT NULL AFTER driver_user_id;
 -- ALTER TABLE routes ADD FOREIGN KEY (warehouse_id) REFERENCES warehouses(id);
+-- ALTER TABLE routes ADD COLUMN IF NOT EXISTS returns_reviewed_at TIMESTAMP DEFAULT NULL AFTER created_by;
+-- ALTER TABLE routes ADD COLUMN IF NOT EXISTS returns_reviewed_by INT DEFAULT NULL AFTER returns_reviewed_at;
 
 -- -----------------------------------------------------------------------------
 -- 18. route_stops
@@ -556,7 +563,34 @@ UPDATE routes SET warehouse_id = (SELECT id FROM warehouses ORDER BY id LIMIT 1)
 --    creadas arriba, no requieren backfill (tablas nuevas, arrancan vacías).
 
 -- =============================================================================
--- Fin del schema — 22 tablas + migraciones Fase 48, 61 y 112
+-- Migración (2026-08-31): marca explícita de "devoluciones revisadas" por ruta
+-- Para bases existentes (ejecutar una sola vez)
+-- =============================================================================
+
+-- routes.returns_reviewed_at distingue "todavía no se revisó" de "se revisó
+-- y no había nada que devolver" — antes se inferría (mal) de si route_returns
+-- tenía filas, lo que confundía una ruta 100% vendida con una sin revisar.
+ALTER TABLE routes ADD COLUMN IF NOT EXISTS returns_reviewed_at TIMESTAMP DEFAULT NULL AFTER created_by;
+ALTER TABLE routes ADD COLUMN IF NOT EXISTS returns_reviewed_by INT DEFAULT NULL AFTER returns_reviewed_at;
+
+-- =============================================================================
+-- Migración (2026-09-01): aprobación de admin antes de enviar una venta a QBO
+-- Para bases existentes (ejecutar una sola vez)
+-- =============================================================================
+
+-- Nuevo estado AWAITING_APPROVAL: createBatch/createOrder/convertPreOrder ya
+-- no llaman a QBO al crear la venta — reservan el número de factura (ticket
+-- sale con número real) y quedan en este estado hasta que un admin aprueba
+-- (POST /api/orders/batch/:batchId/approve). reserved_invoice_number guarda
+-- ese número para que la aprobación (o un retry post-fallo) no reserve uno
+-- nuevo. approved_by/approved_at quedan para auditoría de quién aprobó.
+ALTER TABLE orders MODIFY COLUMN status ENUM('AWAITING_APPROVAL','PENDING','SENT','FAILED','CANCELLED') DEFAULT 'PENDING';
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS reserved_invoice_number INT NULL AFTER qb_invoice_id;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS approved_by INT NULL AFTER reserved_invoice_number;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP NULL AFTER approved_by;
+
+-- =============================================================================
+-- Fin del schema — 22 tablas + migraciones Fase 48, 61, 112, 2026-08-31 y 2026-09-01
 -- =============================================================================
 SET FOREIGN_KEY_CHECKS = 1;
 SET FOREIGN_KEY_CHECKS = 1;

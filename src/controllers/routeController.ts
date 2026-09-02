@@ -9,6 +9,7 @@ import {
   applyFifoAllocation,
   restoreLotQuantity,
   recordMovement,
+  InsufficientStockError,
 } from './warehouseController.ts';
 
 // Orden forward-only: PLANNED -> IN_PROGRESS -> COMPLETED, sin poder retroceder.
@@ -41,6 +42,8 @@ async function ensureTables() {
       status          ENUM('PLANNED','IN_PROGRESS','COMPLETED','CANCELLED') DEFAULT 'PLANNED',
       notes           TEXT DEFAULT NULL,
       created_by      INT DEFAULT NULL,
+      returns_reviewed_at TIMESTAMP DEFAULT NULL,
+      returns_reviewed_by INT DEFAULT NULL,
       created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       FOREIGN KEY (warehouse_id) REFERENCES warehouses(id)
@@ -125,7 +128,7 @@ export async function listRoutes(req: Request, res: Response): Promise<void> {
     const driver_user_id = req.user?.role === 'operator' ? req.user.id : req.query.driver_user_id;
     let query = `
       SELECT r.id, r.name, r.scheduled_date, r.driver_user_id, u.name AS driver_name,
-             r.status, r.notes, r.created_by, r.created_at, r.updated_at,
+             r.status, r.notes, r.created_by, r.returns_reviewed_at, r.created_at, r.updated_at,
              COUNT(rs.id) AS stop_count
       FROM routes r
       LEFT JOIN users u ON u.id = r.driver_user_id
@@ -608,7 +611,11 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
       try {
         allocations = await computeFifoAllocation(product.id, warehouseId, quantity);
       } catch (allocErr: any) {
-        res.status(409).json({ error: allocErr.message });
+        if (allocErr instanceof InsufficientStockError) {
+          res.status(409).json({ error: allocErr.message, available: allocErr.available, requested: allocErr.requested, product_id: product.id });
+        } else {
+          res.status(409).json({ error: allocErr.message });
+        }
         return;
       }
     }
@@ -775,10 +782,16 @@ export async function getExpectedReturns(req: Request, res: Response): Promise<v
        WHERE ri.route_id = ?`, [id]
     ) as any[];
 
+    // rs.batch_id alcanza solo (sin filtrar por stop_type) — además de las
+    // paradas BATCH (batch_id seteado desde que se crea el stop en addStop),
+    // ahora también matchea paradas CUSTOMER ya vendidas ("Vender por
+    // scratch"), que createBatch vincula recién al momento de la venta (ver
+    // orderController.ts). Las PRE_ORDER nunca tienen batch_id, siguen sin
+    // aparecer acá — comportamiento sin cambios para ese caso.
     const [soldRows] = await pool.query(
       `SELECT o.barcode, SUM(o.quantity) AS sold_qty
        FROM orders o
-       JOIN route_stops rs ON rs.batch_id = o.batch_id AND rs.stop_type = 'BATCH'
+       JOIN route_stops rs ON rs.batch_id = o.batch_id
        WHERE rs.route_id = ? AND o.status != 'CANCELLED'
        GROUP BY o.barcode`, [id]
     ) as any[];
@@ -823,8 +836,13 @@ export async function createReturns(req: Request, res: Response): Promise<void> 
   try {
     const { id } = req.params;
     const { items } = req.body;
-    if (!Array.isArray(items) || items.length === 0) {
-      res.status(400).json({ error: 'items debe ser un array no vacío' });
+    // items vacío es válido a propósito: es como el almacenista confirma
+    // "ya revisé esta ruta y no hay nada que devolver" (ej. se vendió todo).
+    // Antes esto se rechazaba, lo que hacía imposible marcar como revisada
+    // una ruta 100% vendida — quedaba indistinguible de "todavía no se
+    // revisó" (ver returns_reviewed_at más abajo).
+    if (!Array.isArray(items)) {
+      res.status(400).json({ error: 'items debe ser un array (puede ir vacío si no hay nada que devolver)' });
       return;
     }
 
@@ -896,6 +914,14 @@ export async function createReturns(req: Request, res: Response): Promise<void> 
 
       results.push({ product_id, quantity, condition_status: conditionStatus });
     }
+
+    // Marca la ruta como revisada — sea que haya devuelto algo o no. Es lo
+    // que la webapp usa para avisarle al admin "ruta COMPLETED sin revisar"
+    // en vez de adivinar por si route_returns tiene filas.
+    await pool.query(
+      'UPDATE routes SET returns_reviewed_at = NOW(), returns_reviewed_by = ? WHERE id = ?',
+      [req.user?.id ?? null, id]
+    );
 
     res.status(201).json({ items: results });
   } catch (err) {

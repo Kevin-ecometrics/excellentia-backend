@@ -50,6 +50,8 @@ src/
 | GET | `/api/orders/export` | JWT | Exportar CSV |
 | POST | `/api/orders/:id/sync` | JWT+admin | Forzar sync a QuickBooks (re-encola para SyncEngine, no llama a QBO al instante) |
 | POST | `/api/orders/batch/:batchId/retry` | JWT | Reintenta el envío a QBO de un batch PENDING/FAILED al instante (mismo `createBatchInvoice` que la creación). Disponible para el operador dueño del batch, no solo admin |
+| POST | `/api/orders/batch/:batchId/approve` | JWT+admin | Aprueba un batch AWAITING_APPROVAL y recién ahí lo manda a QBO (Fase 113) — ver "Aprobación de admin..." abajo |
+| POST | `/api/orders/batch/:batchId/reconcile` | JWT+admin | Chequeo de solo lectura contra QBO por DocNumber para un batch FAILED/PENDING — sin reintentar el envío. Ver "Fix (2026-09-01)" abajo |
 | GET | `/api/products` | JWT | Listar productos — `?search=` matchea `name`/`barcode`/**`sku`** (Fase 108), `?sort=sku` ordena por secuencia NEW_SKU (marca A-Z, luego 001, 002…; sin NEW_SKU al final) |
 | GET | `/api/customers` | JWT | Clientes QB |
 | GET | `/api/customers/:customerId` | JWT | Un solo cliente — cache-first contra `cached_customers`, fallback a QB (Fase 102, ticket Android necesitaba resolver dirección para reprint) |
@@ -57,7 +59,7 @@ src/
 | PUT | `/api/settings/invoice-counter` | JWT+admin | Reasigna el próximo número de factura QBO (`company_settings.invoice_counter`) — ver nota abajo |
 | POST | `/api/products/migrate-sku` | JWT+admin | Migración de una sola vez: adopta la nomenclatura NEW_SKU (marca+secuencia) del master sheet Excellentia-vs-QBO — ver nota abajo |
 | \* | `/api/routes/*` | JWT (+admin/almacenista en mutaciones) | Rutas de entrega, paradas y manifiesto de carga — ver "Módulo Almacén" abajo |
-| \* | `/api/warehouse/*` | JWT+admin/almacenista | Recepción, lotes/FIFO, sub-inventario y liquidación diaria — ver "Módulo Almacén" abajo |
+| \* | `/api/warehouse/*` | JWT+admin/almacenista (`/settlements/*` es JWT+admin exclusivo) | Recepción, lotes/FIFO, sub-inventario y liquidación diaria — ver "Módulo Almacén" abajo |
 
 ## migrateSkuNomenclature — migración de una sola vez a la nomenclatura NEW_SKU
 
@@ -131,11 +133,45 @@ vez hiciera falta una re-corrida. La ruta es POST-only: un fetch sin
 
 ## invoice_counter — numeración de facturas QBO
 
-`company_settings.invoice_counter` (fila única, `id = 1`) es el **próximo** `DocNumber` a asignar en QuickBooks — se lee y se incrementa en `createBatch`/`retryBatchSync`/`convertPreOrder` (`orderController.ts`, `preOrderController.ts`) y en `processPendingOrders` (SyncEngine). Cada factura exitosa hace `invoice_counter = invoice_counter + 1`.
+`company_settings.invoice_counter` (fila única, `id = 1`) es el **próximo** `DocNumber` a asignar en QuickBooks — se reserva y se incrementa en `createOrder`/`createBatch`/`retryBatchSync` (`orderController.ts`), `convertPreOrder` (`preOrderController.ts`) y `processPendingOrders` (`syncEngine.ts`). Cada factura exitosa hace `invoice_counter = invoice_counter + 1`.
 
 `PUT /api/settings/invoice-counter` (`updateInvoiceCounter`, `settingsController.ts`) permite reasignarlo manualmente — caso de uso real: se acaba la caja de facturas físicas y hay que arrancar la numeración en un número más alto. **Solo admite avanzar el contador, nunca retroceder** (`next > current`, si no 400) — bajarlo podría reasignar un `DocNumber` que QBO ya usó en una factura previa. Cada cambio queda en `activity_log` (`action = 'INVOICE_COUNTER_UPDATED'`, `details` con `#actual → #nuevo`) para auditoría, dado que es un valor sensible que afecta la numeración fiscal.
 
 Editable desde la webapp en Settings (card "Invoice numbering", admin-only) — `excellentia-webapp/app/settings/_components/SettingsClient.tsx`. Requiere confirmación en un modal antes de aplicar el cambio.
+
+### Fix (2026-08-31) — condición de carrera al reservar el número
+
+Los 5 lugares de arriba seguían el mismo patrón: `SELECT invoice_counter` →
+llamar a QBO (una llamada HTTP, no instantánea) → recién ahí `UPDATE
+invoice_counter = invoice_counter + 1`, **solo si** QBO confirmó la factura
+(así una factura que falla no quema un número — importante porque el
+contador se usa para alinear con un talonario físico de facturas, ver más
+arriba). El problema: la lectura y el incremento no eran una sola operación
+atómica. Si dos ventas entraban casi al mismo tiempo desde dispositivos
+distintos, las dos podían leer el mismo `invoice_counter` antes de que
+cualquiera de las dos llegara al `UPDATE` — QBO rechaza el segundo intento
+(no permite `DocNumber` repetido), esa orden quedaba `PENDING`/`FAILED` para
+reintentar más tarde, pero era un fallo evitable.
+
+**Fix:** `src/services/invoiceCounter.ts` — `withInvoiceNumber(fn)` serializa
+la sección crítica completa (leer + llamar a QBO + incrementar) con un
+*named lock* de MySQL (`GET_LOCK('invoice_counter', 10)` / `RELEASE_LOCK`),
+todo en la misma conexión (`pool.getConnection()`, no `pool.query()` suelto —
+un named lock es por sesión, se pierde si cada consulta toma una conexión
+distinta del pool). Se usa un named lock y no un `SELECT ... FOR UPDATE`
+para no dejar una fila de InnoDB trabada durante toda la llamada HTTP a QBO,
+que puede tardar. `fn` recibe el número reservado y un callback
+`markSuccess()` que hay que llamar explícitamente si QBO confirmó — mismo
+criterio de "no quemar el número si falla" que ya existía, ahora sin la
+carrera. Los 5 call sites se reescribieron para usar este helper en vez de
+las dos queries sueltas.
+
+De paso, `createBatch` tenía un segundo bug relacionado: al armar la
+respuesta HTTP volvía a leer `invoice_counter` y le restaba 1 para reportar
+`invoiceNumber` — bajo la misma concurrencia, ese re-read podía devolver el
+número de **otra** venta que ya hubiera incrementado el contador mientras
+tanto. Reemplazado por usar directamente el número que `withInvoiceNumber`
+ya había reservado para ese batch (`docNumber`, capturado en el closure).
 
 ## Schema — tabla `orders`
 
@@ -243,13 +279,129 @@ Body: { items[], customer_id?, customer_name?, signature?, damage_items?, paymen
    - 1 unidad por línea de ítem (1 escaneo = 1 unidad física)
    - GREATEST previene negativos
 4. Guarda damage_items en batch_damage (qty > 0) — calcula el crédito por línea
-   (computeDamageCredit) y lo agrega a customer_credits
-5. Intenta sync inmediato a QuickBooks (createBatchInvoice, incluye la línea
-   negativa de crédito si corresponde)
-   - Éxito → UPDATE status=SENT, qb_invoice_id
-   - Falla → quedan PENDING para SyncEngine (cada 5 min)
-6. Responde: { batchId, invoiceId, orders[], creditsTotal }
+   (computeDamageCredit) y lo agrega a customer_credits; aplica apply_credit
+   de inmediato (credit_transactions USED, invoice_id=NULL por ahora)
+5. Reserva el número de factura (reserveInvoiceNumber) y queda
+   status=AWAITING_APPROVAL — el envío real a QBO se difiere hasta que un
+   admin apruebe (ver "Aprobación de admin..." más abajo), no pasa acá
+6. Responde: { batchId, invoiceId: null, invoiceNumber, orders[], creditsTotal, creditApplied }
 ```
+
+## Aprobación de admin antes de enviar una venta a QBO (Fase 113)
+
+Pedido urgente del usuario (2026-09-01), mismo espíritu que el rediseño de
+Liquidación diaria de la Fase 112 ("que el admin revise antes de que algo le
+pegue a QBO") pero aplicado al flujo de ventas, no de inventario. Antes de
+esta fase, `createBatch`/`createOrder`/`convertPreOrder` llamaban a
+QuickBooks en la misma request en la que se imprimía el ticket. Ahora **se
+difiere solo el push a QBO, no el registro local** — mismo principio de
+diseño que ya se usó para el sub-inventario de la Fase 112 — la orden, el
+ticket (con número de factura real) y todo lo que es puramente local (stock,
+crédito por daño, crédito de cliente aplicado) siguen sucediendo al
+instante.
+
+**Alcance: todas las ventas**, no solo las de ruta de entrega — decisión
+explícita del usuario. Incluye `createOrder` (el endpoint de un solo item),
+que ahora también genera su propio `batch_id` (antes no tenía) para poder
+aprobarse por el mismo mecanismo que un batch de varios items.
+
+**Estado nuevo `AWAITING_APPROVAL`** en `orders.status`. Al crear una venta,
+los 3 flujos reservan el número de factura al instante
+(`reserveInvoiceNumber()`, `src/services/invoiceCounter.ts` — envuelve
+`withInvoiceNumber()` llamando `markSuccess()` incondicionalmente, porque a
+diferencia del flujo viejo ya no hay forma de saber en ese momento si QBO va
+a aceptar la factura más tarde; el número se considera "usado" en cuanto se
+imprime, igual que un talonario físico) y dejan el batch entero en
+`AWAITING_APPROVAL` con `reserved_invoice_number` guardado — **no** llaman a
+`createBatchInvoice`/`createInvoice`.
+
+**`POST /api/orders/batch/:batchId/approve` (`approveBatch`,
+`orderController.ts`, admin-only)** es el único lugar que de verdad manda la
+venta a QBO. Mismas validaciones que `retryBatchSync` (qb_item_id faltante o
+`qb_active=0` → `FAILED` con mensaje claro) pero arrancando desde
+`AWAITING_APPROVAL`. Usa `reserved_invoice_number` ya guardado — **no**
+reserva un número nuevo, el contador ya avanzó al crear el batch. Éxito →
+`SENT` + `qb_invoice_id` + `approved_by`/`approved_at`; backfillea
+`credit_transactions.invoice_id` tanto para el crédito `EARNED` (daño) como
+`USED` (crédito de cliente aplicado), mismo patrón para los dos. Fallo →
+`FAILED` (reintentable con `retryBatchSync`).
+
+**Por qué no hizo falta tocar el SyncEngine:** `processPendingOrders` solo
+procesa `status = 'PENDING'`. Como los 3 flujos de creación ya no dejan
+nada en `PENDING` (van directo a `AWAITING_APPROVAL`), el SyncEngine nunca
+los toca — cumple el requisito de "no se manda solo" sin cambiar ese
+archivo. Se agregó de todos modos una guarda defensiva ahí y en
+`retryBatchSync`: si una orden tiene `reserved_invoice_number` seteado, se
+reusa tal cual en vez de reservar uno nuevo (evita reservar un segundo
+número para la misma venta si algún camino la deja en `PENDING` por
+error). `retryBatchSync` además cambió su rama de fallo: con número ya
+reservado, un reintento fallido vuelve a `FAILED` (no `PENDING` como antes)
+para que el SyncEngine no la levante solo.
+
+**Guard contra saltearse la aprobación vía `retryBatchSync`/`forceSync`:**
+`retryBatchSync` (no es admin-only, lo puede llamar el operador dueño del
+batch) y `forceSync` (admin-only) no distinguían `AWAITING_APPROVAL` de
+`PENDING`/`FAILED` — sin este guard, cualquiera de los dos hubiera podido
+mandar la venta a QBO directamente, saltándose por completo la revisión del
+admin. Ambos ahora responden 400 ("esperando aprobación del administrador")
+si el batch/orden está en `AWAITING_APPROVAL`, antes de tocar nada.
+
+**`listOrders`** expone `reserved_invoice_number` y, vía subqueries
+correlacionadas (mismo patrón que `damage_credits`), a qué ruta pertenece un
+batch (`route_id`/`route_name`/`route_date`, `NULL` si la venta no está
+atada a ninguna ruta) — así el admin puede "revisar la ruta" desde la
+pantalla de aprobación sin una llamada aparte.
+
+**Efecto secundario aceptado, no corregido en esta fase:**
+`statsController.ts` (ingresos) y `routes/customers.ts` (stats de cliente,
+"última compra") filtran `status = 'SENT'` — con este cambio hay un delay
+entre la venta y que aparezca en esos números (hasta que el admin aprueba).
+Coherente con lo que esos reportes ya significan ("facturado de verdad en
+QBO"), pero vale tenerlo presente.
+
+**Webapp** — la pantalla `/orders` ya existente (no una nueva) gana un chip
+de filtro "Por aprobar", un botón "Aprobar y enviar a QBO" (admin-only,
+visible solo en batches `AWAITING_APPROVAL`, con el mismo `ConfirmModal` que
+ya usa `/warehouse/settlement` para su cierre diario) y un tag de ruta junto
+al ID del batch cuando aplica.
+
+**Fix (2026-09-01) — un timeout de QBO se registraba como fallo aunque la factura sí se hubiera creado.**
+Encontrado en producción: `oauthClient.makeApiCall` (intuit-oauth) tiene un
+timeout default de 30000ms — si QBO tarda más que eso en responder pero la
+factura **sí** se creó de su lado, `approveBatch`/`retryBatchSync` recibían
+la excepción de timeout y marcaban la venta `FAILED` (o `PENDING` vía
+"Forzar sync") aunque la factura ya existiera en QBO — riesgo real de
+duplicado si alguien reintentaba. Fix en dos partes:
+- `qbInvoices.ts` — `createInvoice`/`createBatchInvoice` suben el timeout a
+  60000ms (mitiga, no elimina el riesgo).
+- Nueva `findInvoiceByDocNumber(docNumber)` (`qbInvoices.ts`, query QBO por
+  `DocNumber`) — `approveBatch` y `retryBatchSync` la llaman en su `catch`
+  **antes** de marcar la venta como fallida: si la factura ya existe en QBO
+  con ese número reservado, se toma como éxito real (`SENT` +
+  `qb_invoice_id`) en vez de `FAILED`/`PENDING`. Evita que un reintento
+  posterior sobre un DocNumber que ya existe termine en un duplicado.
+- **`POST /api/orders/batch/:batchId/reconcile`** (`reconcileBatch`,
+  admin-only) — cubre el hueco que dejan `approveBatch`/`retryBatchSync`: su
+  reconciliación automática solo corre dentro de un intento de envío real,
+  pero **"Forzar sync" (`forceSync`) no llama a QBO al instante** — solo
+  reencola para el SyncEngine (cada 5 min) — así que una venta que quedó
+  `FAILED`/`PENDING` por un timeout, pero que en QBO sí se creó, podía
+  quedar sin reconciliar hasta el próximo ciclo (o hasta que alguien la
+  arreglara a mano en la DB, como pasó en producción el 2026-09-01). Este
+  endpoint es de **solo lectura contra QBO** (consulta por `DocNumber`, no
+  reintenta el envío — cero riesgo de duplicado): si encuentra la factura,
+  actualiza local a `SENT` + `qb_invoice_id` + backfill de
+  `credit_transactions`; si no la encuentra, responde que es seguro
+  reintentar. Botón "Verificar en QBO" en `/orders`, junto a "Forzar sync"
+  (mismas condiciones: admin, batch `PENDING`/`FAILED`).
+
+**Fuera de alcance de esta fase:** el repo de Android no se tocó (no está en
+este workspace). El contrato de respuesta de los 3 endpoints de creación no
+cambia de forma, pero `orders[].status` ahora puede llegar
+`AWAITING_APPROVAL` en vez de `SENT`/`PENDING` justo después de crear la
+venta, y `invoiceId` llega `null` hasta la aprobación — hay que verificar en
+el repo Android si algo depende de esos valores puntuales antes de dar esto
+por cerrado en producción.
 
 ## updateBatchPayment — PUT /api/orders/batch/:batchId/payment (Fase 82)
 
@@ -342,6 +494,17 @@ body (`route_item_lots.used_suggested_lot = 0`), la app Android se lo ofrece
 tras mostrar la sugerencia. `removeRouteItem` revierte recorriendo
 `route_item_lots` de esa línea y restaurando `remaining_qty` en cada lote.
 
+Un lote recibido con un error de tipeo (cantidad o expiración) se corrige con
+`PUT /api/warehouse/lots/:id` (`updateLot`, agregado 2026-08-31 a pedido del
+usuario) — solo mientras el lote sigue `ACTIVE`, y no deja bajar la cantidad
+por debajo de lo que ya se asignó a una ruta. El delta queda como un
+movimiento `ADJUSTMENT` aparte; el `RECEIPT` original nunca se toca (registro
+histórico). Expuesto en Android desde `InventoryMovementsActivity` — botón de
+editar en las filas `RECEIPT` cuyo lote sigue activo. Corregir el *producto*
+de una recepción mal escaneada queda fuera de alcance a propósito (implicaría
+mover stock entre dos productos) — la vía es dar de baja el lote
+(`setLotCondition`) y recibir de nuevo.
+
 **Sub-inventario y liquidación diaria (Fase 112) — `inventory_movements`/
 `daily_settlements`/`settlement_lines`.** Decisión de diseño central: **se
 difiere solo el push a QBO, no el registro local.** Cada movimiento
@@ -350,7 +513,10 @@ difiere solo el push a QBO, no el registro local.** Cada movimiento
 el día, igual que antes de esta fase — pero ya **no** dispara
 `updateItemQtyOnHand` al instante (ese código, `syncStockToQbo` en
 `routeController.ts`, se eliminó). El movimiento queda con `settlement_id
-NULL` (pendiente) hasta que la liquidación del día lo agrupa. Confirmar una
+NULL` (pendiente) hasta que la liquidación del día lo agrupa. Quién dispara
+`preview`/`confirm` es el **admin**, desde `/warehouse/settlement` en la
+webapp (`adminOnly`, no `warehouseOnly` — el almacenista no tiene acceso,
+ver más abajo "Alcance de la Fase 112"). Confirmar una
 liquidación (`POST /api/warehouse/settlements/:id/confirm`) es barato de
 razonar porque `updateItemQtyOnHand` ya trabaja con `QtyOnHand` **absoluto**,
 no delta: como `products.stock` local ya está siempre al día, liquidar es
@@ -376,14 +542,34 @@ físicamente, no re-valida lo que se vendió (eso ya está en `orders`) —
 `GET /api/routes/:id/returns/expected` da la referencia (cargado − vendido −
 ya revisado) pero no bloquea si el conteo real no coincide.
 
-**Alcance de la Fase 112: backend + Android, sin Dashboard.** Mismo patrón
-que la Fase 111 pero al revés ("primero Android, después Dashboard/webapp") —
-a pedido explícito del usuario. Las pantallas nuevas en Android
-(`ReceivingActivity`, `RouteReturnsActivity`, `SettlementActivity`,
+**`routes.returns_reviewed_at`/`returns_reviewed_by` (2026-08-31) — marca
+explícita de revisión, no inferida.** `createReturns` la estampa siempre al
+terminar, **incluso con `items: []`** (el endpoint dejó de exigir al menos
+un producto) — así una ruta 100% vendida se puede marcar "revisada, nada
+para devolver" en vez de quedar indistinguible de una ruta que todavía
+nadie miró (antes se adivinaba por si `route_returns` tenía filas, y los dos
+casos se veían idénticos). Se usa para avisos en la webapp (badge en
+`/warehouse`, banner en `/warehouse/settlement`) — **nunca para bloquear**;
+se evaluó un bloqueo duro y se descartó porque no hay forma de que sea
+preciso sin esta marca, y aun con ella el admin puede tener razones válidas
+para liquidar antes de tiempo.
+
+**Alcance de la Fase 112: backend + Android primero, con un ajuste posterior
+el mismo día.** Mismo patrón que la Fase 111 pero al revés ("primero
+Android, después Dashboard/webapp") — a pedido explícito del usuario. Las
+pantallas de Android (`ReceivingActivity`, `RouteReturnsActivity`,
 `InventoryMovementsActivity`) son deliberadamente simples (listas y
-formularios, sin gráficos/reportes); `SettlementActivity` en particular es la
-primera candidata a moverse/duplicarse al Dashboard cuando se aborde esa
-fase, ya que es una tarea más de oficina que de piso de almacén.
+formularios, sin gráficos/reportes). Una excepción reconsiderada en la
+práctica: la **liquidación diaria** arrancó como `SettlementActivity` en
+Android (accesible al almacenista), pero el usuario decidió después que ese
+paso — revisar lo que pasó en cada ruta y confirmar el cierre a QBO — es
+tarea exclusiva del **admin desde la webapp**, no del almacenista en el
+TC22. `SettlementActivity` se eliminó por completo de Android (no quedó como
+código muerto) y el flujo se reconstruyó en `/warehouse/settlement`
+(`excellentia-webapp`), gateado a `admin` tanto en el backend
+(`adminOnly` en `warehouseInventory.ts`) como en la página. El resto del
+módulo (recepción, FIFO, sub-inventario, devoluciones) sigue siendo tarea
+del almacenista en Android, sin cambios.
 
 ## Notas de diseño
 

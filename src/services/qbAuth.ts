@@ -159,13 +159,26 @@ function loadTokensFromEnv(): boolean {
 }
 
 async function refreshToken(): Promise<void> {
+  // Capturado ANTES de llamar a .refresh() — Intuit no siempre devuelve un
+  // refresh_token nuevo en la respuesta (comportamiento normal de OAuth2
+  // cuando el proveedor no rota el token en cada refresh; QBO lo omite en
+  // algunos casos). Guardado como fallback para no perderlo si la respuesta
+  // viene sin él.
+  const previousRefreshToken = oauthClient.getToken().refresh_token;
   try {
     const authResponse = await oauthClient.refresh();
     const token = authResponse.getToken();
+    // Bug de producción (2026-09-01): acá se hacía `token.refresh_token ??
+    // ''` — bajo un incidente de Intuit que devolvió la respuesta sin
+    // refresh_token, eso pisó el token válido guardado en `qb_tokens` con
+    // un string vacío, dejando la integración muerta ("The Refresh token is
+    // missing") hasta reconectar manualmente. Ahora, si no viene uno nuevo,
+    // se sigue usando el que ya teníamos.
+    const refreshTokenToUse = token.refresh_token || previousRefreshToken || '';
 
     oauthClient = createClient({
       access_token: token.access_token ?? '',
-      refresh_token: token.refresh_token ?? '',
+      refresh_token: refreshTokenToUse,
       realmId: defaultTokens.realmId,
       expires_in: token.expires_in,
       x_refresh_token_expires_in: token.x_refresh_token_expires_in,
@@ -174,7 +187,7 @@ async function refreshToken(): Promise<void> {
 
     await saveTokensToDb({
       access_token: token.access_token ?? '',
-      refresh_token: token.refresh_token ?? '',
+      refresh_token: refreshTokenToUse,
       realm_id: defaultTokens.realmId,
       expires_in: token.expires_in,
       x_refresh_token_expires_in: token.x_refresh_token_expires_in,

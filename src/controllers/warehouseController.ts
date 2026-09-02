@@ -2,8 +2,19 @@ import type { Request, Response } from 'express';
 import pool from '../db/connection.ts';
 import logger from '../services/logger.ts';
 import { updateItemQtyOnHand } from '../services/qbItems.ts';
+import { normalizeQbActive } from './productController.ts';
 
 export type MovementType = 'RECEIPT' | 'ROUTE_LOAD' | 'RETURN' | 'DAMAGE' | 'ADJUSTMENT';
+
+// Distingue "cero recibido para este producto" (available === 0 — la app
+// ofrece ir a Recepción) de "hay, pero no alcanza" (available > 0 — solo hay
+// que avisar cuánto hay) sin tener que parsear el string del mensaje.
+export class InsufficientStockError extends Error {
+  constructor(public available: number, public requested: number) {
+    super(`Stock insuficiente en el almacén: disponible ${available}, solicitado ${requested}`);
+    this.name = 'InsufficientStockError';
+  }
+}
 
 export interface FifoAllocation {
   lot_id: number;
@@ -176,7 +187,7 @@ export async function computeFifoAllocation(
 
   if (remaining > 0.0001) {
     const totalAvailable = quantity - remaining;
-    throw new Error(`Stock insuficiente en el almacén: disponible ${totalAvailable}, solicitado ${quantity}`);
+    throw new InsufficientStockError(totalAvailable, quantity);
   }
   return allocations;
 }
@@ -329,6 +340,35 @@ export async function listLots(req: Request, res: Response): Promise<void> {
   }
 }
 
+// Productos con stock recibido disponible (>= 1 lote ACTIVE con remaining_qty
+// > 0), agrupados y con la cantidad total sumada — para el picker "Cargar
+// desde recepción" de WarehouseRouteDetailActivity (alternativa a escanear
+// caja por caja cuando se acaba de recibir un lote grande). Devuelve el mismo
+// shape que ProductDto (Android lo reusa tal cual para el flujo de
+// addRouteItem) más `available_qty`.
+export async function listAvailableProducts(req: Request, res: Response): Promise<void> {
+  await ensureWarehouseTables();
+  try {
+    const warehouseId = req.query.warehouse_id ? Number(req.query.warehouse_id) : await getDefaultWarehouseId();
+    const [rows] = await pool.query(
+      `SELECT p.id, p.barcode, p.sku, p.name, p.short_name, p.price, p.min_price,
+              p.qb_item_id, p.qb_active, p.category, p.brand, p.stock,
+              p.weight_per_unit, p.unit, p.qty,
+              SUM(pl.remaining_qty) AS available_qty
+       FROM product_lots pl
+       JOIN products p ON p.id = pl.product_id
+       WHERE pl.warehouse_id = ? AND pl.status = 'ACTIVE' AND pl.remaining_qty > 0
+       GROUP BY p.id
+       ORDER BY p.name`,
+      [warehouseId]
+    ) as any[];
+    res.json({ data: (rows as any[]).map(normalizeQbActive) });
+  } catch (err) {
+    logger.error('listAvailableProducts error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
 export async function suggestLots(req: Request, res: Response): Promise<void> {
   await ensureWarehouseTables();
   try {
@@ -344,7 +384,11 @@ export async function suggestLots(req: Request, res: Response): Promise<void> {
       const allocations = await computeFifoAllocation(productId, warehouseId, quantity);
       res.json({ data: allocations });
     } catch (allocErr: any) {
-      res.status(409).json({ error: allocErr.message });
+      if (allocErr instanceof InsufficientStockError) {
+        res.status(409).json({ error: allocErr.message, available: allocErr.available, requested: allocErr.requested });
+      } else {
+        res.status(409).json({ error: allocErr.message });
+      }
     }
   } catch (err) {
     logger.error('suggestLots error:', err);
@@ -392,15 +436,96 @@ export async function setLotCondition(req: Request, res: Response): Promise<void
   }
 }
 
+// Corrige un lote ya recibido (cantidad y/o fecha de expiración) — pensado
+// para arreglar un error de tipeo en la recepción, no para reescribir
+// historia: solo se puede editar mientras el lote sigue ACTIVE (si ya se
+// dio de baja por daño/vencimiento, o quedó en 0 porque una ruta se llevó
+// todo, no se toca más). Si se achica la cantidad, no se puede bajar de lo
+// que ya se asignó a una ruta (received_qty - remaining_qty). El delta se
+// aplica a products.stock al instante y queda registrado como un movimiento
+// ADJUSTMENT (pendiente de liquidar, como cualquier otro) — no se edita ni
+// reclasifica el movimiento RECEIPT original, que queda como registro
+// histórico de auditoría.
+export async function updateLot(req: Request, res: Response): Promise<void> {
+  await ensureWarehouseTables();
+  try {
+    const { id } = req.params;
+    const { quantity, expiration_date } = req.body;
+
+    const [[lot]] = await pool.query(
+      'SELECT id, warehouse_id, product_id, received_qty, remaining_qty, status FROM product_lots WHERE id = ?', [id]
+    ) as any[];
+    if (!lot) {
+      res.status(404).json({ error: 'Lote no encontrado' });
+      return;
+    }
+    if (lot.status !== 'ACTIVE') {
+      res.status(400).json({ error: `No se puede editar: el lote ya está en estado '${lot.status}'` });
+      return;
+    }
+
+    const updates: string[] = [];
+    const params: any[] = [];
+    let deltaQty = 0;
+
+    if (quantity !== undefined) {
+      const newQty = Number(quantity);
+      if (!Number.isFinite(newQty) || newQty < 0) {
+        res.status(400).json({ error: 'quantity debe ser un número mayor o igual a 0' });
+        return;
+      }
+      const consumed = Number(lot.received_qty) - Number(lot.remaining_qty);
+      if (newQty < consumed) {
+        res.status(409).json({ error: `No se puede bajar de ${consumed} — ya se asignó esa cantidad a una ruta` });
+        return;
+      }
+      deltaQty = newQty - Number(lot.received_qty);
+      updates.push('received_qty = ?', 'remaining_qty = ?');
+      params.push(newQty, Number(lot.remaining_qty) + deltaQty);
+    }
+    if (expiration_date !== undefined) {
+      updates.push('expiration_date = ?');
+      params.push(expiration_date ?? null);
+    }
+    if (updates.length === 0) {
+      res.status(400).json({ error: 'Nada para actualizar — mandá quantity y/o expiration_date' });
+      return;
+    }
+
+    params.push(id);
+    await pool.query(`UPDATE product_lots SET ${updates.join(', ')} WHERE id = ?`, params);
+
+    if (deltaQty !== 0) {
+      await pool.query('UPDATE products SET stock = stock + ? WHERE id = ?', [deltaQty, lot.product_id]);
+      await recordMovement({
+        warehouseId: lot.warehouse_id, productId: lot.product_id, lotId: lot.id,
+        movementType: 'ADJUSTMENT', quantity: deltaQty, createdBy: req.user?.id ?? null,
+      });
+    }
+
+    res.json({ message: 'Lote actualizado' });
+  } catch (err) {
+    logger.error('updateLot error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
 export async function listMovements(req: Request, res: Response): Promise<void> {
   await ensureWarehouseTables();
   try {
     const { warehouse_id, product_id, settled, date } = req.query;
+    // LEFT JOIN product_lots: para las líneas RECEIPT trae la expiración y el
+    // estado del lote, así la pantalla de sub-inventario puede ofrecer
+    // "Editar" sin pedirle al cliente una consulta aparte por cada fila.
     let query = `
       SELECT im.id, im.warehouse_id, im.product_id, im.lot_id, im.movement_type, im.quantity,
              im.route_id, im.settlement_id, im.created_by, im.created_at,
-             p.name AS product_name, p.sku
-      FROM inventory_movements im JOIN products p ON p.id = im.product_id
+             p.name AS product_name, p.sku,
+             pl.expiration_date AS lot_expiration_date, pl.status AS lot_status,
+             pl.received_qty AS lot_received_qty
+      FROM inventory_movements im
+      JOIN products p ON p.id = im.product_id
+      LEFT JOIN product_lots pl ON pl.id = im.lot_id
       WHERE 1=1
     `;
     const params: any[] = [];

@@ -2,6 +2,7 @@ import pool from '../db/connection.ts';
 import { findItemsUpdatedSince } from './qbItems.ts';
 import { createInvoice } from './qbInvoices.ts';
 import { hasQboTokens } from './qbAuth.ts';
+import { withInvoiceNumber } from './invoiceCounter.ts';
 import logger from './logger.ts';
 
 let intervalId: ReturnType<typeof setInterval> | null = null;
@@ -48,18 +49,19 @@ async function processPendingOrders(): Promise<void> {
           continue;
         }
 
-        const [[{ invoice_counter }]] = await pool.query(
-          'SELECT invoice_counter FROM company_settings WHERE id = 1'
-        ) as any[];
-
-        const invoice = await createInvoice(order, order.qb_item_id, order.qb_class_id ?? null, invoice_counter);
-        const invoiceId = invoice.Invoice?.DocNumber;
-
-        if (invoiceId) {
-          await pool.query(
-            'UPDATE company_settings SET invoice_counter = invoice_counter + 1 WHERE id = 1'
-          );
-        }
+        // Defensa extra: si esta orden ya tiene un número reservado (no
+        // debería llegar acá con status PENDING bajo el flujo de aprobación
+        // — ver approveBatch/retryBatchSync en orderController.ts — pero si
+        // pasara, reusarlo evita reservar un segundo número para la misma
+        // venta).
+        const invoiceId = order.reserved_invoice_number
+          ? (await createInvoice(order, order.qb_item_id, order.qb_class_id ?? null, order.reserved_invoice_number)).Invoice?.DocNumber
+          : await withInvoiceNumber(async (invoiceNumber, markSuccess) => {
+              const invoice = await createInvoice(order, order.qb_item_id, order.qb_class_id ?? null, invoiceNumber);
+              const id = invoice.Invoice?.DocNumber;
+              if (id) await markSuccess();
+              return id;
+            });
 
         await pool.query(
           "UPDATE orders SET status = 'SENT', qb_invoice_id = ? WHERE id = ?",

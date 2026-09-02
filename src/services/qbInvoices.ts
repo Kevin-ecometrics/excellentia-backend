@@ -1,4 +1,4 @@
-import { oauthClient, refreshToken } from './qbAuth.ts';
+import { oauthClient, refreshToken, makeQboApiCall } from './qbAuth.ts';
 import type { Order } from '../types/index.ts';
 import { isLbsUnit, formatDamageQty } from './creditCalculator.ts';
 import logger from './logger.ts';
@@ -20,6 +20,10 @@ export async function createInvoice(order: Order, qbItemId: string, classId?: st
   const response = await oauthClient.makeApiCall({
     url: `/v3/company/${process.env.REALM_ID}/invoice`,
     method: 'POST',
+    // Default de intuit-oauth es 30000ms — QBO puede tardar más que eso en
+    // responder aunque la factura sí se cree del lado de ellos (ver
+    // findInvoiceByDocNumber más abajo, que existe justo para ese caso).
+    timeout: 60000,
     body: {
       Line: [
         {
@@ -34,6 +38,22 @@ export async function createInvoice(order: Order, qbItemId: string, classId?: st
     },
   });
   return response.json;
+}
+
+// Un timeout (u otro error de red) al crear una factura NO significa
+// necesariamente que QBO no la haya creado — la llamada puede haber llegado
+// y la respuesta perderse en el camino de vuelta (pasó en producción: la
+// factura se creó en QBO, pero el timeout local la marcó FAILED acá).
+// approveBatch/retryBatchSync llaman esto ANTES de declarar una venta como
+// fallida, para no arriesgar una factura duplicada en un reintento
+// posterior sobre un DocNumber que en realidad ya existe.
+export async function findInvoiceByDocNumber(docNumber: number | string): Promise<{ Id: string; DocNumber: string } | null> {
+  const safeDocNumber = String(docNumber).replace(/'/g, "\\'");
+  const query = `SELECT Id, DocNumber FROM Invoice WHERE DocNumber = '${safeDocNumber}'`;
+  const endpoint = `/v3/company/${process.env.REALM_ID}/query?query=${encodeURIComponent(query)}`;
+  const data = await makeQboApiCall(endpoint);
+  const invoices = data.QueryResponse?.Invoice ?? [];
+  return invoices[0] ?? null;
 }
 
 interface DamageItem { barcode: string; product_name: string; qty: number; unit_price?: number; amount?: number; qb_item_id?: string | null; unit?: string | null }
@@ -212,6 +232,7 @@ export async function createBatchInvoice(
   const response = await oauthClient.makeApiCall({
     url: `/v3/company/${process.env.REALM_ID}/invoice`,
     method: 'POST',
+    timeout: 60000,
     body,
   });
   return response.json;

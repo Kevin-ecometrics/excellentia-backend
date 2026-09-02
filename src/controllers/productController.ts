@@ -9,7 +9,7 @@ import skuMigrationInput from '../data/sku-migration-input.json';
 // Android (Gson, Boolean estricto) tira excepción al parsear un número donde
 // espera true/false — rompe silenciosamente cualquier response que incluya
 // qb_active sin normalizar (findByBarcode, búsqueda por nombre, etc).
-function normalizeQbActive<T extends { qb_active?: unknown }>(row: T): T {
+export function normalizeQbActive<T extends { qb_active?: unknown }>(row: T): T {
   return { ...row, qb_active: row.qb_active == null ? null : !!row.qb_active };
 }
 
