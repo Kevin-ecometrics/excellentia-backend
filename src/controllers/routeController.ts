@@ -208,17 +208,24 @@ export async function getRoute(req: Request, res: Response): Promise<void> {
     // min_expiration_date/used_override: resumen de qué lote(s) alimentaron
     // esta línea (route_item_lots, Fase 112) — para que el detalle de la ruta
     // muestre la expiración sin que Android tenga que pedir cada lote aparte.
+    // loaded_by_name: solo se puede cargar stock de lotes ACTIVE (nunca
+    // dañado/vencido, ver addRouteItem/computeFifoAllocation), así que
+    // scanned_by/created_at ya son la confirmación de que esa línea salió en
+    // buen estado — se expone el nombre acá para que la webapp la muestre
+    // sin una consulta aparte (mismo dato que ya usa Android en la revisión
+    // de devoluciones vía getExpectedReturns).
     const [itemRows] = await pool.query(
       `SELECT ri.id, ri.route_id, ri.product_id, ri.barcode, ri.quantity, ri.scanned_by, ri.created_at, ri.updated_at,
-              p.name, p.sku, p.unit,
+              p.name, p.sku, p.unit, u.name AS loaded_by_name,
               MIN(pl.expiration_date) AS min_expiration_date,
               MAX(1 - ril.used_suggested_lot) AS used_override
        FROM route_items ri
        JOIN products p ON p.id = ri.product_id
+       LEFT JOIN users u ON u.id = ri.scanned_by
        LEFT JOIN route_item_lots ril ON ril.route_item_id = ri.id
        LEFT JOIN product_lots pl ON pl.id = ril.lot_id
        WHERE ri.route_id = ?
-       GROUP BY ri.id, ri.route_id, ri.product_id, ri.barcode, ri.quantity, ri.scanned_by, ri.created_at, ri.updated_at, p.name, p.sku, p.unit
+       GROUP BY ri.id, ri.route_id, ri.product_id, ri.barcode, ri.quantity, ri.scanned_by, ri.created_at, ri.updated_at, p.name, p.sku, p.unit, u.name
        ORDER BY ri.created_at`, [id]
     ) as any[];
 
@@ -566,8 +573,12 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
   await ensureRouteLinkedWarehouseTables();
   try {
     const { id } = req.params;
-    const { barcode, product_id, lot_id } = req.body;
+    const { barcode, product_id, lot_id, source } = req.body;
     const quantity = req.body.quantity === undefined ? 1 : Number(req.body.quantity);
+    // 'STOCK' salta el FIFO por completo y descuenta products.stock directo —
+    // para stock real que todavía no pasó por Recepción (sin lote). Default
+    // 'LOT' preserva el comportamiento de siempre.
+    const useStock = source === 'STOCK';
 
     // product_id cubre el ingreso manual (productos sin código de barras) —
     // ver "Ingresar manualmente" en WarehouseRouteDetailActivity (Android).
@@ -607,8 +618,21 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
     // partir la cantidad entre varios si el primero no alcanza. lot_id es el
     // override manual (el almacenista eligió otro lote a mano) — ahí no se
     // parte entre lotes, tiene que alcanzar con ese solo lote elegido.
-    let allocations: { lot_id: number; qty: number }[];
-    if (lot_id) {
+    // source: 'STOCK' se salta todo esto — no hay lote de por medio, solo se
+    // valida que products.stock alcance (mismo shape de error que
+    // InsufficientStockError, para que Android reuse el mismo manejo de 409).
+    let allocations: { lot_id: number; qty: number }[] = [];
+    if (useStock) {
+      const [[stockRow]] = await pool.query('SELECT stock FROM products WHERE id = ?', [product.id]) as any[];
+      const currentStock = Number(stockRow?.stock) || 0;
+      if (currentStock < quantity) {
+        res.status(409).json({
+          error: `Stock insuficiente: disponible ${currentStock}, solicitado ${quantity}`,
+          available: currentStock, requested: quantity, product_id: product.id,
+        });
+        return;
+      }
+    } else if (lot_id) {
       const [[lot]] = await pool.query(
         `SELECT id, remaining_qty FROM product_lots
          WHERE id = ? AND product_id = ? AND warehouse_id = ? AND status = 'ACTIVE'`,
@@ -636,7 +660,7 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
       }
     }
 
-    await applyFifoAllocation(allocations);
+    if (!useStock) await applyFifoAllocation(allocations);
 
     await pool.query(
       `INSERT INTO route_items (route_id, product_id, barcode, quantity, scanned_by)
@@ -649,16 +673,23 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
     const [[routeItem]] = await pool.query(
       'SELECT id FROM route_items WHERE route_id = ? AND product_id = ?', [id, product.id]
     ) as any[];
-    for (const a of allocations) {
-      await pool.query(
-        `INSERT INTO route_item_lots (route_item_id, lot_id, quantity, used_suggested_lot)
-         VALUES (?, ?, ?, ?)`,
-        [routeItem.id, a.lot_id, a.qty, lot_id ? 0 : 1]
-      );
+    if (useStock) {
       await recordMovement({
-        warehouseId, productId: product.id, lotId: a.lot_id, movementType: 'ROUTE_LOAD',
-        quantity: -a.qty, routeId: Number(id), createdBy: req.user?.id ?? null,
+        warehouseId, productId: product.id, lotId: null, movementType: 'ROUTE_LOAD',
+        quantity: -quantity, routeId: Number(id), createdBy: req.user?.id ?? null,
       });
+    } else {
+      for (const a of allocations) {
+        await pool.query(
+          `INSERT INTO route_item_lots (route_item_id, lot_id, quantity, used_suggested_lot)
+           VALUES (?, ?, ?, ?)`,
+          [routeItem.id, a.lot_id, a.qty, lot_id ? 0 : 1]
+        );
+        await recordMovement({
+          warehouseId, productId: product.id, lotId: a.lot_id, movementType: 'ROUTE_LOAD',
+          quantity: -a.qty, routeId: Number(id), createdBy: req.user?.id ?? null,
+        });
+      }
     }
 
     const [[item]] = await pool.query(
@@ -718,6 +749,15 @@ export async function removeRouteItem(req: Request, res: Response): Promise<void
       });
     }
     await pool.query('DELETE FROM route_item_lots WHERE route_item_id = ?', [itemId]);
+    // Ítem cargado con source: 'STOCK' (sin lote) — el restore de stock de
+    // abajo corre igual, pero sin este movimiento el historial no mostraría
+    // que ese stock volvió (el loop de arriba no itera nada si no hay lotes).
+    if ((lotRows as any[]).length === 0 && Number(item.quantity) > 0) {
+      await recordMovement({
+        warehouseId, productId: item.product_id, lotId: null, movementType: 'ROUTE_LOAD',
+        quantity: Number(item.quantity), routeId: Number(id), createdBy: req.user?.id ?? null,
+      });
+    }
 
     await pool.query('UPDATE products SET stock = stock + ? WHERE id = ?', [item.quantity, item.product_id]);
     await pool.query('DELETE FROM route_items WHERE id = ?', [itemId]);

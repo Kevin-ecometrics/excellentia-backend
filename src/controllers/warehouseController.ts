@@ -369,6 +369,74 @@ export async function listAvailableProducts(req: Request, res: Response): Promis
   }
 }
 
+// Backfill de apertura: productos con stock real (products.stock) de antes de
+// usar el módulo Almacén, sin ningún lote que lo respalde — computeFifoAllocation
+// solo asigna desde product_lots ACTIVE, así que ese stock nunca se puede
+// cargar a una ruta aunque products.stock diga que hay de sobra (aunque sí se
+// puede vender: createBatch/createOrder/convertPreOrder restan products.stock
+// directo, sin pedir lote). Esta corrida crea UN lote por producto con la
+// diferencia (gap = stock − lotes ACTIVE ya existentes), para que ese stock
+// quede utilizable por FIFO igual que cualquier otro.
+//
+// A propósito NO toca products.stock (ya está correcto, es lo que se está
+// respaldando) ni llama a recordMovement — no fue un movimiento físico real,
+// es registrar en el sistema algo que ya existía. Generar un movimiento
+// RECEIPT acá lo dejaría pendiente de la próxima liquidación y empujaría
+// QtyOnHand a QBO de nuevo sin necesidad, además de aparecer en el historial
+// como si hoy hubiera entrado mercadería nueva.
+//
+// Mismo criterio dry-run/apply que migrateSkuNomenclature (productController.ts):
+// sin ?apply=true solo informa qué haría, no escribe nada.
+export async function backfillLots(req: Request, res: Response): Promise<void> {
+  await ensureWarehouseTables();
+  try {
+    const apply = req.query.apply === 'true';
+    const warehouseId = req.body.warehouse_id ?? await getDefaultWarehouseId();
+    const expirationDate = req.body.expiration_date ?? null;
+    const productIds: number[] | undefined = Array.isArray(req.body.product_ids) ? req.body.product_ids : undefined;
+
+    let query = `
+      SELECT p.id, p.name, p.sku, p.barcode, p.stock,
+             COALESCE(SUM(pl.remaining_qty), 0) AS lot_qty
+      FROM products p
+      LEFT JOIN product_lots pl ON pl.product_id = p.id AND pl.warehouse_id = ? AND pl.status = 'ACTIVE'
+      WHERE p.stock > 0
+    `;
+    const params: any[] = [warehouseId];
+    if (productIds && productIds.length > 0) {
+      query += ` AND p.id IN (${productIds.map(() => '?').join(',')})`;
+      params.push(...productIds);
+    }
+    query += ' GROUP BY p.id, p.name, p.sku, p.barcode, p.stock HAVING p.stock > COALESCE(SUM(pl.remaining_qty), 0) ORDER BY p.name';
+
+    const [rows] = await pool.query(query, params) as any[];
+
+    const results: any[] = [];
+    for (const row of rows as any[]) {
+      const gap = Number(row.stock) - Number(row.lot_qty);
+      if (apply) {
+        const receiptBatchId = 'backfill-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        const [insertResult] = await pool.query(
+          `INSERT INTO product_lots (receipt_batch_id, warehouse_id, product_id, barcode, expiration_date, received_qty, remaining_qty, received_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [receiptBatchId, warehouseId, row.id, row.barcode ?? null, expirationDate, gap, gap, req.user?.id ?? null]
+        ) as any;
+        results.push({ product_id: row.id, name: row.name, sku: row.sku, gap, status: 'applied', lot_id: insertResult.insertId });
+      } else {
+        results.push({ product_id: row.id, name: row.name, sku: row.sku, gap, status: 'dry_run' });
+      }
+    }
+
+    res.json({
+      data: results,
+      summary: { count: results.length, total_qty: results.reduce((s, r) => s + r.gap, 0), applied: apply },
+    });
+  } catch (err) {
+    logger.error('backfillLots error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
 export async function suggestLots(req: Request, res: Response): Promise<void> {
   await ensureWarehouseTables();
   try {
