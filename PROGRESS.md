@@ -4060,28 +4060,125 @@ para los TC22.
 |---|---|---|
 | Alta | **Módulo de inventario** | Hoy "stock" es solo un contador (`products.stock`) que baja al vender (`createBatch`) y se sincroniza con `QtyOnHand` de QBO — no hay pantalla ni endpoint dedicado a inventario, ni en backend, webapp o Android. Para que sea un módulo real falta: (1) cerrar el gap ya documentado de que `convertPreOrder` no descuenta stock (nota al final de la Fase 87) — **sigue sin cerrar**; (2) ~~recepción de mercadería~~ — **resuelto en la Fase 112** (`POST /api/warehouse/receipts`, `product_lots`); (3) conteo físico / reconciliación con motivo registrado — **sigue sin cerrar**: `inventory_movements.movement_type` ya tiene el valor `ADJUSTMENT` reservado en el ENUM, pero ningún endpoint lo usa todavía, no hay flujo de "conteo físico" real; (4) ~~historial de movimientos auditable~~ — **resuelto en la Fase 112** (`inventory_movements`, `GET /api/warehouse/movements`, `InventoryMovementsActivity` en Android); (5) Lbs y peso real en stock — la Fase 112 ya soporta cantidades `DECIMAL` en `product_lots`/recepción, así que técnicamente ya se puede recibir por peso, pero la decisión de política (¿debe el stock de Lbs reflejar peso real o seguir siendo solo un contador de eventos de venta, dado que `Qty: 1` fijo a QBO sigue vigente — Fase 39?) sigue sin tomarse; (6) alertas de stock bajo con punto de reorden — **sigue sin cerrar**, ver fila en Webapp más arriba; (7) daños (`batch_damage`) no parecen ajustar `products.stock`, solo generan crédito en dólares — **sigue sin confirmar**, distinto del daño de almacén de la Fase 112 (`route_returns`/`product_lots.status`), que sí ajusta stock; (8) soporte offline — **sigue sin cerrar**, la Fase 112 explícitamente dejó todo el módulo Almacén online-only, mismo criterio que rutas (Fase 111). Preguntado por el usuario 2026-08-28; puntos 2 y 4 cerrados por la Fase 112, el resto sigue abierto |
 
-### Almacén — próxima fase (planeada, sin implementar): rutas directas/consignación/cortesías, transporter damage y créditos
+### Fase 115 — Módulo Routes: rutas directas/no directas, reconciliación, consignación y cortesías (diseño confirmado 2026-09-02, sin implementar todavía)
 
-Pedido por el usuario 2026-08-31, justo después de cerrar la Fase 112 (recepción,
-FIFO, sub-inventario, liquidación, devoluciones, condición del producto).
-Todavía **sin alcance ni número de fase asignado** — queda documentado acá para
-no perderlo, con el análisis de qué ya cubre la Fase 112 y qué es
-conceptualmente nuevo, para cuando se planifique en serio.
+Pedido original por el usuario 2026-08-31, justo después de cerrar la Fase 112.
+Retomado el 2026-09-02 al cerrarse el resto del módulo Almacén (Fase 114) —
+esta entrada **reemplaza** la anterior "Almacén — próxima fase" con las
+decisiones ya confirmadas por el usuario, así que el diseño de abajo ya se
+puede implementar sin más preguntas abiertas sobre las 4 primeras piezas.
+**A pedido explícito del usuario, esa vuelta fue solo de documentación — sin
+código todavía.**
 
-| Feature (pedido del usuario) | Ya cubierto por la Fase 112 | Qué falta / es nuevo |
+**Actualización (2026-09-02, mismo día) — schema ya migrado, código sigue
+pendiente.** El usuario corrió a mano, vía phpMyAdmin, las 4 piezas de abajo
+(`routes.route_type`, `route_stops.stop_type` + `CONSIGNMENT`, tabla nueva
+`route_consignment_items`, `orders.is_courtesy`) — **antes** de que exista
+ningún controller/endpoint/pantalla que las use, mismo orden que otras veces
+en este proyecto (preparar la base primero). `db/schema.sql` y
+`excellentia_schema.sql` ya quedaron actualizados en el repo (definición de
+tabla + bloque de migración "Fase 115", mismo patrón que Fase 112) para que
+no vuelvan a desincronizarse como pasó con la Fase 111. Con los defaults
+(`route_type = 'MULTI_STOP'`, `is_courtesy = 0`) el comportamiento actual no
+cambió en nada — el código de hoy simplemente no lee estas columnas todavía.
+
+**Decisiones confirmadas con el usuario (2026-09-02):**
+1. **Ruta directa** = un solo destino, con la carga ya pre-vendida/pre-asignada
+   de antemano (no se vende "por scratch" en el camino). **No directa** = el
+   flujo actual (multi-parada, se vende sobre la marcha, se cuenta al volver).
+2. **Consignación** — precio = el del catálogo (`products.price`), sin campo
+   de precio nuevo ni negociación por cliente.
+3. **Cortesías** — se facturan en QBO, pero en **$0** — la cantidad/unidad de
+   la línea sigue exactamente la misma lógica que ya usa una venta normal
+   (Lbs = peso real, Case/Unit = `case_qty` unidades por caja con su c/u,
+   Bucket = conteo). Se logra reusando el flujo de venta existente
+   (`createBatch`) en vez de construir uno nuevo, así hereda gratis ese
+   manejo por tipo de unidad que ya está resuelto ahí.
+4. **Reconciliación** (enviado vs vendido + regresado + dañado + otra
+   condición) — **solo avisa, no bloquea** — mismo criterio ya usado en todo
+   el módulo Almacén (`returns_reviewed_at`, `expected returns`); se evaluó
+   bloqueo duro y se descartó por la misma razón que las veces anteriores
+   (trabaría casos legítimos por conteos incompletos).
+
+| # | Feature | Diseño |
 |---|---|---|
-| **Rutas directas / no directas** | Nada — `routes` no distingue tipos hoy, toda ruta sigue el mismo flujo armar→cargar→repartir→completar→revisar devoluciones | Agregar algo como `routes.route_type` y definir con el usuario, antes de tocar schema, qué cambia exactamente entre "directa" y "no directa" en cada uno de: movimiento de producto, inventario, ventas y devoluciones — la descripción del ticket no lo especifica |
-| **Salida y regreso de productos** | Salida (`route_items`/`inventory_movements` `ROUTE_LOAD`) y regreso (`route_returns`) ya existen | Hoy `GET /api/routes/:id/returns/expected` es solo referencia, **no bloquea** si el conteo real no coincide (decisión explícita de la Fase 112, se mantuvo en la Fase 114). Esto pide una reconciliación formal — probablemente debería bloquear el cierre de la ruta si enviado ≠ vendido + regresado + dañado + otra condición (la Liquidación diaria que existía como otro posible punto de bloqueo se eliminó en la Fase 114 — QBO se sincroniza al toque, ya no hay un paso de cierre aparte) |
-| **Productos no vendidos** | Ya cubierto en la práctica: `route_returns.condition_status = 'GOOD'` repone `remaining_qty` del lote que la ruta usó | Definir si "no vendido" necesita ser una categoría propia separada de "regresó en buen estado" en general (reportería), o si alcanza con lo que ya hay |
-| **Consignación** | Nada — concepto nuevo | Requiere: relacionar clientes con la ruta/parada de consignación, precios propios (¿distintos del catálogo?), y un estado de inventario intermedio que hoy no existe — "en consignación en el cliente X" (ni en almacén ni vendido) hasta liquidar (parte se vende → factura, parte regresa → stock). `route_items` hoy solo modela "cargado en el camión", no "entregado a un tercero sin vender todavía" |
-| **Cortesías** | Nada — concepto nuevo | Necesita un flag/tipo en la línea de venta o el manifiesto (`orders`/`route_items`, ej. `COURTESY`) que descuente inventario sin generar ingreso — decidir si pasa por QBO con `Amount: 0` o no se factura en absoluto |
-| **Expired / Damaged en el nuevo flujo** | Prácticamente resuelto — `route_returns.condition_status` (`DAMAGED`/`EXPIRED`) y `product_lots.status` ya existen, y ninguno de los dos vuelve a entrar al pool FIFO (`computeFifoAllocation` solo toma lotes `ACTIVE`) | Más que construir, confirmar/pulir con casos reales una vez se pruebe la Fase 112 |
-| **Transporter Damage** | Nada — `route_returns.condition_status` hoy solo tiene `GOOD`/`DAMAGED`/`EXPIRED` | Agregar un 4° valor (ej. `TRANSPORTER_DAMAGE`) para diferenciar "se dañó en tránsito" (salió bueno del almacén) de "ya estaba dañado/vencido" — probablemente amerita reportería/responsabilidad distinta (reclamos al transportista) |
-| **Aplicación de créditos** | El sistema de créditos ya existe (`credit_transactions`, Fases 75/76) pero asume que el daño se detecta **en el momento de la venta** (`computeDamageCredit`) o sin venta asociada (`POST /api/credits/issue`) | `route_returns` hoy no tiene ningún vínculo con `orders`/`credit_transactions` — falta conectar devoluciones Expired/Damaged/Transporter Damage de una ruta directa o consignación con la orden/cliente real, para aplicar el crédito correspondiente y confirmar que el producto no vuelve a estar disponible para reenviarse (esto último ya lo garantiza la Fase 112: el producto dado de baja en `route_returns` no restituye `remaining_qty`) |
+| 115.1 | **Rutas directas / no directas** | `routes.route_type ENUM('DIRECT','MULTI_STOP') DEFAULT 'MULTI_STOP'`. `addStop` rechaza (`400`) agregar una 2ª parada a una ruta `DIRECT` — si no, el campo queda decorativo sin cambiar nada real. Selector al crear ruta (Android `WarehouseActivity`/webapp `RouteModal.tsx`) + badge en lista/detalle (las 2 apps) |
+| 115.2 | **Reconciliación de salida/regreso** | La base ya existe (`route_items`, `route_returns`, `GET /api/routes/:id/returns/expected`) — falta el resumen formal. Nuevo endpoint (o extender el existente) que desglose `route_returns` por `condition_status` (hoy se suma todo junto) y calcule `discrepancy = loaded − (sold + returned_good + returned_damaged + returned_expired)` por producto. Panel nuevo en el detalle de ruta (Android y webapp) con la discrepancia resaltada si `≠ 0` — sin bloquear nada |
+| 115.3 | **Productos no vendidos que regresan** | Ya cubierto en la práctica desde la Fase 112 (`route_returns.condition_status = 'GOOD'` repone `remaining_qty`) — lo que faltaba era el desglose de 115.2 para verlo separado de "vendido" en vez de inferirlo |
+| 115.4 | **Consignación** | La pieza más grande — concepto nuevo, `route_items` hoy modela toda la carga del camión, no por parada. Requiere: `route_stops.stop_type` gana `'CONSIGNMENT'`; tabla nueva `route_consignment_items` (`route_stop_id`, `product_id`, `quantity_left`, `quantity_sold`, `quantity_returned`, `settled_at`); endpoint para registrar qué se dejó (resta stock igual que `addRouteItem`, mismo `movementType: 'ROUTE_LOAD'`, sin tipo nuevo) y endpoint para **liquidar** (`quantity_sold` → venta real vía `createBatch` al precio de catálogo; `quantity_returned` → restituye stock igual que `route_returns` `GOOD`). Android: nueva parada tipo Consignación + pantalla de liquidación. Webapp: solo lectura |
+| 115.5 | **Cortesías** | `orders.is_courtesy TINYINT(1) DEFAULT 0`. `price`/`total` locales guardan el valor real de catálogo (reportería — "cuánto se regaló"); el `$0` se aplica solo en la línea de QBO (`qbInvoices.ts`, `UnitPrice: 0` en vez de `total`, mismo `Qty` que ya se usa hoy). Excluir `is_courtesy = 1` de reportes de ingresos (`statsController.ts`). Android: checkbox "Marcar como cortesía" por ítem, mismo lugar que "+ Agregar crédito" (Fase 85). Webapp: chip "Cortesía" en `/orders` |
 
-**Nota para cuando se planifique:** varias de estas piezas (consignación,
-cortesías, rutas directas) son conceptos que no encajan del todo en el modelo
-actual de `route_items`/`route_stops` (pensado para "cargar el camión" +
-"parada = pedido/pre-orden/cliente"), así que probablemente convenga una
-sesión de diseño propia (como se hizo para la Fase 112) antes de tocar
-schema, en vez de ir agregando columnas sueltas a lo ya existente.
+**Fuera de esta ronda, no pedido explícitamente esta vez** (quedan del
+análisis anterior, sin descartar para más adelante): **Transporter Damage**
+(un 4° valor en `route_returns.condition_status` para diferenciar "se dañó en
+tránsito" de "ya estaba mal") y **aplicación de créditos** conectando
+`route_returns` con `credit_transactions` (hoy el sistema de créditos asume
+que el daño se detecta en el momento de la venta o sin venta asociada, no
+como devolución de ruta). **Retomado como módulo aparte en la Fase 116, ver
+más abajo** — el usuario decidió armarlo como su propio módulo chico (3
+sub-tareas) en vez de agregarlo a esta lista de Routes.
+
+**Orden sugerido de implementación:** 115.1 (directas) → 115.5 (cortesías) →
+115.2 (reconciliación) → 115.4 (consignación, la más grande) — cada pieza es
+funcional por separado, se puede cortar entre una y otra.
+
+### Fase 116 — Módulo Damage/Credits: Expired/Damaged/Transporter Damage y valuación de pérdida en devoluciones de ruta (diseño confirmado 2026-09-02, sin implementar todavía)
+
+Pedido original por el usuario 2026-09-02, elegido para encarar antes que el
+resto de la Fase 115 por ser más chico (3 sub-tareas). Mismo criterio que la
+Fase 115: **esta ronda fue solo de documentación y schema — sin código
+todavía.** El usuario ya corrió a mano las 3 sentencias de migración de
+abajo contra su base antes de que exista ningún controller/endpoint/pantalla
+que las use.
+
+**Sub-tareas pedidas por el usuario (verbatim):**
+1. Mantener y adaptar el manejo de productos Expired y Damaged dentro del
+   nuevo flujo de Warehouse y Routes — que queden registrados correctamente
+   y no vuelvan a enviarse como disponibles para venta.
+2. Agregar una nueva condición para productos dañados durante el transporte,
+   diferenciada de Expired y Damaged — que se pueda determinar que el
+   producto salió del almacén en buen estado y se dañó en el traslado.
+3. Aplicar el crédito correspondiente cuando un producto sea Expired,
+   Damaged o Transporter Damage, y que el producto quede fuera de lo
+   disponible para volver a enviarse.
+
+**Decisión confirmada con el usuario sobre la sub-tarea 3:** no es un crédito
+a cliente — un producto que vuelve dañado/vencido de una ruta nunca se
+vendió (por eso vuelve), así que no hay `customer_id` real detrás
+(`credit_transactions` siempre requiere uno, no aplica acá). Es **pérdida de
+inventario valorizada**: mismo cálculo por unidad que ya usa
+`computeDamageCredit()`/`unitValueOf()` (`creditCalculator.ts` — Case/Unit
+divide `price` entre el tamaño de paquete, Lbs/Bucket usan `price` directo),
+reusado para valorizar la pérdida en dólares, sin tocar el sistema de
+créditos de clientes ni `POST /api/credits/issue`. El usuario pidió
+explícitamente revisar en detalle cómo lo usa hoy el flujo de operador
+(`createBatch`/`preOrderController.convert`/`routes/credits.ts`) antes de
+adaptarlo — confirmado que los 3 call sites existentes no cambian.
+
+| # | Sub-tarea | Diseño |
+|---|---|---|
+| 116.1 | **Auditoría Expired/Damaged en Warehouse+Routes** | Ya resuelto desde las Fases 112/114, se confirma sin reconstruir: `product_lots.status` DAMAGED/EXPIRED nunca vuelve al pool FIFO (`computeFifoAllocation` solo toma `ACTIVE`); `route_returns.condition_status` DAMAGED/EXPIRED nunca restituye stock/lotes (`createReturns`, solo GOOD restituye); la carga por `source: 'STOCK'` (Fase 114) tampoco puede tomar algo dado de baja porque `setLotCondition` ya descontó `products.stock` con `GREATEST(...,0)` al marcarlo. **Gap conocido, sin cerrar:** un producto que nunca pasó por Recepción (stock 100% genérico, sin lote) no se puede marcar dañado/vencido hoy — `setLotCondition` requiere un `lot_id` real; mitigación ya disponible es correr el backfill (`POST /api/warehouse/lots/backfill`, Fase 114) antes |
+| 116.2 | **Transporter Damage** | `route_returns.condition_status` → `ENUM('GOOD','DAMAGED','EXPIRED','TRANSPORTER_DAMAGE')`. Mismo tratamiento que DAMAGED/EXPIRED en todo (no restituye stock/lotes, notas obligatorias) — la única diferencia es la etiqueta, para distinguir en reportes "ya estaba mal" de "se rompió en el camino" (reclamo a transportista / responsabilizar una ruta puntual). `createReturns` (`routeController.ts`) solo necesita agregar el valor a la lista de válidos — el resto ya trata "no GOOD" genéricamente. Android (`RouteReturnsActivity`): 4° campo de cantidad. Webapp: badge de color propio (distinto del rojo de DAMAGED y el ámbar de EXPIRED) |
+| 116.3 | **Valuación de la pérdida** | `route_returns` gana `unit_price`/`amount DECIMAL(10,2)` (mismo shape que `batch_damage.unit_price`/`amount`). `computeDamageCredit()` hoy busca el producto solo por `barcode` (puede ser `NULL`, Fase 105) — se extiende `DamageInput` con un `product_id?` opcional, cambio chico y retrocompatible, para que `createReturns` (que solo tiene `product_id`) pueda usarlo directo. Para líneas DAMAGED/EXPIRED/TRANSPORTER_DAMAGE, `createReturns` calcula y guarda `unit_price`/`amount` al insertar; GOOD no calcula nada. Webapp: mostrar el monto junto al badge de condición en el detalle de ruta |
+
+**No requiere cambios:** `credit_transactions`/`applyCustomerCredit`/
+`POST /api/credits/issue` quedan intactos (esto no es crédito de cliente);
+`batch_damage` sigue siendo específico de daño en venta o standalone con
+cliente — `route_returns` queda con su propio par `unit_price`/`amount`, sin
+mezclarse con esa tabla.
+
+**Actualización (2026-09-02, mismo día) — schema ya migrado, código sigue
+pendiente.** El usuario corrió a mano, vía phpMyAdmin, las 3 sentencias de
+abajo — todos los SQL de ambos módulos (Fase 115 y Fase 116) ya están
+aplicados en phpMyAdmin por el momento. `db/schema.sql`
+y `excellentia_schema.sql` ya quedaron actualizados en el repo (definición de
+tabla + bloque de migración "Fase 116", mismo patrón que Fase 115). Con los
+defaults (`unit_price`/`amount` NULL, ENUM retrocompatible) el comportamiento
+actual no cambió en nada — el código de hoy simplemente no lee estas columnas
+ni el nuevo valor del ENUM todavía.
+
+```sql
+ALTER TABLE route_returns MODIFY COLUMN condition_status ENUM('GOOD','DAMAGED','EXPIRED','TRANSPORTER_DAMAGE') NOT NULL DEFAULT 'GOOD';
+ALTER TABLE route_returns ADD COLUMN IF NOT EXISTS unit_price DECIMAL(10,2) NULL AFTER notes;
+ALTER TABLE route_returns ADD COLUMN IF NOT EXISTS amount DECIMAL(10,2) NULL AFTER unit_price;
+```

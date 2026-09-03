@@ -101,6 +101,9 @@ CREATE TABLE IF NOT EXISTS `orders` (
     `retry_count`   INT DEFAULT 0,
     `created_at`    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     `updated_at`    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    -- Fase 115 — factura en QBO a $0 (ver qbInvoices.ts); price/total acá
+    -- siguen guardando el valor real de catálogo, para reportería.
+    `is_courtesy`   TINYINT(1) NOT NULL DEFAULT 0,
     `payment_method` VARCHAR(20) NULL,
     `check_number`   VARCHAR(20) NULL,
     FOREIGN KEY (`device_id`) REFERENCES `devices`(`id`),
@@ -288,6 +291,9 @@ CREATE TABLE IF NOT EXISTS `routes` (
     `driver_user_id`  INT DEFAULT NULL,
     `warehouse_id`    INT DEFAULT NULL,
     `status`          ENUM('PLANNED','IN_PROGRESS','COMPLETED','CANCELLED') DEFAULT 'PLANNED',
+    -- Fase 115 — DIRECT: un solo destino, carga pre-vendida/pre-asignada de
+    -- antemano. MULTI_STOP: el flujo de siempre. Default MULTI_STOP.
+    `route_type`      ENUM('DIRECT','MULTI_STOP') NOT NULL DEFAULT 'MULTI_STOP',
     `notes`           TEXT DEFAULT NULL,
     `created_by`      INT DEFAULT NULL,
     `returns_reviewed_at` TIMESTAMP DEFAULT NULL,
@@ -306,7 +312,7 @@ CREATE TABLE IF NOT EXISTS `route_stops` (
     `id`            INT AUTO_INCREMENT PRIMARY KEY,
     `route_id`      INT NOT NULL,
     `position`      INT NOT NULL,
-    `stop_type`     ENUM('BATCH','PRE_ORDER','CUSTOMER') NOT NULL,
+    `stop_type`     ENUM('BATCH','PRE_ORDER','CUSTOMER','CONSIGNMENT') NOT NULL,
     `batch_id`      VARCHAR(50) DEFAULT NULL,
     `pre_order_id`  INT DEFAULT NULL,
     `customer_id`   VARCHAR(50) DEFAULT NULL,
@@ -409,16 +415,24 @@ CREATE TABLE IF NOT EXISTS `inventory_movements` (
 -- 23. route_returns
 -- Fase 112 — revisión de devoluciones: lo que el almacén cuenta físicamente al
 -- volver una ruta (COMPLETED), con su condición. GOOD restituye remaining_qty a
--- los lotes que esa ruta usó; DAMAGED/EXPIRED se da de baja permanente. El
--- almacén audita lo que regresa, no re-valida lo que se vendió (ya en orders).
+-- los lotes que esa ruta usó; DAMAGED/EXPIRED/TRANSPORTER_DAMAGE se da de baja
+-- permanente. El almacén audita lo que regresa, no re-valida lo que se
+-- vendió (ya en orders).
+-- Fase 116 (2026-09-02) — TRANSPORTER_DAMAGE distingue "se rompió en el
+-- camino" de DAMAGED genérico; unit_price/amount valorizan la pérdida
+-- (mismo cálculo que computeDamageCredit, creditCalculator.ts) para
+-- DAMAGED/EXPIRED/TRANSPORTER_DAMAGE — no es crédito a cliente, es pérdida
+-- de inventario. Diseño en PROGRESS.md, código todavía sin implementar.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `route_returns` (
     `id`                 INT AUTO_INCREMENT PRIMARY KEY,
     `route_id`           INT NOT NULL,
     `product_id`         INT NOT NULL,
     `quantity`           DECIMAL(10,2) NOT NULL,
-    `condition_status`   ENUM('GOOD','DAMAGED','EXPIRED') NOT NULL DEFAULT 'GOOD',
+    `condition_status`   ENUM('GOOD','DAMAGED','EXPIRED','TRANSPORTER_DAMAGE') NOT NULL DEFAULT 'GOOD',
     `notes`              TEXT DEFAULT NULL,
+    `unit_price`         DECIMAL(10,2) DEFAULT NULL,
+    `amount`             DECIMAL(10,2) DEFAULT NULL,
     `reviewed_by`        INT NOT NULL,
     `reviewed_at`        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (`route_id`) REFERENCES `routes`(`id`) ON DELETE CASCADE,
@@ -537,5 +551,62 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS approved_by INT NULL AFTER reserved_
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP NULL AFTER approved_by;
 
 -- =============================================================================
--- Fin del schema — 22 tablas + migraciones Fase 48, 111, 112, 2026-08-31 y 2026-09-01
+-- Migración — Fase 115 (2026-09-02): rutas directas/no directas, consignación
+-- y cortesías. Diseño documentado en PROGRESS.md — código todavía sin
+-- implementar al momento de correr esta migración; corrida a mano por el
+-- usuario para dejar la base lista de antemano. Todo aditivo.
+-- Para bases existentes (ejecutar una sola vez)
+-- =============================================================================
+
+-- 1. Rutas directas (un solo destino, carga pre-asignada) vs no directas
+-- (multi-parada, flujo de siempre). Default MULTI_STOP.
+ALTER TABLE routes ADD COLUMN IF NOT EXISTS route_type ENUM('DIRECT','MULTI_STOP') NOT NULL DEFAULT 'MULTI_STOP' AFTER status;
+
+-- 2. Nuevo stop_type para paradas de consignación (además de BATCH/PRE_ORDER/CUSTOMER)
+ALTER TABLE route_stops MODIFY COLUMN stop_type ENUM('BATCH','PRE_ORDER','CUSTOMER','CONSIGNMENT') NOT NULL;
+
+-- 3. Qué se dejó en consignación por parada, y cómo se liquidó (parte
+-- vendida / parte devuelta). route_items sigue siendo el manifiesto de toda
+-- la ruta — esta tabla es la única que trackea por parada/cliente.
+CREATE TABLE IF NOT EXISTS route_consignment_items (
+    id                INT AUTO_INCREMENT PRIMARY KEY,
+    route_stop_id     INT NOT NULL,
+    product_id        INT NOT NULL,
+    quantity_left     DECIMAL(10,2) NOT NULL,
+    quantity_sold     DECIMAL(10,2) NOT NULL DEFAULT 0,
+    quantity_returned DECIMAL(10,2) NOT NULL DEFAULT 0,
+    unit              VARCHAR(20) DEFAULT NULL,
+    case_qty          INT DEFAULT NULL,
+    settled_at        TIMESTAMP DEFAULT NULL,
+    settled_by        INT DEFAULT NULL,
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (route_stop_id) REFERENCES route_stops(id) ON DELETE CASCADE,
+    FOREIGN KEY (product_id) REFERENCES products(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 4. Cortesías — factura en QBO a $0, pero orders.price/total locales
+-- guardan el valor real de catálogo (reportería de "cuánto se regaló").
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS is_courtesy TINYINT(1) NOT NULL DEFAULT 0 AFTER case_qty;
+
+-- =============================================================================
+-- Migración — Fase 116 (2026-09-02): Damage/Credits — Transporter Damage y
+-- valuación de pérdida en devoluciones de ruta. Diseño documentado en
+-- PROGRESS.md — código (backend/webapp/Android) todavía sin implementar al
+-- momento de correr esta migración; corrida a mano por el usuario para dejar
+-- la base lista de antemano. Todo aditivo, no rompe nada de lo ya existente.
+-- Para bases existentes (ejecutar una sola vez)
+-- =============================================================================
+
+-- 1. Nueva condición TRANSPORTER_DAMAGE, distinta de DAMAGED/EXPIRED —
+-- producto que salió del almacén en buen estado y se dañó en el camino.
+ALTER TABLE route_returns MODIFY COLUMN condition_status ENUM('GOOD','DAMAGED','EXPIRED','TRANSPORTER_DAMAGE') NOT NULL DEFAULT 'GOOD';
+
+-- 2-3. Valorización de la pérdida por línea (mismo cálculo que
+-- computeDamageCredit/unitValueOf en creditCalculator.ts) para
+-- DAMAGED/EXPIRED/TRANSPORTER_DAMAGE — no aplica a GOOD.
+ALTER TABLE route_returns ADD COLUMN IF NOT EXISTS unit_price DECIMAL(10,2) NULL AFTER notes;
+ALTER TABLE route_returns ADD COLUMN IF NOT EXISTS amount DECIMAL(10,2) NULL AFTER unit_price;
+
+-- =============================================================================
+-- Fin del schema — 23 tablas + migraciones Fase 48, 111, 112, 115, 116, 2026-08-31 y 2026-09-01
 -- =============================================================================
