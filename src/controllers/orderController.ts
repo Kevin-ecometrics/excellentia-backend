@@ -23,7 +23,7 @@ function extractQboErrorMessage(err: unknown): string {
 
 export async function createOrder(req: Request, res: Response): Promise<void> {
   try {
-    const { barcode, product_name, price, quantity, total, device_id } = req.body;
+    const { barcode, product_name, price, quantity, total, device_id, is_courtesy } = req.body;
     if (!barcode || !product_name || price === undefined || quantity === undefined || quantity <= 0) {
       res.status(400).json({ error: 'Faltan campos requeridos' });
       return;
@@ -38,8 +38,8 @@ export async function createOrder(req: Request, res: Response): Promise<void> {
     const batchId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
     const [result] = await pool.query(
-      "INSERT INTO orders (barcode, product_name, price, quantity, total, batch_id, device_id, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      [barcode, product_name, price, quantity, finalTotal, batchId, device_id ?? null, req.user?.id ?? null]
+      "INSERT INTO orders (barcode, product_name, price, quantity, total, batch_id, device_id, user_id, is_courtesy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [barcode, product_name, price, quantity, finalTotal, batchId, device_id ?? null, req.user?.id ?? null, is_courtesy ? 1 : 0]
     ) as any;
 
     const orderId = result.insertId;
@@ -68,7 +68,7 @@ export async function listOrders(req: Request, res: Response): Promise<void> {
     const limitNum = parseInt(limit as string) || 20;
     const offset = (pageNum - 1) * limitNum;
 
-    let query = `SELECT o.id, o.barcode, o.product_name, o.price, o.quantity, o.total, o.status, o.batch_id, o.qb_invoice_id, o.reserved_invoice_number, o.device_id, o.user_id, o.customer_id, o.customer_name, o.unit, o.case_qty, o.payment_method, o.check_number, o.credit_applied, o.created_at, u.email AS user_email, u.name AS user_name,
+    let query = `SELECT o.id, o.barcode, o.product_name, o.price, o.quantity, o.total, o.status, o.batch_id, o.qb_invoice_id, o.reserved_invoice_number, o.device_id, o.user_id, o.customer_id, o.customer_name, o.unit, o.case_qty, o.payment_method, o.check_number, o.credit_applied, o.is_courtesy, o.created_at, u.email AS user_email, u.name AS user_name,
       (SELECT COALESCE(SUM(bd.amount), 0) FROM batch_damage bd WHERE bd.batch_id = o.batch_id AND bd.qty > 0) AS damage_credits,
       (SELECT r.id FROM route_stops rs JOIN routes r ON r.id = rs.route_id WHERE rs.batch_id = o.batch_id AND rs.stop_type = 'BATCH' LIMIT 1) AS route_id,
       (SELECT r.name FROM route_stops rs JOIN routes r ON r.id = rs.route_id WHERE rs.batch_id = o.batch_id AND rs.stop_type = 'BATCH' LIMIT 1) AS route_name,
@@ -153,6 +153,10 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
 
     for (const item of items) {
       const { barcode, product_name, price, quantity, total, unit, case_qty } = item;
+      // Fase 115.5 — cortesía: price/total locales guardan el valor real de
+      // catálogo (reportería, "cuánto se regaló") — el $0 se aplica recién
+      // en la línea de QBO (ver createBatchInvoice/qbInvoices.ts), nunca acá.
+      const isCourtesy = item.is_courtesy ? 1 : 0;
       const [productRows] = await pool.query('SELECT qb_item_id, min_price, weight_per_unit FROM products WHERE barcode = ?', [barcode]) as any[];
       const product = productRows[0];
       const qbItemId = product?.qb_item_id ?? null;
@@ -169,8 +173,8 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
       }
 
       const [result] = await pool.query(
-        "INSERT INTO orders (barcode, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name, unit, case_qty, payment_method, check_number, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')",
-        [barcode, product_name, price, quantity, total ?? price * quantity, batchId, req.user?.id ?? null, customer_id ?? null, customer_name ?? null, unit ?? null, case_qty ?? null, payment_method ?? null, check_number ?? null]
+        "INSERT INTO orders (barcode, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name, unit, case_qty, payment_method, check_number, is_courtesy, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')",
+        [barcode, product_name, price, quantity, total ?? price * quantity, batchId, req.user?.id ?? null, customer_id ?? null, customer_name ?? null, unit ?? null, case_qty ?? null, payment_method ?? null, check_number ?? null, isCourtesy]
       ) as any;
       inserted.push({ id: result.insertId, barcode, product_name, price, quantity, total: total ?? price * quantity, qb_item_id: qbItemId });
     }
@@ -377,6 +381,7 @@ export async function approveBatch(req: Request, res: Response): Promise<void> {
       price: o.price,
       quantity: o.quantity,
       total: o.total,
+      is_courtesy: !!o.is_courtesy,
     }));
 
     // Finaliza como SENT — reusado tanto si createBatchInvoice devuelve
@@ -730,6 +735,7 @@ export async function retryBatchSync(req: Request, res: Response): Promise<void>
       price: o.price,
       quantity: o.quantity,
       total: o.total,
+      is_courtesy: !!o.is_courtesy,
     }));
 
     // Declarado ANTES del try (no adentro): el catch de abajo lo necesita

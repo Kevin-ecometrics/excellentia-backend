@@ -150,7 +150,7 @@ router.get('/stats', auth, adminOnly, async (_req: Request, res: Response) => {
           customer_id,
           customer_name,
           COUNT(DISTINCT batch_id) AS batch_count,
-          SUM(total) AS total_spent,
+          SUM(CASE WHEN is_courtesy = 0 THEN total ELSE 0 END) AS total_spent,
           MAX(created_at) AS last_order_at
         FROM orders
         WHERE customer_id IS NOT NULL AND status = 'SENT'

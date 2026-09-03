@@ -56,8 +56,8 @@ export async function getStats(req: Request, res: Response): Promise<void> {
       pool.query(`
         SELECT
           (SELECT COUNT(*) FROM orders WHERE DATE(created_at) BETWEEN '${from}' AND '${to}' ${userFilter}) AS orders_period,
-          (SELECT COALESCE(SUM(total),0) FROM orders WHERE DATE(created_at) BETWEEN '${from}' AND '${to}' AND status='SENT' ${userFilter}) AS revenue_period,
-          (SELECT COALESCE(SUM(total),0) FROM orders WHERE status='SENT' ${userFilter}) AS revenue_total,
+          (SELECT COALESCE(SUM(total),0) FROM orders WHERE DATE(created_at) BETWEEN '${from}' AND '${to}' AND status='SENT' AND is_courtesy=0 ${userFilter}) AS revenue_period,
+          (SELECT COALESCE(SUM(total),0) FROM orders WHERE status='SENT' AND is_courtesy=0 ${userFilter}) AS revenue_total,
           (SELECT COUNT(*) FROM orders WHERE status='PENDING' ${userFilter}) AS pending,
           (SELECT COUNT(*) FROM orders WHERE status='SENT' ${userFilter}) AS sent,
           (SELECT COUNT(*) FROM orders WHERE status='FAILED' ${userFilter}) AS failed,
@@ -84,7 +84,7 @@ export async function getStats(req: Request, res: Response): Promise<void> {
       // Top 5 productos del período
       pool.query(`
         SELECT product_name AS name, SUM(total) AS total, COUNT(*) AS count
-        FROM orders WHERE status='SENT' ${dateWhere} ${userFilter}
+        FROM orders WHERE status='SENT' AND is_courtesy=0 ${dateWhere} ${userFilter}
         GROUP BY product_name
         ORDER BY total DESC
         LIMIT 5

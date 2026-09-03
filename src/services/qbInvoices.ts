@@ -59,7 +59,7 @@ export async function findInvoiceByDocNumber(docNumber: number | string): Promis
 interface DamageItem { barcode: string; product_name: string; qty: number; unit_price?: number; amount?: number; qb_item_id?: string | null; unit?: string | null }
 
 export async function createBatchInvoice(
-  items: { qb_item_id: string; product_name: string; price: number; quantity: number; total: number }[],
+  items: { qb_item_id: string; product_name: string; price: number; quantity: number; total: number; is_courtesy?: boolean }[],
   customerId?: string | null,
   damageItems: DamageItem[] = [],
   paymentMethod?: string | null,
@@ -78,12 +78,14 @@ export async function createBatchInvoice(
   // individual es una fila separada en `orders`, ver CLAUDE.md del repo
   // Android) — sin esto, la factura de QBO mostraba una línea por fila (10
   // líneas de "Michoacano - 1 lb" en vez de una sola "Michoacano - 10 lb").
-  // Se agrupa por qb_item_id + price (mismo criterio que el ticket de Android,
-  // `groupedForTicket()` en data/Models.kt) — si el precio cambió entre filas
-  // no se mezclan, igual que en el carrito.
-  const grouped = new Map<string, { qb_item_id: string; product_name: string; price: number; quantity: number; total: number }>();
+  // Se agrupa por qb_item_id + price + is_courtesy (mismo criterio que el
+  // ticket de Android, `groupedForTicket()` en data/Models.kt) — si el precio
+  // cambió entre filas no se mezclan, igual que en el carrito. is_courtesy
+  // entra en la key (Fase 115.5) para que una línea regalada nunca se mezcle
+  // con una pagada del mismo producto/precio — cada una factura distinto.
+  const grouped = new Map<string, { qb_item_id: string; product_name: string; price: number; quantity: number; total: number; is_courtesy?: boolean }>();
   for (const item of items) {
-    const key = `${item.qb_item_id}::${item.price}`;
+    const key = `${item.qb_item_id}::${item.price}::${item.is_courtesy ? 1 : 0}`;
     const existing = grouped.get(key);
     if (existing) {
       existing.quantity += Number(item.quantity);
@@ -94,17 +96,24 @@ export async function createBatchInvoice(
   }
   const groupedItems = Array.from(grouped.values());
 
+  // Cortesía: se factura en QBO a $0 (UnitPrice y Amount) — price/total
+  // locales en `orders` ya guardaron el valor real de catálogo para
+  // reportería ("cuánto se regaló"), acá es donde se aplica el descuento
+  // real a la factura, no antes.
   const lines: any[] = groupedItems.map(item => {
+    const isCourtesy = !!item.is_courtesy;
+    const unitPrice = isCourtesy ? 0 : Number(item.price);
+    const amount = isCourtesy ? 0 : Number(item.total);
     const salesItemLineDetail: Record<string, any> = {
       ItemRef: { value: item.qb_item_id },
       Qty: item.quantity,
-      UnitPrice: Number(item.price),
+      UnitPrice: unitPrice,
     };
     if (classId) salesItemLineDetail.ClassRef = { value: classId };
     return {
       DetailType: 'SalesItemLineDetail' as const,
-      Amount: Number(item.total),
-      Description: `${item.product_name} - ${item.quantity} lb a $${Number(item.price).toFixed(2)}/lb`,
+      Amount: amount,
+      Description: `${item.product_name} - ${item.quantity} lb a $${Number(item.price).toFixed(2)}/lb${isCourtesy ? ' · Cortesía' : ''}`,
       SalesItemLineDetail: salesItemLineDetail,
     };
   });

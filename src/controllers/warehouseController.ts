@@ -146,6 +146,28 @@ export async function ensureRouteLinkedWarehouseTables(): Promise<void> {
       FOREIGN KEY (product_id) REFERENCES products(id)
     )
   `);
+  // Fase 115.4 — qué se dejó en consignación por parada, y cómo se liquidó
+  // (parte vendida / parte devuelta). route_items sigue siendo el manifiesto
+  // de toda la ruta (registerConsignment también inserta ahí, para que la
+  // reconciliación de la Fase 115.2 siga contando lo consignado como
+  // "cargado"); esta tabla es la única que trackea por parada/cliente.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS route_consignment_items (
+      id                INT AUTO_INCREMENT PRIMARY KEY,
+      route_stop_id     INT NOT NULL,
+      product_id        INT NOT NULL,
+      quantity_left     DECIMAL(10,2) NOT NULL,
+      quantity_sold     DECIMAL(10,2) NOT NULL DEFAULT 0,
+      quantity_returned DECIMAL(10,2) NOT NULL DEFAULT 0,
+      unit              VARCHAR(20) DEFAULT NULL,
+      case_qty          INT DEFAULT NULL,
+      settled_at        TIMESTAMP DEFAULT NULL,
+      settled_by        INT DEFAULT NULL,
+      created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (route_stop_id) REFERENCES route_stops(id) ON DELETE CASCADE,
+      FOREIGN KEY (product_id) REFERENCES products(id)
+    )
+  `);
 }
 
 export async function getDefaultWarehouseId(): Promise<number> {

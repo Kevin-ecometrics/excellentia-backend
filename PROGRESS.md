@@ -4122,6 +4122,213 @@ sub-tareas) en vez de agregarlo a esta lista de Routes.
 115.2 (reconciliación) → 115.4 (consignación, la más grande) — cada pieza es
 funcional por separado, se puede cortar entre una y otra.
 
+**Actualización (2026-09-03) — 115.1 implementada (backend + webapp + Android).**
+
+- **Backend** (`routeController.ts`) — `createRoute` acepta `route_type` del
+  body (`'DIRECT'` o default `'MULTI_STOP'`), lo persiste y lo devuelve.
+  `addStop` trae `route_type` en su `SELECT` inicial y rechaza (`400`,
+  "Ruta directa: ya tiene su único destino asignado") agregar una parada si
+  la ruta es `DIRECT` y `route_stops` ya tiene ≥1 fila — antes de tocar
+  nada más del body. `listRoutes` suma `r.route_type` a las columnas
+  explícitas del `SELECT` (`getRoute` ya lo traía gratis vía `r.*`). El
+  `CREATE TABLE IF NOT EXISTS routes` de `ensureTables()` (instalación
+  limpia) también ganó la columna, mismo cuidado que se le dio a
+  `route_returns` en la Fase 116 para que no se desincronice de
+  `db/schema.sql`. `route_type` no es editable desde `updateRoute` — es
+  inmutable después de creada, a propósito.
+- **Webapp** — la ruta se crea y arma **desde Android únicamente**
+  (`RouteModal.tsx` es edit-only: repartidor + notas, sin modo creación,
+  documentado en `excellentia-webapp/CLAUDE.md`) — así que acá solo hizo
+  falta sumar `route_type` a `RouteRow` (`app/warehouse/page.tsx`) y un
+  badge índigo "Directa" en la lista de `WarehouseClient.tsx` cuando
+  `route_type === 'DIRECT'` (`MULTI_STOP`, el caso común, no lleva badge).
+  Claves i18n `wh_routeType_DIRECT` (es/en). `bun run build` limpio.
+- **Android** — `showCreateRouteDialog` (`WarehouseActivity.kt`) gana un
+  `MaterialSwitch` "Ruta directa (un solo destino)", oculto si hay 2+
+  pre-órdenes ya seleccionadas (una ruta armada desde varias pre-órdenes ya
+  es multi-parada por construcción — el backend rechazaría la 2ª parada de
+  todos modos). `RouteRequest`/`RouteDto`/`RouteDetailDto` (`Models.kt`)
+  ganan `route_type` (`@SerializedName("route_type")`). Badge "Direct" en
+  `item_route.xml`/`WarehouseActivity.bindRoute()` (lista) y en
+  `activity_warehouse_route_detail.xml`/`WarehouseRouteDetailActivity.bind()`
+  (detalle), mismo criterio "solo se marca DIRECT" que la webapp. En el
+  detalle, `btnAddStop.isEnabled` ahora también chequea
+  `!(routeType == "DIRECT" && stops.isNotEmpty())` para no dejar que el
+  almacenista llegue al 400 del backend intentando una 2ª parada. Cadenas
+  `route_type_direct`/`label_direct_route` en `values/strings.xml` (en) y
+  `values-es/strings.xml` (es). `:app:compileDebugKotlin` limpio.
+
+**Actualización (2026-09-03) — 115.5 implementada (backend + webapp + Android).**
+
+- **Backend** (`orderController.ts`) — `createBatch`/`createOrder` aceptan
+  `is_courtesy` por ítem, lo insertan en `orders` tal cual (price/total
+  siguen siendo el valor real de catálogo — el $0 se aplica recién en la
+  línea de QBO). `approveBatch`/`retryBatchSync` suman `is_courtesy: !!o.is_courtesy`
+  al `items.map()` que arma la factura (ambos leen `SELECT o.*`, así que la
+  columna ya venía gratis, solo faltaba pasarla). `listOrders` expone
+  `o.is_courtesy`. `qbInvoices.ts` (`createBatchInvoice`) — la key de
+  agrupado de líneas repetidas ganó `is_courtesy` (antes `qb_item_id::price`,
+  ahora `+ ::is_courtesy`) para que una línea regalada nunca se mezcle con
+  una pagada del mismo producto/precio; para líneas cortesía, `UnitPrice` y
+  `Amount` van a `0` (antes `price`/`total` reales), con "· Cortesía" en la
+  `Description` para que se note en QBO. `statsController.ts` — las 3 sumas
+  de ingresos (`revenue_period`, `revenue_total`, top 5 productos) ganaron
+  `AND is_courtesy=0`. `routes/customers.ts` — `total_spent` por cliente
+  pasó a `SUM(CASE WHEN is_courtesy=0 THEN total ELSE 0 END)` (mismo
+  criterio, no estaba en el diseño original pero es la misma clase de
+  reporte de ingresos — dejarlo afuera hubiera inflado "cuánto gastó" un
+  cliente con cortesías). El historial de batches de un cliente (línea 269,
+  detalle de una orden puntual) **no** se tocó a propósito — ahí `SUM(total)`
+  es "qué hay en este pedido", no un agregado de ingresos.
+  **Gap conocido, no cerrado:** el `CREATE TABLE IF NOT EXISTS orders` de
+  `src/routes/setup.ts` (instalación desde cero) ya estaba muy desactualizado
+  antes de esta fase (le faltan `unit`/`case_qty`/`reserved_invoice_number`/etc,
+  no solo `is_courtesy`) — no se tocó para no dar una falsa sensación de que
+  quedó al día arreglando solo una columna.
+- **Webapp** — `OrderRow` (`app/orders/page.tsx`) gana `is_courtesy: boolean | number`
+  (mismo patrón que `qb_active` — TINYINT(1) vía mysql2 no es boolean
+  estricto en JSON). `OrdersClient.tsx` — chip 🎁 "cortesía" (índigo,
+  `--ec-info-bg`/`--ec-info-ink`) junto a `#BATCHID`, visible si algún ítem
+  del batch tiene `is_courtesy` (es una marca por ítem, no por batch entero).
+  Claves i18n `ord_courtesy` (es/en). `bun run build` limpio.
+- **Android** — persistencia local nueva: `pending_orders` gana columna
+  `is_courtesy` (`AppDatabase.kt`, `DATABASE_VERSION` 16→17, mismo patrón que
+  `is_credit` de la Fase 86), `PendingOrderEntity.isCourtesy`, `OrderDao`
+  (insert/cursorToEntity + `setCourtesy(id, bool)` nuevo),
+  `OrderRepository.setCourtesy()`. `item_pending_order.xml` gana un
+  `MaterialCheckBox` "Mark as courtesy" bajo el total de cada fila del
+  carrito (`CurrentOrderActivity.loadOrder()`) — togglear no dispara
+  `loadOrder()` completo (price/quantity no cambian, no hace falta
+  re-renderizar la lista). Oculto en las filas de crédito (Fase 86, no son
+  un producto vendible). `BatchItem` (`Models.kt`) gana
+  `is_courtesy` (`@SerializedName`), poblado en `toBatchItems()` desde
+  `order.isCourtesy`. Cadenas `label_mark_as_courtesy` (en/es).
+  `:app:compileDebugKotlin` limpio.
+- **Fuera de alcance, sin resolver:** qué imprime el ticket físico para una
+  línea cortesía (¿precio real o "$0.00 — Cortesía"?) — no estaba definido
+  en el diseño original, `PrintService.kt` no se tocó.
+
+**Actualización (2026-09-03) — 115.2/115.3 implementada (backend + webapp + Android).**
+
+- **Backend** (`routeController.ts`, `getExpectedReturns`) — la query de
+  `route_returns` pasó de `GROUP BY product_id` (un solo total) a
+  `GROUP BY product_id, condition_status`, desglosado en 4 buckets
+  (good/damaged/expired/transporterDamage). La respuesta por producto gana
+  `returned_good_qty`/`returned_damaged_qty`/`returned_expired_qty`/
+  `returned_transporter_damage_qty` y `discrepancy` (= `loaded_qty − sold_qty
+  − already_returned_qty`, **sin** el `Math.max(...,0)` que sí tiene
+  `expected_return_qty` — un valor negativo es señal real de que se
+  contó/devolvió de más). `already_returned_qty`/`expected_return_qty`
+  quedan igual que antes (suma de los 4 buckets) — 100% retrocompatible con
+  `RouteReturnsActivity` (Android), que sigue usando el mismo endpoint sin
+  cambios de comportamiento. Solo informativo, no bloquea nada — mismo
+  criterio que el resto del módulo Almacén.
+- **Webapp** (`WarehouseClient.tsx`) — nuevo fetch a
+  `GET /api/routes/:id/returns/expected` en `loadDetail()` (antes solo lo
+  consumía Android). Tabla nueva "Reconciliación salida/regreso" en el
+  detalle de ruta, debajo de Devoluciones: Cargado/Vendido/Bueno/Dañado/
+  Vencido/Tránsito/Diferencia por producto. La columna Diferencia se resalta
+  en rojo solo si `route.returns_reviewed_at` está seteado **y**
+  `discrepancy !== 0` — antes de revisar, tener "esperado > 0" es normal
+  (todavía no se contó nada), no es un error que avisar. Claves i18n
+  `wh_reconciliation`/`wh_product`/`wh_sold`/`wh_discrepancy` (es/en,
+  `wh_returnCondition_*` ya existían de la Fase 116 y se reusan para los
+  headers de columna). `bun run build` limpio.
+- **Android** (`WarehouseRouteDetailActivity`) — mismo panel, en la pantalla
+  de **detalle de ruta** (no en `RouteReturnsActivity`, que es donde se
+  *registra* la devolución — acá es donde se *audita después*, mismo
+  endpoint `getExpectedReturns` que ya llamaba `RouteReturnsActivity`, ahora
+  llamado también desde acá vía `loadReconciliation()`). Layout nuevo
+  `item_reconciliation_row.xml`; sección nueva en
+  `activity_warehouse_route_detail.xml` (`tvReconciliationTitle`/
+  `layoutReconciliation`, oculta si no hay nada cargado). Mismo criterio de
+  resaltado que la webapp (`reviewed && row.discrepancy != 0.0` → rojo,
+  si no → gris). `RouteReturnExpectedDto` (`Models.kt`) gana los 4 buckets +
+  `discrepancy` con default `0.0` (retrocompatible si algún día se
+  deserializa una respuesta vieja en caché). Cadenas
+  `wh_reconciliation`/`wh_reconciliation_meta` (en/es).
+  `:app:compileDebugKotlin` limpio.
+
+**115.3 (productos no vendidos que regresan)** queda cerrado por el mismo
+trabajo — era justamente el desglose que faltaba para separar "vendido" de
+"devuelto por condición" en vez de inferirlo de un solo total.
+
+**Actualización (2026-09-03) — 115.4 implementada (backend + webapp + Android). Fase 115 completa.**
+
+**Decisiones de diseño tomadas durante la implementación (no explícitas en el
+diseño original, resueltas con el mejor criterio dado el schema ya migrado):**
+- `registerConsignment` resta stock **sin FIFO por lote** (como
+  `addRouteItem` con `source: 'STOCK'`, no como su modo por defecto) — el
+  schema migrado no incluye una tabla de lotes por línea de consignación
+  (`route_item_lots` referencia `route_items`, no `route_consignment_items`),
+  así que no había dónde trackear una asignación FIFO por consignación sin
+  otra migración manual. También inserta/acumula en `route_items` (mismo
+  `UNIQUE route_product`) para que la reconciliación de la Fase 115.2 lo
+  siga contando como "cargado" en el total de la ruta.
+- Una parada puede recibir varias llamadas de "dejar" antes de liquidar — se
+  acumula en la fila sin liquidar existente (`route_stop_id + product_id +
+  settled_at IS NULL`) en vez de crear filas duplicadas.
+- `settleConsignment` **no exige agotar `quantity_left`** en una sola
+  liquidación (mismo criterio "no bloquea" que `createReturns`) — el
+  remanente queda sin liquidar para una visita futura.
+- La venta real de la parte vendida usa el mismo flujo `AWAITING_APPROVAL`
+  de la Fase 113 (no se factura al instante, un admin la aprueba después) —
+  pero **no** reusa `createBatch` tal cual (que sí descuenta stock): acá el
+  stock ya se descontó al registrar la consignación, así que el INSERT a
+  `orders` se hace directo, sin el paso de descuento.
+- `route_consignment_items` no tiene columna para guardar qué `batch_id`
+  resultó de liquidarla (el schema migrado no la incluye) — **gap conocido,
+  sin cerrar:** no hay trazabilidad automática desde una fila de consignación
+  liquidada hacia la venta que generó; se puede reconstruir a mano por
+  cliente/fecha en `/orders`.
+
+- **Backend** (`routeController.ts`) — `addStop` acepta `stop_type:
+  'CONSIGNMENT'` (mismos requisitos que `CUSTOMER`: `customer_id`/
+  `customer_name`, nunca pre-orden). 3 endpoints nuevos: `POST
+  /api/routes/:id/stops/:stopId/consignment` (`registerConsignment`,
+  warehouseOnly), `GET .../consignment` (`getConsignment`, lectura para
+  cualquier autenticado), `POST .../consignment/settle`
+  (`settleConsignment`, warehouseOnly). `ensureTables()` (`route_stops`) y
+  `ensureRouteLinkedWarehouseTables()` (`route_consignment_items`, tabla
+  nueva) actualizados para instalaciones limpias — mismo cuidado que en las
+  Fases 115.1/116. `tsc --noEmit`: 9 errores preexistentes, ninguno nuevo.
+- **Webapp** (`WarehouseClient.tsx`) — **solo lectura**, según el diseño:
+  paradas `CONSIGNMENT` muestran su label propio, y si tienen líneas
+  (`GET .../consignment`, fetch nuevo en `loadDetail`) las lista debajo con
+  dejado/vendido/devuelto o "sin liquidar". Sin botones de registrar/liquidar
+  — eso es exclusivo de Android. Claves i18n `wh_consignment*` (es/en).
+  `bun run build` limpio.
+- **Android** — nueva pantalla `ConsignmentActivity` (registrar vía escaneo
+  DataWedge o búsqueda manual + liquidar por línea con inputs de vendido/
+  devuelto), lanzada desde un botón nuevo en cada fila `CONSIGNMENT` de
+  `WarehouseRouteDetailActivity` (`renderStops()`). `showStopTypeChooser()`
+  nuevo — antes de abrir el picker de clientes al agregar una parada, ahora
+  pregunta Cliente vs. Consignación (mismo picker de clientes para las dos).
+  Modelos nuevos en `Models.kt`
+  (`ConsignmentRegisterItem/Request/ResultItem/Response`,
+  `ConsignmentItemDto`, `ConsignmentSettleItem/Request/ResultItem/Response`)
+  y 3 endpoints nuevos en `ApiService.kt`. Layout nuevo
+  `activity_consignment.xml`; `item_route_stop.xml` gana un botón "manage"
+  visible solo en paradas `CONSIGNMENT`. `:app:assembleDebug` completo
+  (no solo `compileDebugKotlin`, dado que se agregó una Activity + manifest
+  + layouts nuevos) — limpio.
+
+**Fase 115 (Módulo Routes) queda completa: 115.1 → 115.5 → 115.2/115.3 →
+115.4, backend + webapp + Android compilando en las 3 partes.** Pendiente de
+deploy en las tres (nada de lo de hoy se desplegó a producción todavía).
+
+**Pendiente — testing manual, todavía no hecho.** Todo lo de la Fase 115
+(115.1/115.5/115.2-115.3/115.4) y de la Fase 116 solo está verificado por
+compilación (`tsc --noEmit`, `bun run build`, `:app:assembleDebug`) — ningún
+flujo se probó corriendo de punta a punta contra una base real (crear una
+ruta directa y confirmar que rechaza la 2ª parada; una venta con cortesía y
+ver que la factura de QBO llegue a $0; revisar devoluciones y confirmar que
+el panel de reconciliación resalta bien la discrepancia; registrar y
+liquidar una consignación completa, con venta parcial + devolución parcial).
+Falta correr el backend contra MySQL, probar la webapp en el navegador y la
+app en un TC22 (o emulador) antes de dar cualquiera de las dos fases por
+verificada en la práctica, no solo "compila".
+
 ### Fase 116 — Módulo Damage/Credits: Expired/Damaged/Transporter Damage y valuación de pérdida en devoluciones de ruta (diseño confirmado 2026-09-02, sin implementar todavía)
 
 Pedido original por el usuario 2026-09-02, elegido para encarar antes que el
@@ -4227,7 +4434,10 @@ preexistentes, no relacionados, siguen igual).
 
 Fase 116 (116.2 Transporter Damage + 116.3 valuación de pérdida) queda
 **completa en backend + webapp + Android**, compilando en las 3 partes.
-Pendiente de deploy en las 3 (mismo estado que quedó la Fase 114 al cerrar:
-nada de esto se desplegó a producción todavía — backend no está en
-`app.excellentiafoods.com`, webapp de producción no tiene el build nuevo, no
-se generó/distribuyó un APK nuevo a los TC22).
+
+**Deploy confirmado por el usuario (2026-09-03, mismo día).** Backend,
+webapp y Android quedaron actualizados/desplegados — **Fase 116 cerrada de
+punta a punta**, no solo en el repo. No verificado en vivo por Claude desde
+esta sesión (sin acceso a `app.excellentiafoods.com`, al hosting de la
+webapp ni a un TC22 físico) — queda registrado como confirmación directa del
+usuario.

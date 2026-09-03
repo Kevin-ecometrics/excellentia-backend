@@ -15,6 +15,9 @@ import {
   getExpectedReturns,
   createReturns,
   listReturns,
+  registerConsignment,
+  getConsignment,
+  settleConsignment,
 } from '../controllers/routeController.ts';
 import { auth } from '../middleware/auth.ts';
 import { warehouseOnly } from '../middleware/warehouseOnly.ts';
@@ -41,5 +44,8 @@ router.delete('/:id/items/:itemId',   auth, warehouseOnly, removeRouteItem);
 router.get('/:id/returns/expected',   auth, getExpectedReturns);
 router.post('/:id/returns',           auth, warehouseOnly, createReturns);
 router.get('/:id/returns',            auth, listReturns);
+router.post('/:id/stops/:stopId/consignment',        auth, warehouseOnly, registerConsignment);
+router.get('/:id/stops/:stopId/consignment',         auth, getConsignment);
+router.post('/:id/stops/:stopId/consignment/settle', auth, warehouseOnly, settleConsignment);
 
 export default router;
