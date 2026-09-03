@@ -11,6 +11,7 @@ import {
   recordMovement,
   InsufficientStockError,
 } from './warehouseController.ts';
+import { computeDamageCredit } from '../services/creditCalculator.ts';
 
 // Orden forward-only: PLANNED -> IN_PROGRESS -> COMPLETED, sin poder retroceder.
 // CANCELLED es terminal — se puede llegar desde PLANNED/IN_PROGRESS (no desde
@@ -895,9 +896,10 @@ export async function getExpectedReturns(req: Request, res: Response): Promise<v
 // condición. GOOD reintegra al pool FIFO (route_item_lots de esta ruta, el
 // lote cargado más reciente primero — no se sabe de qué caja física viene lo
 // que regresa) y revierte el descuento de products.stock que hizo la carga.
-// DAMAGED/EXPIRED NO revierte nada: el ROUTE_LOAD original ya restó esa
-// cantidad de products.stock al cargarla al camión, y esa baja queda firme —
-// sumar otro movimiento acá duplicaría el descuento.
+// DAMAGED/EXPIRED/TRANSPORTER_DAMAGE NO revierten nada: el ROUTE_LOAD
+// original ya restó esa cantidad de products.stock al cargarla al camión, y
+// esa baja queda firme — sumar otro movimiento acá duplicaría el descuento.
+// Esas 3 condiciones sí valorizan la pérdida en unit_price/amount (Fase 116).
 export async function createReturns(req: Request, res: Response): Promise<void> {
   await ensureWarehouseTables();
   await ensureTables();
@@ -952,16 +954,20 @@ export async function createReturns(req: Request, res: Response): Promise<void> 
         results.push({ error: 'product_id y quantity (>0) son requeridos', line });
         continue;
       }
-      if (!['GOOD', 'DAMAGED', 'EXPIRED'].includes(conditionStatus)) {
-        results.push({ error: "condition_status debe ser 'GOOD', 'DAMAGED' o 'EXPIRED'", line });
+      if (!['GOOD', 'DAMAGED', 'EXPIRED', 'TRANSPORTER_DAMAGE'].includes(conditionStatus)) {
+        results.push({ error: "condition_status debe ser 'GOOD', 'DAMAGED', 'EXPIRED' o 'TRANSPORTER_DAMAGE'", line });
         continue;
       }
       // Como la salida del almacén ya garantiza buen estado (solo se carga
-      // stock ACTIVE, ver getExpectedReturns), un producto que vuelve
-      // DAMAGED/EXPIRED implica que pasó durante la ruta — la nota es lo que
-      // documenta qué pasó, para auditoría o reclamo al transportista.
+      // stock ACTIVE, ver getExpectedReturns), un producto que vuelve en
+      // cualquier condición que no sea GOOD implica que pasó durante la
+      // ruta — la nota es lo que documenta qué pasó, para auditoría o
+      // reclamo al transportista. TRANSPORTER_DAMAGE (Fase 116) distingue
+      // "se rompió en el camino" de DAMAGED genérico ("ya estaba mal"), pero
+      // se trata igual que DAMAGED/EXPIRED en todo lo demás (no restituye
+      // stock/lotes).
       if (conditionStatus !== 'GOOD' && !notes?.trim()) {
-        results.push({ error: 'notes es requerido cuando condition_status es DAMAGED o EXPIRED', line });
+        results.push({ error: 'notes es requerido cuando condition_status no es GOOD', line });
         continue;
       }
       if (conditionStatus === 'GOOD') {
@@ -972,10 +978,27 @@ export async function createReturns(req: Request, res: Response): Promise<void> 
         seenGoodProductIds.add(product_id);
       }
 
+      // Valuación de pérdida (Fase 116) — solo para líneas que no son GOOD:
+      // un producto que vuelve dañado/vencido/dañado-en-tránsito nunca se
+      // vendió, así que no hay crédito de cliente detrás (no aplica
+      // credit_transactions) — es pérdida de inventario valorizada, mismo
+      // cálculo por unidad que computeDamageCredit()/unitValueOf() usa para
+      // batch_damage, reusado acá vía el product_id (route_returns no tiene
+      // barcode a mano). GOOD no pierde nada, se guarda NULL/NULL.
+      let unitPrice: number | null = null;
+      let amount: number | null = null;
+      if (conditionStatus !== 'GOOD') {
+        const { rows: valuation } = await computeDamageCredit([
+          { product_id, product_name: '', qty: quantity },
+        ]);
+        unitPrice = valuation[0]?.unit_price ?? 0;
+        amount = valuation[0]?.amount ?? 0;
+      }
+
       await pool.query(
-        `INSERT INTO route_returns (route_id, product_id, quantity, condition_status, notes, reviewed_by)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [id, product_id, quantity, conditionStatus, notes ?? null, req.user?.id ?? null]
+        `INSERT INTO route_returns (route_id, product_id, quantity, condition_status, notes, unit_price, amount, reviewed_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [id, product_id, quantity, conditionStatus, notes ?? null, unitPrice, amount, req.user?.id ?? null]
       );
 
       if (conditionStatus === 'GOOD') {
@@ -1011,9 +1034,9 @@ export async function createReturns(req: Request, res: Response): Promise<void> 
         }
         await pool.query('UPDATE products SET stock = stock + ? WHERE id = ?', [quantity, product_id]);
       }
-      // DAMAGED/EXPIRED: sin cambios en stock/ledger — ver comentario de la función.
+      // DAMAGED/EXPIRED/TRANSPORTER_DAMAGE: sin cambios en stock/ledger — ver comentario de la función.
 
-      results.push({ product_id, quantity, condition_status: conditionStatus });
+      results.push({ product_id, quantity, condition_status: conditionStatus, unit_price: unitPrice, amount });
     }
 
     // Marca la ruta como revisada — sea que haya devuelto algo o no. Es lo

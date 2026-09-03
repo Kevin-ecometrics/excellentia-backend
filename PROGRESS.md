@@ -4182,3 +4182,52 @@ ALTER TABLE route_returns MODIFY COLUMN condition_status ENUM('GOOD','DAMAGED','
 ALTER TABLE route_returns ADD COLUMN IF NOT EXISTS unit_price DECIMAL(10,2) NULL AFTER notes;
 ALTER TABLE route_returns ADD COLUMN IF NOT EXISTS amount DECIMAL(10,2) NULL AFTER unit_price;
 ```
+
+**Actualización (2026-09-03) — backend implementado (116.2 + 116.3).** `createReturns`
+(`routeController.ts`) acepta `TRANSPORTER_DAMAGE` como cuarto valor de
+`condition_status` (mismo tratamiento que DAMAGED/EXPIRED en todo: no
+restituye stock/lotes, notas obligatorias) y, para cualquier línea que no
+sea GOOD, calcula `unit_price`/`amount` y los persiste en el INSERT.
+`computeDamageCredit()` (`creditCalculator.ts`) ganó un `product_id?`
+opcional en `DamageInput` (junto a `barcode?`, ahora también opcional) —
+`createReturns` solo tiene `product_id` a mano (no barcode), así que lo pasa
+directo en vez de tener que resolver el barcode primero; los 3 call sites
+existentes (`orderController.ts`, `preOrderController.ts`,
+`routes/credits.ts`) siguen mandando `barcode` sin cambios, retrocompatible.
+`ensureRouteLinkedWarehouseTables()` (`warehouseController.ts`, el
+`CREATE TABLE IF NOT EXISTS` que corre en instalaciones nuevas) se actualizó
+para que coincida con el schema ya migrado — antes solo `db/schema.sql`
+tenía el ENUM/columnas nuevas, una instalación desde cero se hubiera creado
+sin ellas. `bun run build`/`tsc --noEmit` sin errores nuevos (los 6
+preexistentes, no relacionados, siguen igual).
+
+**Actualización (2026-09-03, mismo día) — Webapp y Android completados, Fase
+116 cerrada en las 3 partes.**
+
+- **Webapp** (`excellentia-webapp`) — `RouteReturn.condition_status` gana
+  `'TRANSPORTER_DAMAGE'`, `unit_price`/`amount` (`WarehouseClient.tsx`).
+  Badge nuevo en `RETURN_CONDITION_BADGE` reusando el token índigo
+  `--ec-info-ink`/`--ec-info-bg` (ya existía para `ROUTE_LOAD` en
+  `/warehouse/inventory`, mismo criterio de "distinto del rojo de DAMAGED y
+  el ámbar de EXPIRED" sin inventar un color nuevo). Chip rojo `-$X.XX`
+  junto al badge de condición cuando `amount > 0` — con el mismo cuidado de
+  `Number(r.amount)` que ya usa `OrdersClient.tsx` para `batch_damage.amount`
+  (DECIMAL vía mysql2 llega como string). Claves i18n
+  `wh_returnCondition_TRANSPORTER_DAMAGE` (es/en) en `app/lib/i18n.ts`.
+  `bun run build` limpio.
+- **Android** (`AndroidStudioProjects/test`) — `RouteReturnsActivity` gana un
+  4° campo de cantidad "Transporter damage" por producto (`ReturnRow` suma
+  `etQtyTransporterDamage`), mismo criterio que Damaged/Expired: notas
+  obligatorias si tiene cantidad (`rowsMissingNotes`), manda
+  `conditionStatus = "TRANSPORTER_DAMAGE"` en `enteredItems()`, y el botón
+  "Sold out" también lo resetea a 0. `RouteReturnItemRequest.conditionStatus`
+  ya era un `String` libre — no hizo falta tocar `Models.kt`. Cadenas nuevas
+  `wh_condition_transporter_damage` en `values/strings.xml` (en) y
+  `values-es/strings.xml` (es). `:app:compileDebugKotlin` limpio.
+
+Fase 116 (116.2 Transporter Damage + 116.3 valuación de pérdida) queda
+**completa en backend + webapp + Android**, compilando en las 3 partes.
+Pendiente de deploy en las 3 (mismo estado que quedó la Fase 114 al cerrar:
+nada de esto se desplegó a producción todavía — backend no está en
+`app.excellentiafoods.com`, webapp de producción no tiene el build nuevo, no
+se generó/distribuyó un APK nuevo a los TC22).

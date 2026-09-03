@@ -2,7 +2,12 @@ import pool from '../db/connection.ts';
 import logger from './logger.ts';
 
 export interface DamageInput {
-  barcode: string;
+  // Uno de los dos identifica el producto — barcode para los call sites
+  // históricos (batch_damage, créditos standalone, que solo tienen barcode a
+  // mano), product_id para route_returns (createReturns, Fase 116), que solo
+  // tiene el id local. Si viene product_id se usa ese; si no, barcode.
+  barcode?: string;
+  product_id?: number;
   product_name: string;
   qty: number;
 }
@@ -78,13 +83,12 @@ export async function computeDamageCredit(items: DamageInput[]): Promise<{ rows:
   for (const item of items) {
     if (!(item.qty > 0)) continue;
     try {
-      const [productRows] = await pool.query(
-        'SELECT price, unit, qty, qb_item_id FROM products WHERE barcode = ?',
-        [item.barcode]
-      ) as any[];
+      const [productRows] = item.product_id != null
+        ? await pool.query('SELECT price, unit, qty, qb_item_id FROM products WHERE id = ?', [item.product_id]) as any[]
+        : await pool.query('SELECT price, unit, qty, qb_item_id FROM products WHERE barcode = ?', [item.barcode]) as any[];
       const product = productRows[0];
       if (!product) {
-        logger.warn(`computeDamageCredit: producto no encontrado para barcode ${item.barcode}, crédito omitido para esa línea`);
+        logger.warn(`computeDamageCredit: producto no encontrado para ${item.product_id != null ? `product_id ${item.product_id}` : `barcode ${item.barcode}`}, crédito omitido para esa línea`);
         rows.push({ ...item, unit_price: 0, amount: 0, qb_item_id: null, unit: null });
         continue;
       }
@@ -94,7 +98,7 @@ export async function computeDamageCredit(items: DamageInput[]): Promise<{ rows:
       rows.push({ ...item, unit_price: unitPrice, amount, qb_item_id: qbItemId, unit: product.unit ?? null });
       creditsTotal += amount;
     } catch (err) {
-      logger.warn(`computeDamageCredit: error calculando crédito para ${item.barcode}:`, err);
+      logger.warn(`computeDamageCredit: error calculando crédito para ${item.product_id ?? item.barcode}:`, err);
       rows.push({ ...item, unit_price: 0, amount: 0, qb_item_id: null, unit: null });
     }
   }
