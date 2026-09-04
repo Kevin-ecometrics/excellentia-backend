@@ -368,7 +368,7 @@ export async function listLots(req: Request, res: Response): Promise<void> {
     let query = `
       SELECT pl.id, pl.receipt_batch_id, pl.warehouse_id, pl.product_id, pl.barcode,
              pl.expiration_date, pl.received_qty, pl.remaining_qty, pl.status, pl.received_at,
-             p.name AS product_name, p.sku
+             p.name AS product_name, p.sku, p.unit
       FROM product_lots pl JOIN products p ON p.id = pl.product_id
       WHERE 1=1
     `;

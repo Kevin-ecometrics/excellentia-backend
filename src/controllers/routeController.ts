@@ -73,7 +73,7 @@ async function ensureTables() {
       route_id     INT NOT NULL,
       product_id   INT NOT NULL,
       barcode      VARCHAR(50) DEFAULT NULL,
-      quantity     INT NOT NULL DEFAULT 0,
+      quantity     DECIMAL(10,2) NOT NULL DEFAULT 0,
       scanned_by   INT DEFAULT NULL,
       created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -236,7 +236,17 @@ export async function getRoute(req: Request, res: Response): Promise<void> {
        ORDER BY ri.created_at`, [id]
     ) as any[];
 
-    res.json({ data: { ...route, stops, items: itemRows } });
+    // route_items.quantity es DECIMAL (Fase 118, para Lbs por peso real) —
+    // mysql2 lo devuelve como string sin decimalNumbers configurado en
+    // db/connection.ts (mismo gotcha ya documentado varias veces en este
+    // proyecto). Gson tolera un string numérico en un campo Double (no
+    // rompe el parseo en Android), pero sin este cast la webapp recibe
+    // "3.00" entre comillas donde su tipo (`quantity: number`) espera un
+    // número real — se ve como "3.00" en vez de "3" en la UI en lugares que
+    // no hacen `Number(...)` antes de mostrarlo (ver WarehouseClient.tsx).
+    const items = (itemRows as any[]).map(r => ({ ...r, quantity: Number(r.quantity) }));
+
+    res.json({ data: { ...route, stops, items } });
   } catch (err) {
     logger.error('getRoute error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
@@ -711,11 +721,13 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
       }
     }
 
-    const [[item]] = await pool.query(
+    const [[itemRow]] = await pool.query(
       `SELECT ri.id, ri.route_id, ri.product_id, ri.barcode, ri.quantity, p.name, p.sku, p.unit
        FROM route_items ri JOIN products p ON p.id = ri.product_id
        WHERE ri.route_id = ? AND ri.product_id = ?`, [id, product.id]
     ) as any[];
+    // Mismo cast que getRoute — route_items.quantity es DECIMAL (Fase 118).
+    const item = { ...itemRow, quantity: Number(itemRow.quantity) };
     const [[{ stock }]] = await pool.query('SELECT stock FROM products WHERE id = ?', [product.id]) as any[];
 
     res.status(201).json({
@@ -1143,7 +1155,7 @@ export async function getExpectedReturns(req: Request, res: Response): Promise<v
     // la línea de base ("salió el X, cargado por Y") junto a lo que se cuenta
     // ahora — sin agregar ningún paso ni columna nueva.
     const [loadedRows] = await pool.query(
-      `SELECT ri.product_id, ri.barcode, p.name, p.sku, ri.quantity AS loaded_qty,
+      `SELECT ri.product_id, ri.barcode, p.name, p.sku, p.unit, ri.quantity AS loaded_qty,
               ri.created_at AS loaded_at, u.name AS loaded_by_name
        FROM route_items ri
        JOIN products p ON p.id = ri.product_id
@@ -1198,7 +1210,7 @@ export async function getExpectedReturns(req: Request, res: Response): Promise<v
       // más arriba) — nunca bloquea, el admin decide qué hacer con eso.
       const discrepancy = Number(row.loaded_qty) - sold - alreadyReturned;
       return {
-        product_id: row.product_id, name: row.name, sku: row.sku,
+        product_id: row.product_id, name: row.name, sku: row.sku, unit: row.unit,
         loaded_qty: Number(row.loaded_qty), sold_qty: sold,
         already_returned_qty: alreadyReturned, expected_return_qty: expected,
         returned_good_qty: returned.good, returned_damaged_qty: returned.damaged,

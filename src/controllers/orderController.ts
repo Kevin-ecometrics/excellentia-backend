@@ -1040,6 +1040,25 @@ export async function editBatch(req: Request, res: Response): Promise<void> {
     }
 
     const first = orderRows[0] as any;
+
+    // Guard — no dejar que la edición baje el total por debajo del crédito
+    // de cliente ya aplicado (credit_applied, decisión conocida de v1: la
+    // edición no lo recalcula, ver comentario más abajo). Sin este check,
+    // `createBatchInvoice` mandaría una línea de descuento (`-applyCredit`)
+    // más grande que la suma de líneas positivas — QBO rechaza un invoice
+    // con total negativo — recién al aprobar, potencialmente días después de
+    // editar. Mejor cortarlo acá, con contexto de qué se estaba editando.
+    const creditApplied = Number(first.credit_applied) || 0;
+    if (creditApplied > 0) {
+      const newTotal = items.reduce((sum: number, it: any) => sum + (Number(it.total) || Number(it.price) * Number(it.quantity)), 0);
+      if (Math.round(newTotal * 100) < Math.round(creditApplied * 100)) {
+        res.status(400).json({
+          error: `El nuevo total ($${newTotal.toFixed(2)}) no puede quedar por debajo del crédito de cliente ya aplicado a esta venta ($${creditApplied.toFixed(2)}). Cancelá la venta y rehacela si necesitás bajar tanto el total.`,
+        });
+        return;
+      }
+    }
+
     const barcodesToSync = new Set<string>();
 
     // Revertir el stock de los ítems VIEJOS que sí se habían descontado.
@@ -1070,8 +1089,9 @@ export async function editBatch(req: Request, res: Response): Promise<void> {
     // usa para pre_order_items. Conserva batch_id/reserved_invoice_number/
     // customer_id/customer_name/payment_method/check_number/credit_applied
     // de la fila original — la edición solo cambia QUÉ se vendió, no a quién
-    // ni con qué método de pago ni el crédito de cliente ya aplicado (ver
-    // limitación conocida más abajo).
+    // ni con qué método de pago ni el crédito de cliente ya aplicado (nunca
+    // se recalcula contra el nuevo total, solo se valida arriba que el nuevo
+    // total no quede por debajo de él).
     await pool.query('DELETE FROM orders WHERE batch_id = ?', [batchId]);
 
     for (const item of items) {

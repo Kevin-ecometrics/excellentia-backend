@@ -342,7 +342,8 @@ CREATE TABLE IF NOT EXISTS `route_items` (
     `route_id`     INT NOT NULL,
     `product_id`   INT NOT NULL,
     `barcode`      VARCHAR(50) DEFAULT NULL,
-    `quantity`     INT NOT NULL DEFAULT 0,
+    -- Fase 118 — era INT; pasó a DECIMAL para poder cargar Lbs por peso real.
+    `quantity`     DECIMAL(10,2) NOT NULL DEFAULT 0,
     `scanned_by`   INT DEFAULT NULL,
     `created_at`   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     `updated_at`   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -638,5 +639,12 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS stock_decremented TINYINT(1) NOT NUL
 ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS note VARCHAR(255) NULL AFTER invoice_id;
 
 -- =============================================================================
--- Fin del schema — 23 tablas + migraciones Fase 48, 111, 112, 115, 116, 117, 2026-08-31 y 2026-09-01
+-- =============================================================================
+-- Migración — Fase 118 (2026-09-04): route_items.quantity de INT a DECIMAL,
+-- para poder cargar Lbs por peso real a una ruta (ver src/db/schema.sql para
+-- el detalle completo). Para bases existentes (ejecutar una sola vez)
+-- =============================================================================
+ALTER TABLE route_items MODIFY COLUMN quantity DECIMAL(10,2) NOT NULL DEFAULT 0;
+
+-- Fin del schema — 23 tablas + migraciones Fase 48, 111, 112, 115, 116, 117, 118, 2026-08-31 y 2026-09-01
 -- =============================================================================

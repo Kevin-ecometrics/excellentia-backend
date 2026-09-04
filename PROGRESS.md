@@ -4795,5 +4795,131 @@ completo de lo que sí quedó en pie en `AndroidStudioProjects/test/CLAUDE.md`
 - **Sin probar en un TC22/emulador real** — la pantalla nueva solo está
   verificada por compilación, igual que el backend.
 
+**Actualización (2026-09-04) — revisión end-to-end (fork de Claude, solo
+lectura) sobre operador + almacén, y fixes aplicados sobre lo que encontró.**
+El pedido fue "revisá todo lo que agregamos y decime qué ves raro" —
+resumen de lo encontrado y arreglado:
+
+- **`ConsignmentActivity.kt` (Fase 115.4, no tocada en la sesión original de
+  la 117) tenía el mismo bug de "no distingue tipo de producto" que se
+  encontró primero en `EditBatchActivity`.** `showQuantityDialog()` (dejar
+  algo en consignación) y los campos Sold/Returned al liquidar una línea
+  usaban un input decimal genérico sin mirar `unit` — dejaba tipear "2.5"
+  en un Case/Unit o Bucket. Arreglado con el mismo criterio que ya usaba
+  `ReceivingActivity.askQtyThenDate()` (que sí lo hacía bien, sirvió de
+  referencia): `isLbsUnit(unit)` decide decimal vs. entero.
+- **Dato aparte, no arreglado a propósito:** `WarehouseRouteDetailActivity`
+  (cargar productos a una ruta) fuerza cantidad entera para todo, incluido
+  Lbs — es lo opuesto al bug de arriba, pero es una pregunta de política ya
+  anotada sin resolver más arriba en este documento ("¿debe el stock de Lbs
+  reflejar peso real...?"), no un descuido nuevo — se dejó como está.
+- **`CurrentOrderActivity.kt` — código muerto limpiado.** `askApplyCredit()`
+  tenía un guard de "sin cliente" que quedó inalcanzable desde el cambio de
+  Snackbar en Finalizar (único punto de entrada a ese flujo, ya corta antes
+  de llegar ahí) — eliminado.
+- **Backend — guard nuevo en `editBatch` contra `credit_applied`.** Detalle
+  completo en `excellentia/CLAUDE.md` ("Editar / Cancelar venta
+  AWAITING_APPROVAL", al final) — en corto: editar ya no puede bajar el
+  total del batch por debajo del crédito de cliente ya aplicado; antes
+  fallaba recién al aprobar, con el error genérico de QBO por invoice en
+  negativo en vez de un mensaje claro sobre la causa real.
+- Los tres repos compilan/buildean limpio con estos cambios (`tsc --noEmit`,
+  `bun run build`, `:app:assembleDebug`).
+- **Cobertura de la revisión, incompleta a propósito:** no llegó a mirar en
+  profundidad `WarehouseActivity.kt`, `RouteReturnsActivity.kt`,
+  `InventoryMovementsActivity.kt`, `MyRoutesActivity.kt`/
+  `MyRouteDetailActivity.kt` — si hace falta, es la próxima pasada pendiente.
+
+## Fase 118 — route_items.quantity: INT → DECIMAL (2026-09-04)
+
+El punto "dato aparte" de la revisión anterior (`WarehouseRouteDetailActivity`
+forzaba cantidad entera para todo, incluido Lbs, al cargar una ruta) se había
+anotado como pregunta de política sin resolver — el usuario la resolvió:
+**sí, debe ajustarse a la misma lógica que ya rige en el resto del sistema**
+(Lbs = peso real). Implementado de punta a punta, DB + backend + Android.
+Detalle técnico completo en `excellentia/CLAUDE.md` (sección "Fase 118") y
+`AndroidStudioProjects/test/CLAUDE.md` (nota sobre `WarehouseRouteDetailActivity`)
+— resumen:
+
+- **DB** — `route_items.quantity` INT → `DECIMAL(10,2)` (única tabla de la
+  cadena de Almacén que seguía en INT; `product_lots`/`route_item_lots`/
+  `inventory_movements`/`route_returns` ya eran DECIMAL desde la Fase 112).
+  Migración agregada a `db/schema.sql`, `excellentia_schema.sql` y
+  `CLAUDE.md` — **no corrida todavía**, pendiente de que el usuario la
+  aplique a mano (mismo flujo de siempre):
+  ```sql
+  ALTER TABLE route_items MODIFY COLUMN quantity DECIMAL(10,2) NOT NULL DEFAULT 0;
+  ```
+- **Backend** (`routeController.ts`) — sin cambios de lógica (ya trataba
+  `quantity` como `Number(...)` genérico en todos lados). Dos fixes de
+  serialización: `getRoute`/`addRouteItem` ahora hacen `Number(row.quantity)`
+  explícito antes de responder — mismo gotcha de siempre (`DECIMAL` vía
+  `mysql2` es string) — para que la webapp no reciba `"3.00"` entre comillas
+  donde espera un número.
+- **Android** — `AddRouteItemRequest.quantity`/`RouteItemDto.quantity`:
+  `Int` → `Double`. Nuevo helper compartido `formatQty()` en `data/Models.kt`.
+  Los 3 diálogos de cantidad de `WarehouseRouteDetailActivity` (cargar
+  escaneando, cargar desde disponible, flujo FIFO) ahora deciden decimal vs.
+  entero según `isLbsUnit()`, mismo criterio que `ReceivingActivity`/
+  `ConsignmentActivity`. `MyRouteDetailActivity` (vista de solo lectura del
+  repartidor) actualizada para mostrar la cantidad formateada.
+- Los tres repos compilan/buildean limpio (`tsc --noEmit`, `bun run build`,
+  `:app:compileDebugKotlin`, `:app:assembleDebug`).
+- **Sin probar contra una base real / TC22** — solo verificado por
+  compilación, igual que el resto de los fixes de esta sesión.
+
+**Actualización (2026-09-04, mismo día) — migración de la Fase 118 ya
+corrida por el usuario.** Pidió una segunda revisión end-to-end, esta vez
+completando la cobertura que había quedado pendiente (`WarehouseActivity`,
+`RouteReturnsActivity`, `InventoryMovementsActivity`, `MyRoutesActivity`).
+Todo lo ya hecho (Fase 117 + Fase 118) confirmado limpio; encontró 2
+pantallas más con el mismo bug de tipo de producto y 1 detalle cosmético,
+los 3 arreglados:
+
+- **`RouteReturnsActivity.kt`** — los 4 campos de cantidad al revisar
+  devoluciones de ruta (Bueno/Dañado/Vencido/Transporter Damage) eran
+  siempre decimales. A diferencia de los fixes anteriores, este necesitó
+  backend: `getExpectedReturns` no traía `unit` pese a hacer `JOIN
+  products` — se agregó (sin migración SQL, columna ya existente).
+- **`InventoryMovementsActivity.kt`** — `showEditLotDialog()` (pestaña
+  Disponible → Editar lote) mismo problema; `listLots` ganó `unit` en la
+  respuesta, mismo criterio.
+- **Cosmético** — el badge de discrepancia en el panel de reconciliación
+  redondeaba a 0 decimales (`%+.0f`) mientras la línea de arriba mostraba
+  precisión completa; con Lbs cargando peso real desde la Fase 118 esto
+  podía ocultar un sobrante/faltante chico. Ajustado a `%+.2f`.
+- Detalle técnico completo en `excellentia/CLAUDE.md` (fin de la sección
+  "Fase 118") y `AndroidStudioProjects/test/CLAUDE.md`.
+- Los tres repos compilan/buildean limpio otra vez tras estos 3 fixes.
+
+**Actualización (2026-09-04, mismo día) — tercera revisión end-to-end,
+enfocada en verificar estos últimos 3 fixes + barrido final del mismo bug
+en toda la app. Resultado: limpio, sin nada nuevo que corregir.**
+
+- Los 3 fixes confirmados correctos releyendo el código actual (no de
+  memoria): captura de variable correcta en `RouteReturnsActivity`, sin
+  `"%.2f"` viejo suelto, badge de reconciliación sin duplicados, `unit`
+  genuinamente presente en las dos respuestas del backend.
+- **Detalle cosmético anotado, no urgente:** las interfaces TypeScript de la
+  webapp (`ReconciliationRow` en `WarehouseClient.tsx`, `ProductLot` en
+  `InventoryClient.tsx`) no declaran el `unit` nuevo que ahora manda el
+  backend — no rompe nada (TS ignora el campo extra), solo el tipo queda
+  desactualizado. Sin acción por ahora.
+- **Barrido completo de los 28 inputs decimales de toda la app** (14 campos
+  lógicos): los 14 que son cantidad de producto ya están todos corregidos
+  con `isLbsUnit()` — incluye varios que resultaron ya estar bien desde
+  antes sin haberlos tocado esta sesión (`CurrentOrderActivity`,
+  `IssueCreditActivity`, `PreOrderDetailActivity`). Los otros 4 (número de
+  cheque, monto de crédito en dólares) son correctamente fijos porque no son
+  cantidad de producto. **Cero casos pendientes de este bug en toda la app.**
+- Los tres repos siguen compilando/buildeando limpio.
+
+**Fase 117 + Fase 118 quedan cerradas de punta a punta.** Pendiente real
+para producción: correr el resto de las migraciones SQL de la Fase 117
+(`voided_at`/`voided_by`/`void_reason`/`stock_decremented`/`note` — la de
+`route_items.quantity` de la Fase 118 ya se corrió) si no se hizo todavía, y
+probar los flujos completos contra un TC22/emulador real — todo lo de esta
+sesión sigue verificado solo por compilación.
+
 Sin correr `git commit` todavía en ninguno de los 3 repos — cambios en el
 working tree.

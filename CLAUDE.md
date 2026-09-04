@@ -243,6 +243,11 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS voided_by INT NULL AFTER voided_at;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS void_reason VARCHAR(255) NULL AFTER voided_by;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS stock_decremented TINYINT(1) NOT NULL DEFAULT 0 AFTER is_courtesy;
 ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS note VARCHAR(255) NULL AFTER invoice_id;
+-- Fase 118 — route_items.quantity de INT a DECIMAL, para poder cargar Lbs
+-- por peso real a una ruta (antes truncaba/redondeaba, único eslabón de la
+-- cadena de Almacén que seguía en INT — product_lots/route_item_lots/
+-- inventory_movements/route_returns ya eran DECIMAL desde la Fase 112).
+ALTER TABLE route_items MODIFY COLUMN quantity DECIMAL(10,2) NOT NULL DEFAULT 0;
 ```
 
 **`orders.unit`/`case_qty` — por qué importan para el ticket:** `unit` es el tipo de venta (Lbs/Case/Unit/Bucket) y `case_qty` las unidades por caja (`products.qty` cuando `unit = "Case"`, copiado al momento de la venta). Sin estos dos campos guardados en `orders`, reimprimir un pedido desde Historial no puede saber si era por peso o por caja — `listOrders` los expone ahora junto al resto de columnas.
@@ -490,6 +495,91 @@ contra el nuevo total del batch (se conserva tal cual estaba); no hay
 ventana horaria — el único gate es el status `AWAITING_APPROVAL`; no hay
 tabla de snapshots de revisiones, solo `activity_log` (`BATCH_CANCELLED`/
 `BATCH_EDITED`).
+
+**Guard agregado (2026-09-04, encontrado en una revisión end-to-end
+posterior) — editar no puede bajar el total por debajo del `credit_applied`
+ya aplicado.** Sin este check, un edit que redujera el total por debajo del
+crédito de cliente ya aplicado hacía que `createBatchInvoice`
+(`qbInvoices.ts`) mandara una línea de descuento (`-applyCredit`) más grande
+que la suma de líneas positivas — QBO rechaza un invoice con total negativo,
+pero recién al aprobar (potencialmente días después de la edición, con el
+error confuso de QBO en vez de uno claro sobre la causa real). `editBatch`
+ahora rechaza (`400`) si `SUM(items[].total) < credit_applied` de la fila
+original, con un mensaje que sugiere cancelar y rehacer si hace falta bajar
+tanto el total.
+
+## Fase 118 — route_items.quantity: INT → DECIMAL (cargar Lbs por peso real a una ruta)
+
+Encontrada en una revisión end-to-end del módulo Almacén pedida por el
+usuario tras cerrar la Fase 117, y confirmada como bug real a corregir (no
+una decisión de política pendiente): `route_items` (el manifiesto de carga
+de una ruta — qué se cargó al camión, Fase 111/112) era la **única** tabla
+de toda la cadena de Almacén que seguía en `INT` para cantidad —
+`product_lots`/`route_item_lots`/`inventory_movements`/`route_returns` ya
+eran `DECIMAL(10,2)` desde la Fase 112. En la práctica, cargar un producto
+Lbs a una ruta forzaba cantidad entera en la app Android — lo opuesto a
+cómo Lbs se trata en cualquier otro flujo del sistema (venta, recepción,
+consignación), donde siempre es peso real con decimales.
+
+`ALTER TABLE route_items MODIFY COLUMN quantity DECIMAL(10,2) NOT NULL
+DEFAULT 0;` — migración aditiva, sin pérdida de datos (un `INT` existente
+convierte limpio a `DECIMAL`). `routeController.ts` no necesitó ningún
+cambio de lógica — ya trataba `quantity` genéricamente como `Number(...)`
+en todos lados (`addRouteItem`, `removeRouteItem`, `computeFifoAllocation`,
+`getExpectedReturns`), sin ningún `parseInt`/`Math.round` que truncara. Los
+únicos dos cambios reales de backend son de **serialización de la
+respuesta**, no de lógica: `getRoute` (`items: itemRows`) y `addRouteItem`
+(`item`) ahora hacen `Number(row.quantity)` explícito antes de mandar el
+JSON — mismo gotcha "`DECIMAL` vía `mysql2` es string, no number" ya
+documentado varias veces en este archivo; acá no rompe el parseo Gson en
+Android (que tolera un string numérico en un campo `Double`), pero sin el
+cast la webapp recibía `"3.00"` entre comillas donde su tipo (`quantity:
+number`) espera un número real — se veía `"3.00"` en vez de `"3"` en la UI.
+
+**Android** (`AndroidStudioProjects/test`) — `AddRouteItemRequest.quantity`
+y `RouteItemDto.quantity` pasaron de `Int` a `Double`. Nuevo helper
+compartido `formatQty(value: Double): String` en `data/Models.kt` (trimea
+ceros de relleno — "3" en vez de "3.0" — para no ensuciar la UI de
+Case/Unit/Bucket ahora que el campo es Double). `WarehouseRouteDetailActivity`
+— los 3 diálogos de cantidad al cargar un producto (`showQuantityDialog`,
+`showQuantityDialogForAvailable`, y el flujo FIFO que cuelga de
+`fetchFifoSuggestionThenAdd`/`showLotPicker`/`addRouteItem`) ahora deciden
+decimal vs. entero según `isLbsUnit(product.unit)`, mismo criterio que
+`ReceivingActivity`/`ConsignmentActivity`. `MyRouteDetailActivity` (vista
+del repartidor, solo lectura del manifiesto) actualizada para mostrar la
+cantidad con `formatQty()` en vez de `.toString()` directo. String
+`msg_route_item_added` (es/en) cambió su placeholder de `%1$d` a `%1$s`
+(recibe el resultado ya formateado de `formatQty()`).
+
+**Sin probar contra una base real / TC22** — solo verificado por
+compilación (`tsc --noEmit`, `bun run build`, `:app:compileDebugKotlin`,
+`:app:assembleDebug`), igual que el resto de los fixes de esta revisión.
+
+**Fix (2026-09-04, misma sesión) — 2 pantallas más con el mismo bug de tipo
+de producto, encontradas en una segunda revisión end-to-end (pedida por el
+usuario tras correr la migración de arriba) que esta vez sí llegó a fondo en
+todo el módulo Almacén.** A diferencia de Consignación/`WarehouseRouteDetailActivity`
+(ya arreglados, ver más arriba y `AndroidStudioProjects/test/CLAUDE.md`),
+estas dos no se podían arreglar solo del lado de Android — les faltaba
+`unit` en la respuesta del backend pese a que la query ya hacía `JOIN
+products`. Sin migración SQL — solo se agregó una columna ya existente
+(`p.unit`) a dos `SELECT`:
+
+- **`getExpectedReturns`** (`routeController.ts`) — sumó `p.unit` al
+  `SELECT` de `loadedRows` y al objeto de respuesta (`unit: row.unit`).
+  Alimenta `RouteReturnsActivity` (Android) — los 4 campos de cantidad al
+  revisar devoluciones (Bueno/Dañado/Vencido/Transporter Damage) ahora
+  deciden decimal vs. entero con el mismo criterio que el resto de la app.
+- **`listLots`** (`warehouseController.ts`) — sumó `p.unit` al `SELECT`.
+  Alimenta `InventoryMovementsActivity.showEditLotDialog()` (Android,
+  pestaña Disponible → Editar lote), mismo fix.
+
+De paso, el badge de discrepancia del panel de reconciliación
+(`WarehouseRouteDetailActivity`) redondeaba a 0 decimales (`%+.0f`) mientras
+la línea de meta justo arriba mostraba precisión completa (`%.2f`) — con
+Lbs cargando peso real desde la Fase 118, un sobrante/faltante chico (ej.
+0.3 lb) podía quedar oculto como "+0". Ajustado a `%+.2f` para que coincida
+con la otra línea.
 
 ## updateBatchPayment — PUT /api/orders/batch/:batchId/payment (Fase 82)
 

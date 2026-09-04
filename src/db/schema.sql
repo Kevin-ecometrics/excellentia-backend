@@ -378,7 +378,10 @@ CREATE TABLE IF NOT EXISTS `route_items` (
     `route_id`     INT NOT NULL,
     `product_id`   INT NOT NULL,
     `barcode`      VARCHAR(50) DEFAULT NULL,
-    `quantity`     INT NOT NULL DEFAULT 0,
+    -- Fase 118 — era INT; pasó a DECIMAL para poder cargar Lbs por peso real
+    -- a una ruta, igual que ya funciona en todos lados (venta, recepción,
+    -- consignación) — antes truncaba/redondeaba cualquier peso con decimales.
+    `quantity`     DECIMAL(10,2) NOT NULL DEFAULT 0,
     `scanned_by`   INT DEFAULT NULL,
     `created_at`   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     `updated_at`   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -699,7 +702,19 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS stock_decremented TINYINT(1) NOT NUL
 ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS note VARCHAR(255) NULL AFTER invoice_id;
 
 -- =============================================================================
--- Fin del schema — 24 tablas + migraciones Fase 48, 61, 112, 115, 116, 117, 2026-08-31 y 2026-09-01
+-- Migración — Fase 118 (2026-09-04): route_items.quantity de INT a DECIMAL.
+-- Encontrada en una revisión end-to-end del módulo Almacén (pedido explícito
+-- del usuario) — cargar un producto Lbs a una ruta forzaba cantidad entera,
+-- lo opuesto al resto del sistema (venta, recepción, consignación), que ya
+-- trata Lbs como peso real desde hace varias fases. product_lots/
+-- route_item_lots/inventory_movements/route_returns ya eran DECIMAL — este
+-- era el único eslabón de la cadena que seguía en INT.
+-- Para bases existentes (ejecutar una sola vez)
+-- =============================================================================
+ALTER TABLE route_items MODIFY COLUMN quantity DECIMAL(10,2) NOT NULL DEFAULT 0;
+
+-- =============================================================================
+-- Fin del schema — 24 tablas + migraciones Fase 48, 61, 112, 115, 116, 117, 118, 2026-08-31 y 2026-09-01
 -- =============================================================================
 SET FOREIGN_KEY_CHECKS = 1;
 SET FOREIGN_KEY_CHECKS = 1;
