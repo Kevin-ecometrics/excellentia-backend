@@ -96,6 +96,10 @@ CREATE TABLE IF NOT EXISTS `orders` (
     `reserved_invoice_number` INT NULL,
     `approved_by`   INT NULL,
     `approved_at`   TIMESTAMP NULL,
+    -- Fase 117 — auditoría de cancelación (cancelBatch, orderController.ts).
+    `voided_at`     TIMESTAMP NULL,
+    `voided_by`     INT NULL,
+    `void_reason`   VARCHAR(255) NULL,
     `status`        ENUM('AWAITING_APPROVAL', 'PENDING', 'SENT', 'FAILED', 'CANCELLED') DEFAULT 'PENDING',
     `error_log`     TEXT,
     `retry_count`   INT DEFAULT 0,
@@ -104,6 +108,9 @@ CREATE TABLE IF NOT EXISTS `orders` (
     -- Fase 115 — factura en QBO a $0 (ver qbInvoices.ts); price/total acá
     -- siguen guardando el valor real de catálogo, para reportería.
     `is_courtesy`   TINYINT(1) NOT NULL DEFAULT 0,
+    -- Fase 117 — si esta fila de verdad descontó products.stock al crearse
+    -- (ver createBatch/cancelBatch/editBatch, orderController.ts).
+    `stock_decremented` TINYINT(1) NOT NULL DEFAULT 0,
     `payment_method` VARCHAR(20) NULL,
     `check_number`   VARCHAR(20) NULL,
     FOREIGN KEY (`device_id`) REFERENCES `devices`(`id`),
@@ -608,5 +615,28 @@ ALTER TABLE route_returns ADD COLUMN IF NOT EXISTS unit_price DECIMAL(10,2) NULL
 ALTER TABLE route_returns ADD COLUMN IF NOT EXISTS amount DECIMAL(10,2) NULL AFTER unit_price;
 
 -- =============================================================================
--- Fin del schema — 23 tablas + migraciones Fase 48, 111, 112, 115, 116, 2026-08-31 y 2026-09-01
+-- Migración — Fase 117 (2026-09-04): Editar / Cancelar venta AWAITING_APPROVAL.
+-- Diseño documentado en PROGRESS.md. Todo aditivo, no rompe nada de lo ya
+-- existente (defaults preservan el comportamiento actual).
+-- Para bases existentes (ejecutar una sola vez)
+-- =============================================================================
+
+-- 1. Auditoría de cancelación (POST /api/orders/batch/:batchId/cancel).
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS voided_at TIMESTAMP NULL AFTER approved_at;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS voided_by INT NULL AFTER voided_at;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS void_reason VARCHAR(255) NULL AFTER voided_by;
+
+-- 2. Marca si esta fila de verdad descontó products.stock al crearse — ver
+-- createBatch/cancelBatch/editBatch en orderController.ts.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS stock_decremented TINYINT(1) NOT NULL DEFAULT 0 AFTER is_courtesy;
+
+-- 3. Nota libre en credit_transactions para movimientos de reversa
+-- (cancelBatch inserta un movimiento opuesto al original en vez de
+-- borrarlo). Nota: esta copia del schema no tiene el CREATE TABLE de
+-- credit_transactions (drift preexistente frente a src/db/schema.sql, no
+-- introducido por esta fase) — este ALTER solo aplica si la tabla ya existe.
+ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS note VARCHAR(255) NULL AFTER invoice_id;
+
+-- =============================================================================
+-- Fin del schema — 23 tablas + migraciones Fase 48, 111, 112, 115, 116, 117, 2026-08-31 y 2026-09-01
 -- =============================================================================

@@ -1,6 +1,7 @@
 import type { Request, Response } from 'express';
 import pool from '../db/connection.ts';
 import { createBatchInvoice, findInvoiceByDocNumber } from '../services/qbInvoices.ts';
+import { updateItemQtyOnHand } from '../services/qbItems.ts';
 import { computeDamageCredit } from '../services/creditCalculator.ts';
 import { getCustomerBalance, applyCustomerCredit } from '../services/creditController.ts';
 import { withInvoiceNumber, reserveInvoiceNumber } from '../services/invoiceCounter.ts';
@@ -158,6 +159,26 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
     const batchId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
     const inserted: { id: number; barcode: string; product_name: string; price: number; quantity: number; total: number; qb_item_id: string | null }[] = [];
 
+    // Calculado ANTES de insertar — 1 unidad por línea de ítem vendido se
+    // descuenta de products.stock, salvo que el producto ya se haya
+    // descontado al cargar esta ruta (route_id viene del cliente cuando hay
+    // una venta "por scratch"/de ruta en curso, ver
+    // MyRouteDetailActivity.kt → OrderRepository.sendBatch()). Sin este
+    // check, un producto route-loaded quedaba descontado DOS veces: una al
+    // cargar la ruta (addRouteItem) y otra acá — con una ruta 100% vendida,
+    // el stock terminaba el doble de bajo de lo real. Se guarda por fila en
+    // orders.stock_decremented (Fase 117) para que cancelBatch/editBatch
+    // sepan con certeza qué filas revertir sin tener que re-derivar esta
+    // misma lógica de ruta desde cero.
+    let routeLoadedBarcodes: Set<string> | null = null;
+    if (route_id) {
+      const [routeItemRows] = await pool.query(
+        'SELECT barcode FROM route_items WHERE route_id = ? AND barcode IS NOT NULL',
+        [route_id]
+      ) as any[];
+      routeLoadedBarcodes = new Set((routeItemRows as any[]).map(r => r.barcode));
+    }
+
     for (const item of items) {
       const { barcode, product_name, price, quantity, total, unit, case_qty } = item;
       // Fase 115.5 — cortesía: price/total locales guardan el valor real de
@@ -179,34 +200,19 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
         }
       }
 
+      const decremented = !routeLoadedBarcodes?.has(barcode);
       const [result] = await pool.query(
-        "INSERT INTO orders (barcode, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name, unit, case_qty, payment_method, check_number, is_courtesy, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')",
-        [barcode, product_name, price, quantity, total ?? price * quantity, batchId, req.user?.id ?? null, customer_id ?? null, customer_name ?? null, unit ?? null, case_qty ?? null, payment_method ?? null, check_number ?? null, isCourtesy]
+        "INSERT INTO orders (barcode, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name, unit, case_qty, payment_method, check_number, is_courtesy, status, stock_decremented) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)",
+        [barcode, product_name, price, quantity, total ?? price * quantity, batchId, req.user?.id ?? null, customer_id ?? null, customer_name ?? null, unit ?? null, case_qty ?? null, payment_method ?? null, check_number ?? null, isCourtesy, decremented ? 1 : 0]
       ) as any;
       inserted.push({ id: result.insertId, barcode, product_name, price, quantity, total: total ?? price * quantity, qb_item_id: qbItemId });
-    }
 
-    // Descontar stock: 1 unidad por línea de ítem vendido — salvo que el
-    // producto ya se haya descontado al cargar esta ruta (route_id viene
-    // del cliente cuando hay una venta "por scratch"/de ruta en curso, ver
-    // MyRouteDetailActivity.kt → OrderRepository.sendBatch()). Sin este
-    // check, un producto route-loaded quedaba descontado DOS veces: una al
-    // cargar la ruta (addRouteItem) y otra acá — con una ruta 100% vendida,
-    // el stock terminaba el doble de bajo de lo real.
-    let routeLoadedBarcodes: Set<string> | null = null;
-    if (route_id) {
-      const [routeItemRows] = await pool.query(
-        'SELECT barcode FROM route_items WHERE route_id = ? AND barcode IS NOT NULL',
-        [route_id]
-      ) as any[];
-      routeLoadedBarcodes = new Set((routeItemRows as any[]).map(r => r.barcode));
-    }
-    for (const item of inserted) {
-      if (routeLoadedBarcodes?.has(item.barcode)) continue;
-      await pool.query(
-        'UPDATE products SET stock = GREATEST(stock - 1, 0) WHERE barcode = ?',
-        [item.barcode]
-      );
+      if (decremented) {
+        await pool.query(
+          'UPDATE products SET stock = GREATEST(stock - 1, 0) WHERE barcode = ?',
+          [barcode]
+        );
+      }
     }
 
     // Vincula esta venta a la parada de ruta que la originó (solo paradas
@@ -884,6 +890,225 @@ export async function forceSync(req: Request, res: Response): Promise<void> {
     res.json({ message: `Sync forzado para pedido ${id}` });
   } catch (err) {
     logger.error('forceSync error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
+// Fase 117 — sync silencioso de stock a QBO por barcode (no por product_id,
+// a diferencia de syncProductStockToQbo en warehouseController.ts — orders
+// solo guarda barcode). Mismo criterio "silent" que el resto del proyecto:
+// si QBO falla acá, no revierte nada local, queda logueado como warning.
+async function syncStockToQboByBarcode(barcode: string): Promise<void> {
+  try {
+    const [[product]] = await pool.query('SELECT stock, qb_item_id FROM products WHERE barcode = ?', [barcode]) as any[];
+    if (!product?.qb_item_id) return;
+    await updateItemQtyOnHand(product.qb_item_id, Number(product.stock) || 0);
+  } catch (err) {
+    logger.warn(`Fase 117: fallo al sincronizar stock a QBO (barcode ${barcode}):`, err);
+  }
+}
+
+// POST /api/orders/batch/:batchId/cancel — Fase 117. Admin + operador dueño
+// del batch (mismo criterio que retryBatchSync). Solo aplica mientras el
+// batch sigue AWAITING_APPROVAL — en la práctica todas las ventas del día
+// quedan en ese estado hasta que un admin las aprueba en bloque al final
+// del día (approveBatch), así que cancelar acá es una operación 100% local:
+// la factura todavía no existe en QBO, no hay nada que voidear. Una vez
+// SENT, este endpoint ya no aplica — un SENT mal cargado se corrige a mano
+// en QBO, como se hacía antes de esta fase.
+export async function cancelBatch(req: Request, res: Response): Promise<void> {
+  try {
+    const { batchId } = req.params;
+    const { reason } = req.body;
+
+    const [orderRows] = await pool.query('SELECT * FROM orders WHERE batch_id = ?', [batchId]) as any[];
+    if (orderRows.length === 0) {
+      res.status(404).json({ error: 'Pedido no encontrado' });
+      return;
+    }
+
+    if (req.user?.role === 'operator' && orderRows.some((o: any) => o.user_id !== req.user!.id)) {
+      res.status(403).json({ error: 'No autorizado' });
+      return;
+    }
+
+    if (orderRows.some((o: any) => o.status !== 'AWAITING_APPROVAL')) {
+      res.status(400).json({ error: `Esta venta ya no se puede cancelar desde la app (status actual: ${orderRows[0].status}). Solo se puede cancelar mientras está esperando aprobación del administrador.` });
+      return;
+    }
+
+    // Revertir stock — solo las filas que de verdad lo habían descontado
+    // (orders.stock_decremented, ver createBatch). Un ítem cargado desde una
+    // ruta nunca se descontó acá, así que revertirlo sería incorrecto.
+    const barcodesToSync = new Set<string>();
+    for (const o of orderRows as any[]) {
+      if (o.stock_decremented) {
+        await pool.query('UPDATE products SET stock = GREATEST(stock + 1, 0) WHERE barcode = ?', [o.barcode]);
+        barcodesToSync.add(o.barcode);
+      }
+    }
+    for (const barcode of barcodesToSync) {
+      await syncStockToQboByBarcode(barcode);
+    }
+
+    // Revertir créditos del batch — inserta movimientos de reversa nuevos
+    // (nunca borra ni toca las filas originales), mismo espíritu que Void en
+    // QBO: nada se borra, todo se anula con rastro. Un EARNED se revierte
+    // con un USED del mismo monto (y viceversa), que es exactamente lo que
+    // getCustomerBalance() ya suma/resta — sin necesitar un tipo nuevo.
+    const [creditRows] = await pool.query(
+      'SELECT * FROM credit_transactions WHERE reference_batch_id = ?',
+      [batchId]
+    ) as any[];
+    for (const c of creditRows as any[]) {
+      const reversalType = c.type === 'EARNED' ? 'USED' : 'EARNED';
+      await pool.query(
+        "INSERT INTO credit_transactions (customer_id, customer_name, type, amount, reference_batch_id, invoice_id, note) VALUES (?, ?, ?, ?, ?, NULL, ?)",
+        [c.customer_id, c.customer_name, reversalType, c.amount, batchId, `Reversa por cancelación del batch ${batchId}`]
+      );
+    }
+
+    await pool.query(
+      "UPDATE orders SET status = 'CANCELLED', voided_at = NOW(), voided_by = ?, void_reason = ? WHERE batch_id = ?",
+      [req.user?.id ?? null, reason ?? null, batchId]
+    );
+
+    logActivity({
+      userId: req.user?.id, userEmail: req.user?.email, action: 'BATCH_CANCELLED', entityType: 'batch', entityId: String(batchId),
+      details: `${orderRows.length} items cancelados, ${creditRows.length} movimiento(s) de crédito revertido(s)${reason ? ` — motivo: ${reason}` : ''}`,
+      ip: req.ip,
+    });
+
+    res.json({ batchId, status: 'CANCELLED' });
+  } catch (err) {
+    logger.error('cancelBatch error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
+// POST /api/orders/batch/:batchId/edit — Fase 117. Mismo alcance de permisos
+// y status que cancelBatch. Reemplazo TOTAL de items[] — el cliente manda la
+// lista final completa (agregar un producto nuevo, quitar uno, o modificar
+// cantidad/precio de uno existente son la misma operación: no aparecer,
+// aparecer, o aparecer distinto en items[]). Solo toca orders — batch_damage
+// queda fuera de v1 (si hay que corregir un daño mal reportado, se cancela
+// el batch entero y se rehace). Se queda en AWAITING_APPROVAL: como
+// approveBatch lee `orders`/`batch_damage` frescos recién en el momento de
+// aprobar (no un snapshot tomado al crear el batch), no hace falta ninguna
+// llamada a QBO acá — la próxima aprobación ya va a ver los ítems editados.
+export async function editBatch(req: Request, res: Response): Promise<void> {
+  try {
+    const { batchId } = req.params;
+    const { items } = req.body;
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      res.status(400).json({ error: 'Se requiere un array de items' });
+      return;
+    }
+
+    const [orderRows] = await pool.query('SELECT * FROM orders WHERE batch_id = ?', [batchId]) as any[];
+    if (orderRows.length === 0) {
+      res.status(404).json({ error: 'Pedido no encontrado' });
+      return;
+    }
+
+    if (req.user?.role === 'operator' && orderRows.some((o: any) => o.user_id !== req.user!.id)) {
+      res.status(403).json({ error: 'No autorizado' });
+      return;
+    }
+
+    if (orderRows.some((o: any) => o.status !== 'AWAITING_APPROVAL')) {
+      res.status(400).json({ error: `Esta venta ya no se puede editar desde la app (status actual: ${orderRows[0].status}). Solo se puede editar mientras está esperando aprobación del administrador.` });
+      return;
+    }
+
+    // Validación de min_price — mismo criterio que createBatch, contra el
+    // catálogo fresco de products, nunca contra lo que mande el cliente.
+    for (const item of items) {
+      const { barcode, price, product_name } = item;
+      const [productRows] = await pool.query('SELECT min_price, weight_per_unit FROM products WHERE barcode = ?', [barcode]) as any[];
+      const product = productRows[0];
+      if (product?.min_price != null) {
+        const weightPerUnit = parseFloat(product.weight_per_unit) || 1.0;
+        const totalPerUnit = Math.round(price * weightPerUnit * 100) / 100;
+        if (Math.round(totalPerUnit * 100) < Math.round(product.min_price * 100)) {
+          res.status(400).json({
+            error: `El precio $${Number(totalPerUnit).toFixed(2)} está por debajo del mínimo permitido $${Number(product.min_price).toFixed(2)} para ${product_name ?? barcode}`,
+          });
+          return;
+        }
+      }
+    }
+
+    const first = orderRows[0] as any;
+    const barcodesToSync = new Set<string>();
+
+    // Revertir el stock de los ítems VIEJOS que sí se habían descontado.
+    for (const o of orderRows as any[]) {
+      if (o.stock_decremented) {
+        await pool.query('UPDATE products SET stock = GREATEST(stock + 1, 0) WHERE barcode = ?', [o.barcode]);
+        barcodesToSync.add(o.barcode);
+      }
+    }
+
+    // Mismo criterio de ruta que createBatch — no descontar stock de un
+    // producto que ya está cargado como route_items de la ruta de este
+    // batch (si esta venta viene de una parada de ruta).
+    let routeLoadedBarcodes: Set<string> = new Set();
+    const [stopRows] = await pool.query(
+      "SELECT route_id FROM route_stops WHERE batch_id = ? LIMIT 1",
+      [batchId]
+    ) as any[];
+    if (stopRows[0]?.route_id) {
+      const [routeItemRows] = await pool.query(
+        'SELECT barcode FROM route_items WHERE route_id = ? AND barcode IS NOT NULL',
+        [stopRows[0].route_id]
+      ) as any[];
+      routeLoadedBarcodes = new Set((routeItemRows as any[]).map((r: any) => r.barcode));
+    }
+
+    // Reemplazo total — mismo patrón DELETE + reinsert que convertPreOrder
+    // usa para pre_order_items. Conserva batch_id/reserved_invoice_number/
+    // customer_id/customer_name/payment_method/check_number/credit_applied
+    // de la fila original — la edición solo cambia QUÉ se vendió, no a quién
+    // ni con qué método de pago ni el crédito de cliente ya aplicado (ver
+    // limitación conocida más abajo).
+    await pool.query('DELETE FROM orders WHERE batch_id = ?', [batchId]);
+
+    for (const item of items) {
+      const { barcode, product_name, price, quantity, total, unit, case_qty } = item;
+      const isCourtesy = item.is_courtesy ? 1 : 0;
+      const decremented = !routeLoadedBarcodes.has(barcode);
+      await pool.query(
+        `INSERT INTO orders
+           (barcode, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name,
+            unit, case_qty, payment_method, check_number, is_courtesy, status, reserved_invoice_number,
+            credit_applied, stock_decremented)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AWAITING_APPROVAL', ?, ?, ?)`,
+        [
+          barcode, product_name, price, quantity, total ?? price * quantity, batchId, first.user_id,
+          first.customer_id, first.customer_name, unit ?? null, case_qty ?? null, first.payment_method,
+          first.check_number, isCourtesy, first.reserved_invoice_number, first.credit_applied, decremented ? 1 : 0,
+        ]
+      );
+      if (decremented) {
+        await pool.query('UPDATE products SET stock = GREATEST(stock - 1, 0) WHERE barcode = ?', [barcode]);
+        barcodesToSync.add(barcode);
+      }
+    }
+
+    for (const barcode of barcodesToSync) {
+      await syncStockToQboByBarcode(barcode);
+    }
+
+    logActivity({
+      userId: req.user?.id, userEmail: req.user?.email, action: 'BATCH_EDITED', entityType: 'batch', entityId: String(batchId),
+      details: `Ítems reemplazados: ${orderRows.length} → ${items.length}`,
+      ip: req.ip,
+    });
+
+    res.json({ batchId, status: 'AWAITING_APPROVAL', itemCount: items.length });
+  } catch (err) {
+    logger.error('editBatch error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 }

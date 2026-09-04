@@ -52,6 +52,8 @@ src/
 | POST | `/api/orders/batch/:batchId/retry` | JWT | Reintenta el envío a QBO de un batch PENDING/FAILED al instante (mismo `createBatchInvoice` que la creación). Disponible para el operador dueño del batch, no solo admin |
 | POST | `/api/orders/batch/:batchId/approve` | JWT+admin | Aprueba un batch AWAITING_APPROVAL y recién ahí lo manda a QBO (Fase 113) — ver "Aprobación de admin..." abajo |
 | POST | `/api/orders/batch/:batchId/reconcile` | JWT+admin | Chequeo de solo lectura contra QBO por DocNumber para un batch FAILED/PENDING — sin reintentar el envío. Ver "Fix (2026-09-01)" abajo |
+| POST | `/api/orders/batch/:batchId/cancel` | JWT | Cancela un batch AWAITING_APPROVAL (revierte stock y créditos, 100% local). Disponible para el operador dueño del batch, no solo admin — ver "Fase 117" abajo |
+| POST | `/api/orders/batch/:batchId/edit` | JWT | Reemplaza los ítems de un batch AWAITING_APPROVAL (agregar/quitar/modificar), se queda esperando aprobación. Disponible para el operador dueño del batch, no solo admin — ver "Fase 117" abajo |
 | GET | `/api/products` | JWT | Listar productos — `?search=` matchea `name`/`barcode`/**`sku`** (Fase 108), `?sort=sku` ordena por secuencia NEW_SKU (marca A-Z, luego 001, 002…; sin NEW_SKU al final) |
 | GET | `/api/customers` | JWT | Clientes QB |
 | GET | `/api/customers/:customerId` | JWT | Un solo cliente — cache-first contra `cached_customers`, fallback a QB (Fase 102, ticket Android necesitaba resolver dirección para reprint) |
@@ -235,6 +237,12 @@ INSERT INTO warehouses (name, is_active) SELECT 'Almacén Principal', 1 WHERE NO
 ALTER TABLE routes ADD COLUMN IF NOT EXISTS warehouse_id INT DEFAULT NULL AFTER driver_user_id;
 UPDATE routes SET warehouse_id = (SELECT id FROM warehouses ORDER BY id LIMIT 1) WHERE warehouse_id IS NULL;
 -- ALTER TABLE routes ADD FOREIGN KEY (warehouse_id) REFERENCES warehouses(id); -- solo si todavía no existe esa FK
+-- Fase 117 — Editar/Cancelar venta AWAITING_APPROVAL (ver sección propia más abajo)
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS voided_at TIMESTAMP NULL AFTER approved_at;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS voided_by INT NULL AFTER voided_at;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS void_reason VARCHAR(255) NULL AFTER voided_by;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS stock_decremented TINYINT(1) NOT NULL DEFAULT 0 AFTER is_courtesy;
+ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS note VARCHAR(255) NULL AFTER invoice_id;
 ```
 
 **`orders.unit`/`case_qty` — por qué importan para el ticket:** `unit` es el tipo de venta (Lbs/Case/Unit/Bucket) y `case_qty` las unidades por caja (`products.qty` cuando `unit = "Case"`, copiado al momento de la venta). Sin estos dos campos guardados en `orders`, reimprimir un pedido desde Historial no puede saber si era por peso o por caja — `listOrders` los expone ahora junto al resto de columnas.
@@ -402,6 +410,86 @@ cambia de forma, pero `orders[].status` ahora puede llegar
 venta, y `invoiceId` llega `null` hasta la aprobación — hay que verificar en
 el repo Android si algo depende de esos valores puntuales antes de dar esto
 por cerrado en producción.
+
+## Editar / Cancelar venta AWAITING_APPROVAL (Fase 117)
+
+Diseño completo (decisiones y alternativas descartadas) en `PROGRESS.md`.
+Reencuadre clave que definió el alcance: en el uso real, **todas las ventas
+del día quedan en `AWAITING_APPROVAL`** y el admin recién las pasa en bloque
+a `SENT` al final del día (Fase 113) — así que editar o cancelar una venta
+antes de esa aprobación es una operación **100% local, sin ninguna llamada a
+QBO** (la factura todavía no existe ahí). Una vez `SENT`, ninguno de los dos
+endpoints aplica más — un `SENT` mal cargado se corrige a mano en QBO, igual
+que antes de esta fase.
+
+Ambos endpoints (`cancelBatch`/`editBatch`, `orderController.ts`) comparten
+las mismas dos validaciones antes de tocar nada: **admin o el operador dueño
+del batch** (`user_id` de todas las filas, mismo criterio que
+`retryBatchSync` — no admin-only como `approveBatch`) y **todas las filas
+del batch tienen que seguir `AWAITING_APPROVAL`** (si no, `400` con el status
+actual en el mensaje).
+
+**`POST /api/orders/batch/:batchId/cancel`** (body opcional `{ reason }`) —
+revierte stock y créditos, y marca `orders.status = 'CANCELLED'` (valor que
+ya existía en el ENUM desde la Fase 1 pero nunca se usaba en la práctica)
+con `voided_at`/`voided_by`/`void_reason` para auditoría (mismo patrón que
+`approved_by`/`approved_at` de la Fase 113). No reintenta ni libera
+`reserved_invoice_number` — el número reservado nunca se reusa, mismo
+criterio que un talonario físico.
+
+**`POST /api/orders/batch/:batchId/edit`** (body `{ items[] }`, mismo shape
+que `createBatch`) — **reemplazo total**: la lista que llega es la versión
+final completa del batch, así que agregar un producto nuevo, quitar uno, o
+modificar cantidad/precio de uno existente son la misma operación (no
+aparecer / aparecer / aparecer distinto en `items[]`), no rutas separadas.
+Solo toca `orders` — `batch_damage` queda fuera de v1 (si hay que corregir
+un daño mal reportado, se cancela el batch entero y se rehace). Valida
+`min_price` igual que `createBatch`. Hace `DELETE FROM orders WHERE
+batch_id = ?` + reinsert (mismo patrón que `convertPreOrder` con
+`pre_order_items`), conservando `batch_id`/`reserved_invoice_number`/
+`customer_id`/`customer_name`/`payment_method`/`check_number`/
+`credit_applied` de la fila original — la edición solo cambia **qué** se
+vendió. El batch se queda en `AWAITING_APPROVAL`: como `approveBatch` lee
+`orders`/`batch_damage` **frescos en el momento de aprobar** (no un snapshot
+tomado al crear el batch), no hace falta tocar `approveBatch` para nada — la
+próxima aprobación ya ve los ítems editados.
+
+**Reversa de stock — por qué hace falta `orders.stock_decremented`.**
+`createBatch` descuenta `products.stock` **1 unidad por línea vendida**, no
+por `quantity` (`quantity` es peso/cantidad facturada, no el conteo de
+descuento de stock) — salvo que el producto ya viniera cargado en la ruta de
+este batch (`route_items`, ver comentario en `createBatch`), caso en el que
+nunca se descuenta acá para no restarlo dos veces. Además, ni `createOrder`
+ni `convertPreOrder` descuentan stock en absoluto (gap preexistente de
+`convertPreOrder`, documentado en la Fase 87). Sin registrar por fila si el
+descuento realmente ocurrió, `cancelBatch`/`editBatch` no tendrían forma
+confiable de saber cuánto revertir sin re-derivar toda esa lógica y
+arriesgarse a sumar stock que nunca se restó. `orders.stock_decremented`
+(columna nueva, default `0` — correcto de por sí para `createOrder`/
+`convertPreOrder`) se calcula y persiste en `createBatch` al mismo tiempo
+que el descuento real, y es lo único que `cancelBatch`/`editBatch` miran
+para decidir si suman de vuelta. La reversa de stock sincroniza a QBO vía
+`updateItemQtyOnHand` (helper nuevo `syncStockToQboByBarcode`, silencioso —
+mismo criterio "no revierte nada local si QBO falla" que el resto del
+proyecto), deduplicado por barcode dentro de la misma request.
+
+**Reversa de créditos — inserta movimientos nuevos, nunca borra ni edita los
+originales.** Mismo espíritu que Void en QBO: nada se borra, todo se anula
+con rastro. Por cada fila de `credit_transactions` con
+`reference_batch_id` = este batch, `cancelBatch` inserta una fila nueva de
+tipo **opuesto** por el mismo monto (`EARNED` → reversa `USED`, `USED` →
+reversa `EARNED`, con `note` describiendo la reversa) — es exactamente la
+aritmética que `getCustomerBalance()` ya hace (`SUM(EARNED) - SUM(USED)`),
+sin necesitar un tipo nuevo en el ENUM. Columna `credit_transactions.note`
+(nueva, libre) queda disponible para cualquier otro uso futuro que quiera
+anotar algo sin forzar el `type`.
+
+**Fuera de alcance de v1 (decisión explícita del usuario, no gaps
+accidentales):** editar no toca `batch_damage` ni recalcula `credit_applied`
+contra el nuevo total del batch (se conserva tal cual estaba); no hay
+ventana horaria — el único gate es el status `AWAITING_APPROVAL`; no hay
+tabla de snapshots de revisiones, solo `activity_log` (`BATCH_CANCELLED`/
+`BATCH_EDITED`).
 
 ## updateBatchPayment — PUT /api/orders/batch/:batchId/payment (Fase 82)
 

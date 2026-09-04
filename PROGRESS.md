@@ -4634,29 +4634,166 @@ completa, con sus respectivos fixes) se hizo en una sola sesión larga,
    sesión y así se encontraron los 2 bugs de arriba (preview de ticket y
    carrito no reflejaban cortesía) — ambos ya corregidos y compilando.
 
-### Próxima sesión — Editar / Cancelar factura ya generada
+## Fase 117 — Editar / Cancelar venta AWAITING_APPROVAL (diseño cerrado 2026-09-04, sin implementar todavía)
 
-Decidido con el usuario 2026-09-03: **mañana el foco es este módulo**, el
-siguiente después de Routes y Damage/Credits+cortesías. Punto de partida
-(análisis ya hecho, ver fila "Cancelar / editar factura ya generada" en la
-tabla de pendientes más arriba en este documento):
+Pedido original 2026-08-28, retomado el 2026-09-04 como el módulo siguiente
+después de cerrar Routes (Fase 115) y Damage/Credits+cortesías (Fase 116).
+Mismo criterio que esas dos fases: **esta ronda fue solo de definición de
+alcance con el usuario — sin código todavía.**
 
-- Técnicamente viable sin upgrade de tier de QBO — void/update de invoice es
-  parte de la Accounting API v3 estándar, misma API que ya usa
-  `qbInvoices.ts` para crear facturas.
-- **Falta resolver antes de empezar a codear:** ¿"editar" significa solo
-  cancelar/voidear una venta ya facturada (más simple), o también poder
-  modificar los ítems/cantidades de una factura que QBO ya tiene (más
-  invasivo — probablemente necesita historial de revisiones)? Sin
-  responder esto todavía.
-- Piezas que probablemente hagan falta (sin diseño cerrado): manejo de
-  `SyncToken` antes de escribir sobre el invoice (mismo patrón GET→SyncToken
-  →POST sparse que ya usa `qbItems.ts`); reversa del lado MySQL al cancelar
-  (`products.stock`, `credit_transactions` — probablemente sin necesitar
-  migración, reusando patrones existentes); posibles columnas nuevas de
-  auditoría en `orders` (`voided_at`/`voided_by`/`void_reason`, mismo
-  patrón que `approved_by`/`approved_at` de la Fase 113) — **esto sí
-  requeriría una migración SQL chica**, a confirmar una vez que se cierre el
-  diseño. `invoice_counter` no se toca — el número nunca se libera para
-  reusar, mismo criterio que un talonario físico.
-- Sin número de fase asignado todavía (sería la próxima después de la 116).
+**Reencuadre clave, aportado por el usuario a mitad de la conversación de
+diseño y que cambió todo el enfoque:** en el uso real, **todas las ventas del
+día quedan en `AWAITING_APPROVAL`** (Fase 113) y el admin recién las pasa en
+bloque a `SENT` **al final del día**. Es decir, durante prácticamente toda la
+jornada la factura **todavía no existe en QBO**. Esto vuelve innecesario todo
+el mecanismo de void/sparse-update de invoices que se había planteado en la
+primera vuelta de diseño (ver historial de decisiones más abajo) — editar o
+cancelar una venta `AWAITING_APPROVAL` es una operación **puramente local**,
+sin ninguna llamada a QBO. Confirmado con `approveBatch` (`orderController.ts`
+línea 328): arma el invoice leyendo `orders`/`batch_damage` **frescos en el
+momento de aprobar**, no un snapshot guardado al crear el batch — así que
+editar las filas de `orders` antes de que el admin apruebe alcanza para que
+la factura final ya salga con los ítems corregidos, **sin tocar
+`approveBatch` para nada**.
+
+**Decisiones finales confirmadas con el usuario (2026-09-04):**
+
+1. **Alcance — solo batches `AWAITING_APPROVAL`.** Una vez que un batch pasa
+   a `SENT` (admin ya aprobó, factura real en QBO), queda **totalmente fuera
+   de alcance de este módulo** — nada de void ni de editar una factura real.
+   Un `SENT` mal cargado se corrige a mano en QBO, como se hace hoy. Esto
+   descarta por completo el mecanismo de void/sparse-update de invoice de la
+   primera vuelta de diseño (no hace falta implementarlo).
+2. **Permisos** — admin + operador dueño del batch, mismo criterio que
+   `retryBatchSync` (no admin-only como `approveBatch`).
+3. **Gate — solo el status importa, sin restricción de horario.** Disponible
+   en cualquier momento mientras el batch siga `AWAITING_APPROVAL`, sin
+   ventana de reloj — el límite real ya lo impone el momento en que el admin
+   aprueba al final del día. (La ventana "9:00–16:00" planteada en la primera
+   vuelta de diseño queda descartada.)
+4. **Reversa al cancelar — stock y créditos, los dos.** `products.stock` se
+   revierte (y su sync a QBO vía `updateItemQtyOnHand`, mismo patrón que
+   `route_returns` `GOOD`) y `credit_transactions` se revierte también — si
+   la venta había generado crédito por daño (`EARNED`) o consumido saldo del
+   cliente (`USED`), ambos movimientos se deshacen. Como la factura nunca
+   existió en QBO, no hay nada que voidear ahí — la reversa es 100% local.
+5. **Editar no requiere un status nuevo.** Reemplaza los ítems del batch y
+   **se queda en `AWAITING_APPROVAL`** — sigue esperando la misma aprobación
+   de fin de día que ya iba a tener. `activity_log` registra que hubo una
+   edición (quién, cuándo, qué cambió) — sin tabla de snapshots dedicada por
+   ahora.
+6. **`orders.status = 'CANCELLED'`** (valor que ya existe en el ENUM desde
+   el schema original — Fase 1 — pero nunca se usó en la práctica hasta
+   ahora). `invoice_counter`/`reserved_invoice_number` **no se tocan** —
+   el número reservado para ese batch nunca se libera para reusar, mismo
+   criterio que un talonario físico (coherente con cómo ya se decidió que
+   funciona `reserveInvoiceNumber()` en la Fase 113).
+
+**Decisiones finales — cierre de los 3 puntos abiertos (2026-09-04):**
+
+7. **Reversa de créditos — movimientos de reversa nuevos, no borrar filas.**
+   Mismo espíritu que Void en QBO (nada se borra, todo se anula con rastro):
+   las filas `EARNED`/`USED` originales del batch quedan intactas en
+   `credit_transactions` y se insertan filas nuevas que las anulan (tipo
+   opuesto o un campo de reversa) — el saldo del cliente queda correcto y el
+   historial completo sigue siendo auditable.
+8. **Editar, v1 — solo ítems de venta (`orders`), no `batch_damage`.** Si
+   hace falta corregir un daño mal reportado, se cancela el batch entero y
+   se rehace desde cero. Más simple, cubre el caso más común (error en
+   producto/cantidad vendida).
+9. **Shape del edit — reemplazo total de `items[]`, y ese reemplazo ya
+   cubre agregar productos nuevos, no solo modificar los existentes.** El
+   cliente manda la lista **final completa** de ítems del batch — mismo
+   patrón que `convertPreOrder` (`DELETE + reinsert`). Como es un reemplazo
+   total, un producto que no estaba en la venta original y aparece en el
+   `items[]` nuevo **se agrega** sin necesidad de un endpoint separado; uno
+   que estaba y no aparece más **se quita**; uno con la cantidad/precio
+   distinto **se modifica** — las tres operaciones (agregar/quitar/editar)
+   son la misma mecánica de reemplazo, no rutas separadas. La UI de edición
+   (Android/webapp) tiene que ofrecer explícitamente both: editar las líneas
+   ya cargadas del carrito **y** agregar un producto nuevo (escaneo/búsqueda,
+   mismo flujo que armar una venta nueva) antes de mandar el `items[]` final
+   — no alcanza con una pantalla que solo permita tocar cantidades de lo que
+   ya estaba.
+
+**Piezas para cerrar el diseño técnico antes de codear:**
+
+| # | Pieza | Diseño |
+|---|---|---|
+| 117.1 | **Cancelar** (`POST /api/orders/batch/:batchId/cancel`) | Valida status (`AWAITING_APPROVAL`, si no 400) y ownership (admin o `user_id` del batch, si no 403). Revierte stock por línea (`GREATEST(stock + qty, 0)`, mismo criterio que el resto del proyecto) e inserta movimientos de reversa en `credit_transactions` para los `EARNED`/`USED` del batch (decisión 7 — no borra las filas originales). `orders.status = 'CANCELLED'` para todas las filas del batch + columnas nuevas `voided_at`/`voided_by`/`void_reason` (mismo patrón que `approved_by`/`approved_at` de la Fase 113 — **requiere migración SQL chica**). Sin ninguna llamada a QBO. `activity_log` con el detalle. |
+| 117.2 | **Editar** (`POST /api/orders/batch/:batchId/edit`) | Body `items[]` — la lista **final completa** de ítems del batch (mismo shape que `createBatch`/`convertPreOrder`); permite agregar productos nuevos, quitar los que ya no van, y modificar cantidad/precio/unidad de los que quedan, todo en la misma operación de reemplazo (decisión 9). Solo toca `orders` — `batch_damage` queda fuera de v1 (decisión 8). Valida status y ownership igual que cancelar. Revierte el stock de los ítems *viejos* y aplica el descuento de los ítems *nuevos* (delta neto, no revert+reaplicar ciego). Reemplaza las filas de `orders` de ese `batch_id` (`DELETE + reinsert`) — conserva `batch_id`/`reserved_invoice_number`/`customer_id` sin cambios. Status se queda en `AWAITING_APPROVAL`. `activity_log` con el diff (ítems antes/después). Sin ninguna llamada a QBO — `approveBatch` recoge los ítems editados solo porque los vuelve a leer en el momento de aprobar. |
+| 117.3 | **Auditoría** | `voided_at`/`voided_by`/`void_reason` (cancelar, columnas nuevas); para editar alcanza con `activity_log` (mismo patrón que `INVOICE_COUNTER_UPDATED`) — sin tabla de snapshots dedicada. |
+| 117.4 | **UI — Android + webapp** | Botones "Cancelar venta" / "Editar venta" visibles solo en batches `AWAITING_APPROVAL` (mismo filtro/chip "Por aprobar" que ya existe en `/orders` desde la Fase 113) — desaparecen apenas el batch pasa a `SENT`. Editar reabre algo parecido al carrito (`CurrentOrderActivity`/modal de ítems en la webapp) precargado con los ítems actuales del batch, con la posibilidad de **tanto tocar las líneas existentes como agregar productos nuevos** (escaneo/búsqueda) antes de guardar — no una pantalla read-mostly de solo cantidades. Sin pantallas ni endpoints diseñados todavía. |
+
+**Diseño cerrado — los 3 puntos abiertos de la vuelta anterior (reversa de
+créditos, alcance de `batch_damage`, shape del edit) quedaron resueltos con
+las decisiones 7-9 de arriba.**
+
+**Actualización (2026-09-04) — backend implementado (117.1, 117.2, 117.3).**
+`cancelBatch`/`editBatch` nuevos en `orderController.ts`, rutas `POST
+/api/orders/batch/:batchId/cancel` y `/edit` en `routes/orders.ts` (`auth`,
+sin `adminOnly` — ownership se valida adentro, mismo criterio que
+`retryBatchSync`). Documentación completa del comportamiento en
+`CLAUDE.md` (sección "Editar / Cancelar venta AWAITING_APPROVAL (Fase
+117)") — no se repite acá.
+
+- **Detalle técnico no explícito en el diseño original, resuelto durante la
+  implementación:** `createBatch` descuenta stock **1 unidad por línea**, no
+  por `quantity` — y ni `createOrder` ni `convertPreOrder` descuentan stock
+  en absoluto. Sin registrar por fila si el descuento realmente ocurrió,
+  revertirlo con precisión al cancelar/editar no era posible sin re-derivar
+  toda esa lógica. Se agregó `orders.stock_decremented` (columna nueva,
+  default `0` — ya correcto de por sí para `createOrder`/`convertPreOrder`),
+  calculada y persistida en `createBatch` en el mismo momento del descuento
+  real; `cancelBatch`/`editBatch` la usan como única fuente de verdad para
+  decidir cuánto revertir. `createBatch` se reordenó un poco (el cálculo de
+  `routeLoadedBarcodes` se movió antes del loop de inserts, no después) para
+  poder calcular el flag en el mismo INSERT sin una segunda pasada.
+- **Migración SQL — aplicada por el usuario (2026-09-04), a mano vía
+  phpMyAdmin, mismo flujo que las Fases 115/116.** Ya agregada también a
+  `db/schema.sql`, `excellentia_schema.sql` y `CLAUDE.md`:
+  ```sql
+  ALTER TABLE orders ADD COLUMN IF NOT EXISTS voided_at TIMESTAMP NULL AFTER approved_at;
+  ALTER TABLE orders ADD COLUMN IF NOT EXISTS voided_by INT NULL AFTER voided_at;
+  ALTER TABLE orders ADD COLUMN IF NOT EXISTS void_reason VARCHAR(255) NULL AFTER voided_by;
+  ALTER TABLE orders ADD COLUMN IF NOT EXISTS stock_decremented TINYINT(1) NOT NULL DEFAULT 0 AFTER is_courtesy;
+  ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS note VARCHAR(255) NULL AFTER invoice_id;
+  ```
+- `bunx tsc --noEmit`: 9 errores preexistentes, ninguno nuevo. `bun run
+  build` limpio.
+- **Pendiente — testing manual del backend, todavía no hecho por Claude.**
+  El usuario prueba los endpoints por su cuenta contra la base real.
+
+**Actualización (2026-09-04) — 117.4 implementada, Android-only por decisión
+explícita del usuario. Fase 117 completa (backend + Android; webapp sin UI a
+propósito).** Corrección sobre la primera vuelta: se había implementado
+también en la webapp (`OrdersClient.tsx`) y el usuario aclaró que cancelar/
+editar **no debe existir en la webapp** — es una acción exclusiva de admin/
+operador **dentro de la app Android**. La implementación de webapp se
+revirtió por completo (`git checkout` sobre `OrdersClient.tsx`/`page.tsx`/
+`i18n.ts`, sin rastro en el código) y quedó una nota en
+`excellentia-webapp/CLAUDE.md` para no repetir el intento sin querer. Detalle
+completo de lo que sí quedó en pie en `AndroidStudioProjects/test/CLAUDE.md`
+(entradas de `TicketDetailActivity`/`EditBatchActivity`) — resumen:
+
+- **Android** — `TicketDetailActivity` gana dos botones ("Edit sale"/"Cancel
+  sale"), visibles solo si el batch sigue `AWAITING_APPROVAL` y el usuario
+  actual es admin u operador dueño de **todas** las filas del batch (mismo
+  criterio que ya valida el backend). Cancelar es un diálogo in-place con
+  motivo opcional. Editar navega a **`EditBatchActivity`** (pantalla nueva)
+  — reemplazo total de `items[]`: lista las líneas actuales editables
+  in-place (`item_edit_batch_row.xml`) + botón "Add product" que reusa el
+  buscador de `ConsignmentActivity` (`GET /api/products?search=`, sin
+  escaneo DataWedge en esta pantalla). Al volver con éxito de cualquiera de
+  las dos acciones, `TicketDetailActivity` se cierra sola (no tiene forma
+  barata de reconstruirse con los ítems nuevos) — vuelve a
+  `HistoryActivity`, que ya refresca en `onResume()`.
+  `:app:compileDebugKotlin` y `:app:assembleDebug` limpios (mismo warning
+  preexistente de `scaledDensity`, no relacionado).
+- **Webapp** — sin UI para esto, a propósito. `bun run build` limpio tras el
+  revert (vuelve a las 16 páginas de siempre, sin cambios de comportamiento).
+- **Sin probar en un TC22/emulador real** — la pantalla nueva solo está
+  verificada por compilación, igual que el backend.
+
+Sin correr `git commit` todavía en ninguno de los 3 repos — cambios en el
+working tree.
