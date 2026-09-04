@@ -44,8 +44,12 @@ router.delete('/:id/items/:itemId',   auth, warehouseOnly, removeRouteItem);
 router.get('/:id/returns/expected',   auth, getExpectedReturns);
 router.post('/:id/returns',           auth, warehouseOnly, createReturns);
 router.get('/:id/returns',            auth, listReturns);
-router.post('/:id/stops/:stopId/consignment',        auth, warehouseOnly, registerConsignment);
+// Sin warehouseOnly: registrar/liquidar consignación es acción de campo del
+// operator (repartidor) dueño de la ruta, no del almacenista — mismo
+// criterio que updateStopStatus. El ownership (operator solo su propia
+// ruta) se resuelve dentro de cada controller.
+router.post('/:id/stops/:stopId/consignment',        auth, registerConsignment);
 router.get('/:id/stops/:stopId/consignment',         auth, getConsignment);
-router.post('/:id/stops/:stopId/consignment/settle', auth, warehouseOnly, settleConsignment);
+router.post('/:id/stops/:stopId/consignment/settle', auth, settleConsignment);
 
 export default router;

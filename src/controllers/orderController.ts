@@ -92,8 +92,15 @@ export async function listOrders(req: Request, res: Response): Promise<void> {
 
     const [rows] = await pool.query(query, params) as any[];
 
+    // is_courtesy es TINYINT(1) — mysql2 lo devuelve como number (0/1), no
+    // boolean estricto (mismo gotcha que qb_active, ver normalizeQbActive en
+    // productController.ts). Android (Gson, BatchItem.isCourtesy: Boolean)
+    // espera boolean estricto — sin este cast, el reprint desde Historial
+    // rompe el parseo de toda la respuesta, no solo este campo.
+    const normalizedRows = (rows as any[]).map(r => ({ ...r, is_courtesy: !!r.is_courtesy }));
+
     res.json({
-      data: rows,
+      data: normalizedRows,
       meta: { page: pageNum, limit: limitNum, total: countResult[0].total },
     });
   } catch (err) {

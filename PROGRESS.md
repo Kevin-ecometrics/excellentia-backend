@@ -4037,7 +4037,7 @@ para los TC22.
 | Media | **Email resumen diario** | Enviar resumen automático al admin con pedidos del día, ingresos totales y operadores activos. Bloqueado hasta tener SMTP |
 | Alta | **`syncProductsFromQbo` inserta productos sin barcode** | El sync automático (`syncEngine.ts`) inserta `barcode = NULL` para items nuevos, a diferencia del sync manual (`qbController.ts`) que usa `item.Sku \|\| 'QBO-{id}'`. Un producto sin barcode nunca puede facturarse (ver Fase 64) — unificar el fallback en ambos sync paths |
 | Media | **Vincular `orders` a `products` por id, no por barcode** | `orders.barcode = products.barcode` es un JOIN por string equality — frágil si el barcode cambia después de la venta o el producto no tiene barcode. Agregar `product_id` a `orders` eliminaría la clase entera de bugs de "PENDING sin razón aparente" (ver Fase 64) |
-| Alta | **Cancelar / editar factura ya generada** | Técnicamente viable sin upgrade de tier QBO — void/update de invoice es parte de la Accounting API v3 (`invoice?operation=void`, sparse update), la misma API que ya usa `qbInvoices.ts` para crear facturas; disponible en cualquier plan de QBO (Simple Start incluido), no es feature Premium. Falta: (1) manejo de `SyncToken` antes de escribir — mismo patrón que `updateItemMeta`/`updateItemQtyOnHand` en `qbItems.ts` (GET → SyncToken → POST sparse), aplicado a `invoice`; (2) lógica de reversa del lado MySQL al voidear — hoy nada revierte `products.stock` ya descontado, créditos generados en `credit_transactions`, ni `invoice_counter` ya incrementado; (3) endpoint(s) nuevos — hoy no existe ninguno ni siquiera oculto; el único parecido (`PUT /api/orders/:id/status`, admin-only) solo cambia el status local, no toca QBO, y no lo llama ninguna pantalla (ni Android ni webapp). Preguntado por el usuario 2026-08-28; sin alcance ni fase asignada todavía |
+| Alta | **Cancelar / editar factura ya generada** | Técnicamente viable sin upgrade de tier QBO — void/update de invoice es parte de la Accounting API v3 (`invoice?operation=void`, sparse update), la misma API que ya usa `qbInvoices.ts` para crear facturas; disponible en cualquier plan de QBO (Simple Start incluido), no es feature Premium. Falta: (1) manejo de `SyncToken` antes de escribir — mismo patrón que `updateItemMeta`/`updateItemQtyOnHand` en `qbItems.ts` (GET → SyncToken → POST sparse), aplicado a `invoice`; (2) lógica de reversa del lado MySQL al voidear — hoy nada revierte `products.stock` ya descontado, créditos generados en `credit_transactions`, ni `invoice_counter` ya incrementado; (3) endpoint(s) nuevos — hoy no existe ninguno ni siquiera oculto; el único parecido (`PUT /api/orders/:id/status`, admin-only) solo cambia el status local, no toca QBO, y no lo llama ninguna pantalla (ni Android ni webapp). Preguntado por el usuario 2026-08-28; sin alcance ni fase asignada todavía. **Actualización 2026-09-03: confirmado por el usuario como el próximo módulo a encarar**, después de cerrar Routes (Fase 115) y Damage/Credits + tickets de cortesía (Fase 116) — sigue sin diseño detallado ni número de fase asignado, los 3 puntos pendientes de arriba (SyncToken, reversa MySQL, endpoints nuevos) son el punto de partida cuando se retome |
 
 ### Webapp
 
@@ -4204,9 +4204,95 @@ funcional por separado, se puede cortar entre una y otra.
   `is_courtesy` (`@SerializedName`), poblado en `toBatchItems()` desde
   `order.isCourtesy`. Cadenas `label_mark_as_courtesy` (en/es).
   `:app:compileDebugKotlin` limpio.
-- **Fuera de alcance, sin resolver:** qué imprime el ticket físico para una
-  línea cortesía (¿precio real o "$0.00 — Cortesía"?) — no estaba definido
-  en el diseño original, `PrintService.kt` no se tocó.
+- **Implementado (2026-09-03, mismo día) — "Courtesy Summary" en el ticket,
+  mismo enfoque que "Negative Sale Summary" (créditos por daño).** El
+  usuario pidió explícitamente el mismo tratamiento que ya existe para
+  daño/vencido, no el tag in-place que se había planteado antes — se
+  descartó esa idea sin implementarse.
+  - **Android** (`PrintService.kt`, `buildCpcl`) — nueva sección "Courtesy
+    Summary:" (enmarcada en `DASH`, mismo estilo que "Negative Sale
+    Summary:") que lista cada ítem cortesía con su cantidad y `-$monto`,
+    justo antes de esa sección. El bloque de Total ahora resta también
+    `courtesyTotal` (`Subtotal → Courtesy → Credits → Credit Applied →
+    TOTAL`, cada línea condicional a que aplique). Reusa
+    `BatchItem.isCourtesy` (ya existía desde la implementación original de
+    115.5). **Se propagó a los 5 lugares donde se arma un `BatchItem` o el
+    `OrderDto` que luego se convierte en uno** — antes solo lo tenía la
+    venta recién armada (`toBatchItems`, `CurrentOrderActivity`): preview
+    de ticket antes de finalizar (`openTicket`), pantalla de éxito
+    (`orders_json` en `OrderSuccessActivity`), reintento de un pedido
+    fallido (`HistoryActivity.bindRetry`) y reimpresión desde Historial
+    (`TicketDetailActivity`) — sin este propagado, cualquiera de esos 4
+    caminos hubiera reimpreso el ticket sin el resumen de cortesía aunque
+    la venta original sí la tuviera. `PreOrderDetailActivity` se dejó sin
+    tocar a propósito — la conversión de pre-órdenes no tiene checkbox de
+    cortesía, no aplica.
+  - **Fix de un bug real encontrado al propagar esto — `OrderDto.isCourtesy`
+    como `Boolean` recibiendo un `number` de MySQL.** `is_courtesy` es
+    `TINYINT(1)`, que `mysql2` devuelve como `0`/`1` (number), no boolean
+    estricto — mismo gotcha ya documentado para `qb_active`
+    (`normalizeQbActive()`, `productController.ts`). Sin normalizar,
+    `listOrders` le mandaba a Android un JSON con `is_courtesy: 0`, y Gson
+    revienta al deserializar un number donde el campo Kotlin espera
+    `Boolean` — **rompía el parseo de la respuesta entera** (mismo patrón
+    de falla ya visto con otros `TINYINT(1)`, no solo ese campo). Fix:
+    `listOrders` (`orderController.ts`) normaliza `is_courtesy` a boolean
+    real antes de responder, mismo patrón que `normalizeQbActive`.
+  - **Webapp** (`OrdersClient.tsx`, modal de ticket) — mismo agregado:
+    sección "Courtesy Summary:" antes de "Negative Sale Summary:", y el
+    bloque Subtotal/Créditos/Total gana la línea "Courtesy:" (color índigo,
+    `--ec-info-ink`, distinto del rojo de Créditos). Claves i18n
+    `tkt_courtesySummary`/`tkt_courtesy` (es/en).
+  - `tsc --noEmit`: 9 preexistentes, ninguno nuevo. `bun run build` limpio.
+    `:app:compileDebugKotlin` limpio (mismos warnings preexistentes de
+    `SOFT_INPUT_ADJUST_RESIZE`/`scaledDensity`, no relacionados).
+
+  **Fix (2026-09-03, mismo día) — el preview del ticket en pantalla no
+  mostraba el descuento de cortesía, encontrado por el usuario probando en
+  el dispositivo.** `TicketDetailActivity.buildReceipt()` es una
+  implementación de renderizado **completamente aparte** de
+  `PrintService.buildCpcl()` — arma el ticket que se ve en pantalla (tanto
+  el preview antes de finalizar como la vista después de enviar/reimprimir),
+  no lo que se manda a la impresora térmica. El agregado de "Courtesy
+  Summary" solo se había hecho en `PrintService.kt`; esta pantalla se
+  quedó sin tocar y seguía mostrando el total completo sin descontar nada
+  cuando había ítems cortesía — mismo tipo de "dos lugares que arman el
+  mismo ticket, hay que tocar los dos" que ya pasaba con Negative Sale
+  Summary (por eso ese sí estaba en los dos). Fix: mismo cálculo de
+  `courtesyTotal` y sección "Courtesy Summary:" replicados en
+  `buildReceipt()` — cubre los 3 call sites de esa función (preview inicial,
+  y las dos re-renderizaciones tras traer datos frescos del servidor) porque
+  comparten el mismo cuerpo. `:app:assembleDebug` limpio.
+
+  **Fix (2026-09-03, mismo día) — el carrito (antes de llegar al ticket) no
+  reflejaba nada de esto.** Encontrado por el usuario probando en el
+  dispositivo: al tildar "Mark as courtesy" en `CurrentOrderActivity`, ni la
+  fila del producto ni el "ORDER TOTAL" cambiaban — el checkbox guardaba la
+  marca (`orderRepository.setCourtesy`) pero a propósito **no** disparaba
+  `loadOrder()` (decisión original: "price/quantity no cambian, no hace
+  falta re-renderizar"), que resultó ser la decisión equivocada una vez que
+  se sumó el requisito de reflejarlo visualmente. Fix, 2 pantallas más:
+  - **Carrito** (`CurrentOrderActivity`) — el checkbox ahora sí llama
+    `loadOrder()` al tildar. La fila de un ítem cortesía muestra
+    `$0.00 · Courtesy` en vez del precio real (color `ex_navy`, distinto del
+    verde normal y del rojo de crédito) — el valor real de catálogo sigue
+    visible en la línea de arriba (`tvPendingMeta`), no se pierde. El "ORDER
+    TOTAL" resta `courtesyTotal` igual que ya resta `creditsTotal`, con una
+    línea "Courtesy: -$X" nueva debajo (`tvCourtesyTotal`, mismo patrón que
+    `tvCreditsTotal`). De paso, `askApplyCredit()` — el cálculo del máximo de
+    crédito de cliente aplicable a la venta — también excluye lo cortesía
+    del `netTotal` (sin este fix, se podía ofrecer aplicar más crédito del
+    que la venta realmente iba a cobrar).
+  - **Pantalla de éxito** (`OrderSuccessActivity`) — mismo patrón que ya
+    tenía para Credits: fila nueva "Courtesy: -$X" (`rowCourtesy`,
+    `activity_order_success.xml`) y el total mostrado (`tvSuccessTotal`)
+    resta `courtesyTotal` (calculado desde `orders`, que ya traía
+    `isCourtesy` gracias al fix de propagación de más arriba).
+  - Con esto, cortesía ahora se refleja consistentemente en **las 4
+    pantallas** donde aparece un total: carrito, preview de ticket,
+    pantalla de éxito, y el ticket físico/reimpreso.
+  - `:app:assembleDebug` limpio (manifest + layouts + recursos nuevos
+    verificados, no solo `compileDebugKotlin`).
 
 **Actualización (2026-09-03) — 115.2/115.3 implementada (backend + webapp + Android).**
 
@@ -4316,6 +4402,65 @@ diseño original, resueltas con el mejor criterio dado el schema ya migrado):**
 **Fase 115 (Módulo Routes) queda completa: 115.1 → 115.5 → 115.2/115.3 →
 115.4, backend + webapp + Android compilando en las 3 partes.** Pendiente de
 deploy en las tres (nada de lo de hoy se desplegó a producción todavía).
+
+**Corrección (2026-09-03, mismo día) — Consignación pasó de Warehouse a
+Operator en Android.** Al revisar dónde quedaba cada pantalla nueva por
+módulo, `ConsignmentActivity` había quedado colgada de
+`WarehouseRouteDetailActivity` (almacenista, planifica la ruta antes de
+salir) — pero dejar/liquidar mercadería en consignación es una acción de
+campo que pasa en el momento de la visita, mismo tipo de acción que ya hace
+el repartidor al "vender por scratch" en una parada CUSTOMER
+(`MyRouteDetailActivity.activateCustomerAndSell()`). Corregido:
+
+- **Backend** — `registerConsignment`/`settleConsignment`/`getConsignment`
+  dejan de requerir `warehouseOnly`; ahora es cualquier autenticado, con el
+  mismo chequeo de ownership que ya usa `updateStopStatus` (`operator` solo
+  puede actuar sobre su propia ruta — `routes.driver_user_id`, 403 si no
+  coincide; `admin`/`almacenista` sin restricción).
+- **Android** — se sacó `btnManageConsignment` de `item_route_stop.xml` y su
+  wiring en `WarehouseRouteDetailActivity` (el almacenista solo ve la
+  etiqueta "Consignment" en la parada, sin acción — mismo criterio "solo
+  lectura" que ya tiene la webapp). `MyRouteDetailActivity.renderStops()`
+  gana el caso `CONSIGNMENT`: botón "Manage consignment" que abre
+  `ConsignmentActivity`, **visible sin importar si la parada ya está
+  `DELIVERED`** (a diferencia de `PRE_ORDER`/`CUSTOMER`) — registrar y
+  liquidar son dos momentos que pueden caer en visitas distintas, así que la
+  acción tiene que seguir disponible después de la primera entrega.
+  `ConsignmentActivity.registerItem()` ahora llama `updateStopStatus(...,
+  "DELIVERED")` en cada registro exitoso (best-effort, no bloquea si falla)
+  — mismo criterio que `CUSTOMER`: la entrega se marca sola cuando ocurre la
+  acción real (dejar mercadería), no con un botón manual aparte.
+  `:app:assembleDebug` limpio.
+
+**Aclaraciones surgidas durante testing manual con el usuario (2026-09-03,
+mismo día) — sin cambios de código, quedan acá como referencia:**
+
+- **No hizo falta ninguna migración SQL nueva además de las que el usuario
+  ya corrió a mano.** `db/schema.sql`/`excellentia_schema.sql` no se
+  tocaron en ninguna de las dos fases (115 y 116) — todo lo que el código
+  necesitaba ya estaba migrado. Los únicos `CREATE TABLE IF NOT EXISTS`
+  que se agregaron/editaron en el código (`ensureTables()`/
+  `ensureRouteLinkedWarehouseTables()`, ver más arriba) son para
+  instalaciones limpias desde cero — contra la base real son no-ops porque
+  las tablas ya existen con esas mismas columnas. La única migración de
+  schema genuinamente nueva de esta sesión es local de Android
+  (`AppDatabase.kt`, `pending_orders.is_courtesy`, `DATABASE_VERSION`
+  16→17) — corre sola al actualizar la app, no requiere nada manual.
+- **Consignación es una acción de campo del repartidor, no del almacenista**
+  (ver "Corrección" más abajo, ya aplicada) — dejar mercadería y liquidarla
+  son dos momentos que pueden caer en visitas distintas; el botón queda
+  disponible en la parada aunque ya esté "Entregada".
+- **Flujo de venta multi-parada — comportamiento preexistente, no tocado en
+  esta sesión, aclarado a pedido del usuario:** en una ruta con varias
+  paradas CUSTOMER, cada una genera **su propia factura independiente**
+  (batch_id y `reserved_invoice_number` propios) — no hay una factura
+  combinada por ruta. Al finalizar la venta de una parada, la app navega a
+  `OrderSuccessActivity` y de ahí siempre vuelve a `MainActivity` (Home) —
+  **no hay una navegación automática de vuelta a la ruta** para atender la
+  siguiente parada. El repartidor tiene que volver a entrar por "Mis
+  rutas" → abrir la misma ruta → tocar "Sell to customer" en la parada
+  siguiente. El usuario confirmó que este comportamiento está bien así, no
+  se pidió cambiarlo.
 
 **Pendiente — testing manual, todavía no hecho.** Todo lo de la Fase 115
 (115.1/115.5/115.2-115.3/115.4) y de la Fase 116 solo está verificado por
@@ -4441,3 +4586,77 @@ punta a punta**, no solo en el repo. No verificado en vivo por Claude desde
 esta sesión (sin acceso a `app.excellentiafoods.com`, al hosting de la
 webapp ni a un TC22 físico) — queda registrado como confirmación directa del
 usuario.
+
+---
+
+## Cierre de sesión (2026-09-03) — resumen de todo lo hecho hoy
+
+Todo lo de más arriba en este documento (Fase 115 completa y Fase 116
+completa, con sus respectivos fixes) se hizo en una sola sesión larga,
+2026-09-03. Resumen para no tener que releer todo el detalle:
+
+1. **Fase 116 — Damage/Credits: Transporter Damage + valuación de pérdida.**
+   Backend + webapp + Android. Deploy confirmado por el usuario (ver arriba).
+2. **Fase 115 — Módulo Routes, completa: 115.1 (rutas directas) → 115.5
+   (cortesías) → 115.2/115.3 (reconciliación salida/regreso) → 115.4
+   (consignación).** Backend + webapp + Android en las 4 piezas.
+   - **Corrección aplicada el mismo día:** Consignación se había implementado
+     primero colgada de `WarehouseRouteDetailActivity` (almacenista) — se
+     movió a `MyRouteDetailActivity` (repartidor/operator), porque dejar y
+     liquidar mercadería es una acción de campo, no de planificación. Backend
+     ajustado para permitir `operator` (ownership check, mismo criterio que
+     `updateStopStatus`) en los 3 endpoints de consignación.
+3. **Cortesías — ticket físico y pantallas, en 4 lugares** (pedido explícito
+   del usuario: mismo enfoque que ya existe para Damage — sección "Summary"
+   aparte + descuento del total, no un tag in-place):
+   - `PrintService.kt` (ticket físico) y `TicketDetailActivity.buildReceipt()`
+     (preview/reimpresión en pantalla) — son dos implementaciones separadas
+     del mismo ticket, había que tocar las dos.
+   - `OrdersClient.tsx` (modal de ticket en la webapp) — mismo tratamiento.
+   - `CurrentOrderActivity` (el carrito, antes de llegar a ningún ticket) y
+     `OrderSuccessActivity` (pantalla posterior a finalizar) — encontrados
+     recién al probar en el dispositivo real, no estaban en el plan
+     original.
+   - **Bug real encontrado y arreglado en el camino:** `listOrders` mandaba
+     `is_courtesy` como `number` (0/1) en vez de boolean estricto —rompía el
+     parseo Gson completo de la respuesta en Android al reimprimir desde
+     Historial (mismo gotcha ya documentado para `qb_active`). Fix en
+     `orderController.ts`.
+4. **No se corrió ninguna migración SQL nueva en toda la sesión** — todo lo
+   que el código necesitaba ya estaba migrado a mano por el usuario (Fases
+   115 y 116, corridas el 2026-09-02). Confirmado explícitamente revisando
+   `git status` sobre `db/schema.sql`/`excellentia_schema.sql` en varios
+   puntos de la sesión.
+5. **Verificación: solo compilación, sin testing manual real todavía**
+   (`tsc --noEmit`, `bun run build`, `:app:assembleDebug`/
+   `compileDebugKotlin` — sin errores nuevos en ningún punto de la sesión).
+   El usuario probó manualmente en el dispositivo real hacia el final de la
+   sesión y así se encontraron los 2 bugs de arriba (preview de ticket y
+   carrito no reflejaban cortesía) — ambos ya corregidos y compilando.
+
+### Próxima sesión — Editar / Cancelar factura ya generada
+
+Decidido con el usuario 2026-09-03: **mañana el foco es este módulo**, el
+siguiente después de Routes y Damage/Credits+cortesías. Punto de partida
+(análisis ya hecho, ver fila "Cancelar / editar factura ya generada" en la
+tabla de pendientes más arriba en este documento):
+
+- Técnicamente viable sin upgrade de tier de QBO — void/update de invoice es
+  parte de la Accounting API v3 estándar, misma API que ya usa
+  `qbInvoices.ts` para crear facturas.
+- **Falta resolver antes de empezar a codear:** ¿"editar" significa solo
+  cancelar/voidear una venta ya facturada (más simple), o también poder
+  modificar los ítems/cantidades de una factura que QBO ya tiene (más
+  invasivo — probablemente necesita historial de revisiones)? Sin
+  responder esto todavía.
+- Piezas que probablemente hagan falta (sin diseño cerrado): manejo de
+  `SyncToken` antes de escribir sobre el invoice (mismo patrón GET→SyncToken
+  →POST sparse que ya usa `qbItems.ts`); reversa del lado MySQL al cancelar
+  (`products.stock`, `credit_transactions` — probablemente sin necesitar
+  migración, reusando patrones existentes); posibles columnas nuevas de
+  auditoría en `orders` (`voided_at`/`voided_by`/`void_reason`, mismo
+  patrón que `approved_by`/`approved_at` de la Fase 113) — **esto sí
+  requeriría una migración SQL chica**, a confirmar una vez que se cierre el
+  diseño. `invoice_counter` no se toca — el número nunca se libera para
+  reusar, mismo criterio que un talonario físico.
+- Sin número de fase asignado todavía (sería la próxima después de la 116).

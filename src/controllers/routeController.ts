@@ -813,7 +813,7 @@ export async function registerConsignment(req: Request, res: Response): Promise<
     }
 
     const [[routeRow]] = await pool.query(
-      'SELECT status, warehouse_id, returns_reviewed_at FROM routes WHERE id = ?', [id]
+      'SELECT status, warehouse_id, returns_reviewed_at, driver_user_id FROM routes WHERE id = ?', [id]
     ) as any[];
     if (!routeRow) {
       res.status(404).json({ error: 'Ruta no encontrada' });
@@ -825,6 +825,12 @@ export async function registerConsignment(req: Request, res: Response): Promise<
     }
     if (routeRow.returns_reviewed_at) {
       res.status(400).json({ error: 'Devoluciones ya revisadas: no se puede modificar esta ruta' });
+      return;
+    }
+    // Acción de campo del repartidor dueño de la ruta — mismo criterio de
+    // ownership que updateStopStatus. admin/almacenista sin restricción.
+    if (req.user?.role === 'operator' && routeRow.driver_user_id !== req.user.id) {
+      res.status(403).json({ error: 'Acceso denegado: esta ruta no está asignada a vos' });
       return;
     }
     const [[stop]] = await pool.query(
@@ -909,7 +915,14 @@ export async function registerConsignment(req: Request, res: Response): Promise<
 export async function getConsignment(req: Request, res: Response): Promise<void> {
   await ensureRouteLinkedWarehouseTables();
   try {
-    const { stopId } = req.params;
+    const { id, stopId } = req.params;
+    if (req.user?.role === 'operator') {
+      const [[routeRow]] = await pool.query('SELECT driver_user_id FROM routes WHERE id = ?', [id]) as any[];
+      if (routeRow && routeRow.driver_user_id !== req.user.id) {
+        res.status(403).json({ error: 'Acceso denegado: esta ruta no está asignada a vos' });
+        return;
+      }
+    }
     const [rows] = await pool.query(
       `SELECT rci.*, p.name, p.sku
        FROM route_consignment_items rci JOIN products p ON p.id = rci.product_id
@@ -943,13 +956,19 @@ export async function settleConsignment(req: Request, res: Response): Promise<vo
       return;
     }
 
-    const [[routeRow]] = await pool.query('SELECT status, warehouse_id FROM routes WHERE id = ?', [id]) as any[];
+    const [[routeRow]] = await pool.query('SELECT status, warehouse_id, driver_user_id FROM routes WHERE id = ?', [id]) as any[];
     if (!routeRow) {
       res.status(404).json({ error: 'Ruta no encontrada' });
       return;
     }
     if (routeRow.status === 'CANCELLED') {
       res.status(400).json({ error: 'Ruta cancelada: no se puede modificar' });
+      return;
+    }
+    // Acción de campo del repartidor dueño de la ruta — mismo criterio de
+    // ownership que updateStopStatus. admin/almacenista sin restricción.
+    if (req.user?.role === 'operator' && routeRow.driver_user_id !== req.user.id) {
+      res.status(403).json({ error: 'Acceso denegado: esta ruta no está asignada a vos' });
       return;
     }
     const [[stop]] = await pool.query(
