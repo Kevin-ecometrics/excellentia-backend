@@ -4921,5 +4921,56 @@ para producción: correr el resto de las migraciones SQL de la Fase 117
 probar los flujos completos contra un TC22/emulador real — todo lo de esta
 sesión sigue verificado solo por compilación.
 
+**Fix adicional (2026-09-04, reportado por el usuario probando en el
+dispositivo) — `btnSaveReturns`/`btnSaveReceipt` mismo bug de contraste
+(fondo del botón = fondo de la pantalla, sin borde que lo distinga).**
+Mismo patrón ya arreglado varias veces esta sesión (`btnEditBatch`,
+`btnSaveChanges`, etc.) — agregado `strokeColor="@color/white"` a los dos
+(`activity_route_returns.xml`, `activity_receiving.xml`). De paso se
+confirmó (sin cambios de código — comportamiento ya correcto): una ruta
+`COMPLETED` sin devoluciones revisadas todavía permite cargar/borrar ítems
+y borrar la ruta a propósito — el bloqueo (`isLocked()`,
+`WarehouseRouteDetailActivity.kt`) solo se activa con `CANCELLED` o
+`returns_reviewed_at` seteado, igual que documenta la Fase 114. `:app:assembleDebug`
+limpio.
+
+**Bug real encontrado por el usuario probando en el dispositivo (2026-09-04)
+— cancelar una venta la mostraba como "Pending" en vez de "Cancelled", tanto
+en Android como en la webapp.** Causa: el `CANCELLED` que existe en el ENUM
+desde la Fase 1 nunca se había usado en la práctica hasta la Fase 117 —
+todo el código que agrega el status de un batch mirando sus líneas
+(`allSent`/`anyFailed`/`anyAwaiting`/...) se escribió antes de que
+`CANCELLED` fuera un valor real, así que ninguno tenía un `else if`/`when`
+para él y caía siempre en el último `else` (que en los 4 lugares de abajo
+resulta ser "Pending"). Mismo bug, 4 lugares, mismo fix (agregar el branch
+`CANCELLED` con label/color propios — gris neutro, no rojo, para no
+confundirlo con "Fallido"):
+
+- **`HistoryActivity.kt`** (Android, lista de historial) — `bindBatchHeader()`.
+- **`ClientHistoryActivity.kt`** (Android, historial por cliente) — `bindBatch()`.
+- **`TicketDetailActivity.kt`** (Android, detalle/reimpresión del ticket) —
+  el cómputo de `orderStatus` en `onCreate()` caía en `null` (peor que
+  "Pending" — no mostraba ningún estado en absoluto, `buildReceipt()` omite
+  la línea de estado si `status == null`).
+- **`OrdersClient.tsx`** (webapp, `/orders`) — `groupBatches()`. Efecto
+  secundario del bug ya corregido de paso: una venta cancelada inflaba el
+  contador "Pending" del KPI — ya no.
+- Los 3 repos compilan/buildean limpio (`bun run build` en ambos frontends,
+  `:app:assembleDebug`).
+- **Sin probar contra un TC22/navegador real** — verificado solo por
+  compilación, igual que el resto de esta sesión.
+
+**Pedido del usuario (2026-09-04, mismo día) — chip "Cancelled" en el
+Historial de Android.** `HistoryActivity` (Android) gana un 5° chip de
+filtro (`activity_history.xml`, `chipCancelled`) — ahora Todos/Enviados/
+Pendientes/Fallidos/Cancelados, mismo criterio que el chip "Fallidos"
+(`orders.any { status == "CANCELLED" }`). De paso se sacó un batch
+cancelado del cajón "Pendientes" — antes cualquier batch "no enviado del
+todo" caía ahí (el filtro `PENDING` solo excluía `allSent`), así que un
+cancelado se contaba dos veces (en Pendientes y, ahora, en Cancelados).
+Cancelled es terminal, no "todavía necesita atención" — se excluye del
+filtro Pendientes explícitamente. Detalle completo en
+`AndroidStudioProjects/test/CLAUDE.md`. `:app:assembleDebug` limpio.
+
 Sin correr `git commit` todavía en ninguno de los 3 repos — cambios en el
 working tree.
