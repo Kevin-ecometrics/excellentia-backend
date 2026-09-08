@@ -646,5 +646,13 @@ ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS note VARCHAR(255) NULL 
 -- =============================================================================
 ALTER TABLE route_items MODIFY COLUMN quantity DECIMAL(10,2) NOT NULL DEFAULT 0;
 
--- Fin del schema — 23 tablas + migraciones Fase 48, 111, 112, 115, 116, 117, 118, 2026-08-31 y 2026-09-01
+-- =============================================================================
+-- Migración — orders.product_id (2026-09-07): vincular orders a products por
+-- id, no solo por barcode (ver src/db/schema.sql para el detalle completo).
+-- Columna aditiva y nullable — no afecta órdenes viejas. Para bases
+-- existentes (ejecutar una sola vez)
+-- =============================================================================
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_id INT NULL AFTER barcode;
+
+-- Fin del schema — 23 tablas + migraciones Fase 48, 111, 112, 115, 116, 117, 118, 2026-08-31, 2026-09-01 y 2026-09-07
 -- =============================================================================

@@ -248,6 +248,9 @@ ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS note VARCHAR(255) NULL 
 -- cadena de Almacén que seguía en INT — product_lots/route_item_lots/
 -- inventory_movements/route_returns ya eran DECIMAL desde la Fase 112).
 ALTER TABLE route_items MODIFY COLUMN quantity DECIMAL(10,2) NOT NULL DEFAULT 0;
+-- orders.product_id — vínculo estable a products, no frágil a que cambie el
+-- barcode después de la venta. Aditiva/nullable, no afecta órdenes viejas.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_id INT NULL AFTER barcode;
 ```
 
 **`orders.unit`/`case_qty` — por qué importan para el ticket:** `unit` es el tipo de venta (Lbs/Case/Unit/Bucket) y `case_qty` las unidades por caja (`products.qty` cuando `unit = "Case"`, copiado al momento de la venta). Sin estos dos campos guardados en `orders`, reimprimir un pedido desde Historial no puede saber si era por peso o por caja — `listOrders` los expone ahora junto al resto de columnas.

@@ -4009,11 +4009,14 @@ para los TC22.
 | ✅ | ~~**Último escaneo en MainActivity**~~ | Completado en Fase 18 — muestra barcode, nombre y hora |
 | ✅ | ~~**Cache cleanup**~~ | Completado en Fase 18 — borra productos cacheados > 7 días al iniciar |
 | ✅ | ~~**Configuración de empresa dinámica**~~ | Completado en Fase 17 |
-| Alta | **Badge crédito cliente activo** | Mostrar en `CurrentOrderActivity` si el cliente activo tiene crédito disponible por damage. Depende del sistema de créditos. |
-| Media | **Notificación sync pedido PENDING** | Pulir `OrderStatusWorker` — notificar al vendedor cuando un pedido PENDING se sincroniza exitosamente a QB |
-| Media | **Buscar cliente por nombre desde MainActivity** | Actualmente solo se puede escanear o ingresar código. Agregar búsqueda de cliente directamente desde la pantalla principal sin abrir `CustomerPickerActivity` |
-| Alta | **Pre-órdenes offline** | Pre-órdenes funcionen sin internet usando SQLite local (mismo patrón que `OrderRepository`: cola local + `SyncWorker` cada 15 min). Subida de prioridad (era Media) — se vuelve requisito real para el port de rutas de la Fase 111: una parada de tipo `PRE_ORDER` en una ruta tiene que poder verse/actuarse en campo con datos móviles intermitentes, y hoy solo `orders` tiene ese soporte offline |
-| Media | **Historial de precios mejorado** | En `ProductDetailActivity` mostrar el precio promedio que ese cliente ha pagado por el producto, además del historial de transacciones |
+| ✅ | ~~**Badge crédito cliente activo**~~ | Verificado (2026-09-07) — ya estaba implementado, ítem desactualizado: `MainActivity.kt` (`refreshCustomerCredit()`, líneas 310-339) muestra `tvCustomerCredit` con el saldo disponible en la Home cuando hay cliente activo con `balance > 0` (no en `CurrentOrderActivity` como decía el ítem original, pero mismo objetivo cumplido) |
+| ✅ | ~~**Notificación sync pedido PENDING**~~ | Verificado (2026-09-07) — ya estaba implementado, ítem desactualizado: `OrderStatusWorker.kt` (`WorkManager`, poll cada 2 min a `GET /api/orders?status=SENT`) notifica al vendedor por cada pedido nuevo sincronizado, trackeando el último `id` notificado en `SharedPreferences` |
+| ❌ | ~~**Buscar cliente por nombre desde MainActivity**~~ | Descartado (2026-09-07) — decisión del usuario: le gusta cómo está implementado hoy (`btnSelectCustomer`/`btnChangeCustomer` abren `CustomerPickerActivity`) |
+| ✅ | ~~**Pre-órdenes offline**~~ | Verificado (2026-09-07) — ya estaba implementado, ítem desactualizado: `PreOrderRepository.kt` (`saveOfflinePreOrder`/`saveOfflineConversion`, tablas `PendingPreOrderEntity`/`PendingPreOrderConversionEntity`) + `SyncWorker.kt` (mismo worker de `pending_orders`, reintenta cada 15 min, notifica al éxito) — cubre crear y convertir pre-órdenes sin señal |
+| ✅ | ~~**Historial de precios mejorado**~~ | Implementado (2026-09-07). Backend: `getProductPriceHistory` (`productController.ts`) suma un `SELECT` agregado — promedio ponderado por cantidad (`SUM($)/SUM(cantidad)`, no promedio simple) sobre todo el historial real, no solo las 10 filas mostradas — nuevo campo `avg_price`. Android: `PriceHistoryResponse.avgPrice` (Models.kt), `TextView` nuevo `tvAvgPrice` en `activity_product_detail.xml` + `ProductDetailActivity.kt`, strings `label_avg_price_display` (ES/EN). `tsc --noEmit` limpio en backend; Android sin compilar en este entorno (sin Java/Gradle) — pendiente que el usuario corra `:app:compileDebugKotlin` |
+| ✅ | ~~**Venta desde ruta no prefillea la cantidad cargada, y el verde no distingue cantidad parcial**~~ | Encontrado por el usuario testeando Fase 115-118 en vivo (2026-09-07). El descuento doble de stock entre carga de ruta y venta **está bien** (sin bug ahí). **Parte 1 (2026-09-07):** para productos Lbs, `MyRouteDetailActivity.renderItems()` manda `route_items.quantity` (cantidad de bolsas) como extra `ProductDetailActivity.KEY_ROUTE_LOADED_UNITS` — `resetWeights()` arranca con esa cantidad de filas de peso en vez de 1 siempre. Solo aplica cuando `isLbsUnit(item.unit)`; Case/Unit/Bucket y el escaneo normal (`MainActivity`) sin cambios. **Parte 2 — Tanda 3 (2026-09-08):** indicador de 3 colores (rojo/ámbar/verde) en vez del chequeo binario — ver detalle completo en "Tanda 3" más abajo en esta misma sección. Sin compilar en este entorno (sin Java/Gradle), revisado a mano — pendiente que el usuario corra `:app:compileDebugKotlin` |
+| ✅ | ~~**`settleConsignment` cierra la fila con la primera liquidación parcial — el remanente quedaba perdido para siempre**~~ | Encontrado en revisión de código a pedido del usuario (2026-09-07) y arreglado el mismo día — verificado y revisado (2026-09-08). Fix en `routeController.ts:1088-1133`: compara contra `outstanding = quantity_left − quantity_sold − quantity_returned` (no contra `quantity_left` a secas) y solo estampa `settled_at` cuando lo acumulado agota `quantity_left` — si queda remanente, la fila sigue `settled_at IS NULL` para poder liquidarla de nuevo en una visita futura. **Pendiente:** el fix está en el working tree sin commitear todavía — falta commitear y desplegar |
+| ✅ | ~~**Reconciliación (`getExpectedReturns`) ignoraba por completo la consignación — discrepancia falsa permanente**~~ | Encontrado en la misma revisión (2026-09-07) y arreglado el mismo día — verificado y revisado (2026-09-08). Fix en `routeController.ts` (`getExpectedReturns` ~1292-1321 y `getRouteReturns` ~371-383): ahora suma `SUM(rci.quantity_sold + rci.quantity_returned)` desde `route_consignment_items` por producto y lo resta en `discrepancy`/`expected_return_qty`, mismo criterio que ya se usaba para `orders`/`route_returns`. **Pendiente:** el fix está en el working tree sin commitear todavía — falta commitear y desplegar |
 
 ### Backend
 
@@ -4030,35 +4033,38 @@ para los TC22.
 | ✅ | ~~**Exportar CSV**~~ | Completado en Fase 16 |
 | ✅ | ~~**Configuración de empresa dinámica**~~ | Completado en Fase 17 (backend + webapp) |
 | ✅ | ~~**Sistema de créditos por damage — backend**~~ | Completado en Fase 75 — tabla `customer_credits` + cálculo automático desde el modal de daño existente. El crédito se aplica siempre al mismo batch que lo genera, no hay endpoint para "aplicar" saldo en un pedido futuro distinto (ver fila de saldo/historial más abajo) |
-| Alta | **Endpoint stats operadores del día** | Query SQL sobre `orders` de hoy agrupada por `user_id` con total pedidos, ingresos y último pedido. Alimenta la tabla de operadores del dashboard |
-| Media | **Producción QBO** | Cambiar `ENVIRONMENT=production`, actualizar `REDIRECT_URI`/`DASHBOARD_URL`/`DISCONNECTED_URL`, registrar URLs en Intuit Developer Console, reconectar empresa real de QuickBooks via `/api/qb/auth` |
-| Media | **Webhook QB → backend** | Recibir notificaciones de QB cuando se crea/edita un producto directamente en QB. Elimina necesidad de "Sincronizar QB" manual. Requiere registrar endpoint en Intuit Developer Console |
-| Media | **Credit Memos QB** | La Fase 75 resuelve el caso común con una línea negativa en la misma factura (más simple, ya reduce el total). Un Credit Memo separado en QB seguiría siendo útil para créditos que no se aplican en la misma venta (ver saldo/historial abajo) — no implementado |
-| Media | **Email resumen diario** | Enviar resumen automático al admin con pedidos del día, ingresos totales y operadores activos. Bloqueado hasta tener SMTP |
-| Alta | **`syncProductsFromQbo` inserta productos sin barcode** | El sync automático (`syncEngine.ts`) inserta `barcode = NULL` para items nuevos, a diferencia del sync manual (`qbController.ts`) que usa `item.Sku \|\| 'QBO-{id}'`. Un producto sin barcode nunca puede facturarse (ver Fase 64) — unificar el fallback en ambos sync paths |
-| Media | **Vincular `orders` a `products` por id, no por barcode** | `orders.barcode = products.barcode` es un JOIN por string equality — frágil si el barcode cambia después de la venta o el producto no tiene barcode. Agregar `product_id` a `orders` eliminaría la clase entera de bugs de "PENDING sin razón aparente" (ver Fase 64) |
-| Alta | **Cancelar / editar factura ya generada** | Técnicamente viable sin upgrade de tier QBO — void/update de invoice es parte de la Accounting API v3 (`invoice?operation=void`, sparse update), la misma API que ya usa `qbInvoices.ts` para crear facturas; disponible en cualquier plan de QBO (Simple Start incluido), no es feature Premium. Falta: (1) manejo de `SyncToken` antes de escribir — mismo patrón que `updateItemMeta`/`updateItemQtyOnHand` en `qbItems.ts` (GET → SyncToken → POST sparse), aplicado a `invoice`; (2) lógica de reversa del lado MySQL al voidear — hoy nada revierte `products.stock` ya descontado, créditos generados en `credit_transactions`, ni `invoice_counter` ya incrementado; (3) endpoint(s) nuevos — hoy no existe ninguno ni siquiera oculto; el único parecido (`PUT /api/orders/:id/status`, admin-only) solo cambia el status local, no toca QBO, y no lo llama ninguna pantalla (ni Android ni webapp). Preguntado por el usuario 2026-08-28; sin alcance ni fase asignada todavía. **Actualización 2026-09-03: confirmado por el usuario como el próximo módulo a encarar**, después de cerrar Routes (Fase 115) y Damage/Credits + tickets de cortesía (Fase 116) — sigue sin diseño detallado ni número de fase asignado, los 3 puntos pendientes de arriba (SyncToken, reversa MySQL, endpoints nuevos) son el punto de partida cuando se retome |
+| ✅ | ~~**Tabla de operadores del día en el dashboard**~~ | Implementado (2026-09-07). Backend: `statsController.ts` (`GET /api/stats`) suma un `SELECT` agrupado por `user_id`/`JOIN users` (pedidos, `revenue` solo SENT sin cortesía, último pedido) → nuevo campo `operators[]` en la respuesta, respeta `userFilter` de período ya existente. Webapp: `DashboardClient.tsx` gana una tarjeta nueva con tabla (Operador/Pedidos/Total $/Último pedido) debajo de Top 5/Actividad reciente — la ruta `/dashboard` ya es admin-only (redirect en `page.tsx`), no hizo falta chequeo extra. Android no se tocó. `bun run build` limpio |
+| ❌ | ~~**Producción QBO**~~ | Descartado (2026-09-07) — decisión del usuario: no quiere registrar nada nuevo en Intuit Developer Console; todo lo de cPanel ya apunta a production |
+| ❌ | ~~**Webhook QB → backend**~~ | Descartado (2026-09-07) — decisión del usuario: requiere configuración ajena a webapp/backend (registrar endpoint y sacar verifier token desde el dashboard de Intuit Developer), fuera de alcance |
+| ❌ | ~~**Credit Memos QB**~~ | Descartado (2026-09-07) — decisión del usuario: el crédito no se aplica en la misma venta igual, no hace falta reflejarlo como Credit Memo separado en QBO. El ledger interno (`credit_transactions`) alcanza |
+| ❌ | ~~**Email resumen diario**~~ | Descartado (2026-09-07) — decisión del usuario: no le interesa el resumen diario |
+| 🔜 Aprobado (después) | **Nodemailer para eventos puntuales de la app** | El usuario quiere usar `nodemailer` conectado al SMTP de un correo de cPanel (host `mail.dominio`, puerto 465/587, user/pass del buzón — soporte genérico de nodemailer, sin nada especial de por medio) para notificar eventos concretos de la app (a definir cuáles), no un resumen diario. Se implementará más adelante — falta definir qué eventos disparan el email |
+| ❌ | ~~**`syncProductsFromQbo` inserta productos sin barcode**~~ | Descartado (2026-09-07) — decisión del usuario: el cliente ya fue avisado de que un producto sin barcode en QBO no se puede usar en la app, no hace falta unificar el fallback |
+| ✅ | ~~**Vincular `orders` a `products` por id, no por barcode**~~ | Implementado y desplegado (2026-09-07) — migración corrida en cPanel y backend deployado, confirmado por el usuario. Se completa (resuelto por barcode al insertar, null si no matchea) en `createOrder`, `createBatch`, `editBatch` (`orderController.ts`), `convertPreOrder` (`preOrderController.ts`) y `settleConsignment` (`routeController.ts`). Sin cambios de Android — el backend resuelve `product_id` del lado del servidor a partir del `barcode` que la app ya mandaba |
+| ❌ | ~~**Cancelar / editar factura ya generada (status `SENT`)**~~ | Descartado (2026-09-08) — decisión del usuario: cancelar/editar solo tiene sentido mientras el batch está `AWAITING_APPROVAL` (Fase 117, `cancelBatch`/`editBatch`, ya implementado), que es justo el paso de revisión antes de mandar algo a QBO. Una vez que una venta llega a `SENT` es porque ya pasó ese proceso de aprobación — no hace falta poder voidear/editar la factura después. Se preguntó el 2026-08-28 y se había confirmado el 2026-09-03 como "próximo módulo a encarar", pero con la Fase 117 ya implementada el caso de uso que lo motivaba quedó cubierto de otra forma; no se va a implementar |
 
 ### Webapp
 
 | Prioridad | Feature | Detalle |
 |---|---|---|
-| Alta | **Imágenes de productos** | Agregar columna `image_url` a `products` en MySQL. Subir imágenes a Cloudinary/cPanel. Mostrar thumbnail en `ProductRow.tsx` y preview en `ProductModal.tsx`. Input para subir/pegar URL de imagen en el modal de edición. |
-| Alta | **Dashboard semi-realtime (polling)** | Polling cada 30s en KPIs, actividad reciente y gráfica de pedidos por hora. Top 5 y gráfica de 7 días solo se refrescan al cambiar filtro de período. Opción SSE descartada por limitaciones de cPanel/Passenger. |
+| ❌ | ~~**Imágenes de productos**~~ | Descartado (2026-09-07) — decisión del usuario, no hace falta en la webapp |
+| ✅ | ~~**Dashboard semi-realtime (polling)**~~ | Implementado (2026-09-07), versión simple: `setInterval` de 30s en `app/dashboard/page.tsx` repite el mismo `fetch` a `GET /api/stats` y pisa todo el estado `stats` de una — sin resetear `ready` en los ticks (no parpadea). Sin cambios de backend. `bun run build` limpio |
 | Alta | **Dashboard — tabla de operadores del día** | Sección nueva en dashboard (solo admin) con tabla: Operador / Pedidos hoy / Total $ / Último pedido. Incluir "último visto" usando `activity_log`. Online en tiempo real descartado — requeriría heartbeat en Android y backend. |
-| Alta | **Unidades por caja en productos** | Agregar campo `units_per_case` a tabla `products` y al modal de edición de productos. Workaround: Android infiere desde `qty` vía fallback en Fase 62. |
+| ❌ | ~~**Unidades por caja en productos**~~ | Descartado (2026-09-07) — decisión del usuario: `qty` ya se usa explícitamente para eso; QBO no tiene un campo equivalente, así que está bien como está |
 | ✅ | ~~**Sistema de créditos por damage**~~ | Completado en Fase 75 (Android + backend + webapp) — Subtotal/Créditos/Total en el ticket, línea negativa real en la factura de QBO, ledger `customer_credits` |
-| Media | **Alerta de stock bajo** | Badge/indicador rojo en productos con stock ≤ 5 en la página de productos. Ya existe el dato, mínimo esfuerzo. |
-| Media | **Historial/saldo de créditos por cliente** | Página o sección en `/customers` mostrando créditos generados y saldo disponible, más la capacidad de "aplicar" ese saldo en un pedido futuro distinto al que lo generó. La tabla `customer_credits` ya existe (Fase 75) como ledger de auditoría — falta la UI de saldo/aplicación |
-| Media | **Reporte de damage por período** | Sección en dashboard con: total perdido por damage por semana/mes, top productos más dañados, qué operador reporta más damage. Útil para decisiones de compra. |
+| ✅ | ~~**Alerta de stock bajo**~~ | Implementado (2026-09-07) — solo badge (sin chip de filtro). `ProductRow.tsx` suma un badge visible (mismo patrón que `qbBadge`: ícono + texto "Stock bajo"/"Sin stock", tokens `--ec-warn-*`/`--ec-danger-*`) junto al número de stock ya coloreado. Strings nuevos `prod_lowStock`/`prod_outOfStock` en `app/lib/i18n.ts` (ES/EN). Sin cambios de backend/schema. `bun run build` limpio |
+| ✅ | ~~**Historial/saldo de créditos por cliente**~~ | Verificado (2026-09-07) — ya estaba implementado, ítem desactualizado: `GET /api/customers/:customerId/credit-balance`/`/credits` en el backend, columnas de saldo/total + modal de historial en `CustomersClient.tsx` en la webapp, y "aplicar" saldo en venta futura ya existe vía `apply_credit` (`createBatch`/`convertPreOrder`) consumido por `askApplyCredit()` en Android |
+| 🔜 Aprobado | **Reporte de damage por período** | Confirmado con el usuario (2026-09-07) para implementar. Sección en dashboard con: total perdido por damage por semana/mes, top productos más dañados, qué operador reporta más damage. Útil para decisiones de compra. Falta detallar diseño (backend: query sobre `batch_damage`; webapp: dónde va la sección) antes de implementar |
 | ✅ | ~~**Numeración de facturas editable**~~ | Completado en Fase 103 — card en Settings, admin-only, con validación forward-only y modal de confirmación |
-| Baja | **`/settings` sin protección de rol consistente** | `GET /api/settings` no tiene `adminOnly` y la página no redirige a un operador que entre por URL directa (a diferencia de `/dashboard`). No es grave hoy (solo lee nombre/dirección de empresa), pero quedó expuesto de nuevo al agregar la card de facturación en Fase 103 — conviene cerrarlo antes de agregar más campos sensibles a Settings |
+| ❌ | ~~**`/settings` sin protección de rol consistente**~~ | Descartado por el momento (2026-09-07) — decisión del usuario: está bien así. Reconsiderar si se agregan más campos sensibles a Settings |
 
 ### Inventario (módulo nuevo — no existe todavía)
 
 | Prioridad | Feature | Detalle |
 |---|---|---|
-| Alta | **Módulo de inventario** | Hoy "stock" es solo un contador (`products.stock`) que baja al vender (`createBatch`) y se sincroniza con `QtyOnHand` de QBO — no hay pantalla ni endpoint dedicado a inventario, ni en backend, webapp o Android. Para que sea un módulo real falta: (1) cerrar el gap ya documentado de que `convertPreOrder` no descuenta stock (nota al final de la Fase 87) — **sigue sin cerrar**; (2) ~~recepción de mercadería~~ — **resuelto en la Fase 112** (`POST /api/warehouse/receipts`, `product_lots`); (3) conteo físico / reconciliación con motivo registrado — **sigue sin cerrar**: `inventory_movements.movement_type` ya tiene el valor `ADJUSTMENT` reservado en el ENUM, pero ningún endpoint lo usa todavía, no hay flujo de "conteo físico" real; (4) ~~historial de movimientos auditable~~ — **resuelto en la Fase 112** (`inventory_movements`, `GET /api/warehouse/movements`, `InventoryMovementsActivity` en Android); (5) Lbs y peso real en stock — la Fase 112 ya soporta cantidades `DECIMAL` en `product_lots`/recepción, así que técnicamente ya se puede recibir por peso, pero la decisión de política (¿debe el stock de Lbs reflejar peso real o seguir siendo solo un contador de eventos de venta, dado que `Qty: 1` fijo a QBO sigue vigente — Fase 39?) sigue sin tomarse; (6) alertas de stock bajo con punto de reorden — **sigue sin cerrar**, ver fila en Webapp más arriba; (7) daños (`batch_damage`) no parecen ajustar `products.stock`, solo generan crédito en dólares — **sigue sin confirmar**, distinto del daño de almacén de la Fase 112 (`route_returns`/`product_lots.status`), que sí ajusta stock; (8) soporte offline — **sigue sin cerrar**, la Fase 112 explícitamente dejó todo el módulo Almacén online-only, mismo criterio que rutas (Fase 111). Preguntado por el usuario 2026-08-28; puntos 2 y 4 cerrados por la Fase 112, el resto sigue abierto |
+| Alta | **Módulo de inventario** | Hoy "stock" es solo un contador (`products.stock`) que baja al vender (`createBatch`) y se sincroniza con `QtyOnHand` de QBO — no hay pantalla ni endpoint dedicado a inventario, ni en backend, webapp o Android. Sub-puntos: (1) `convertPreOrder` no descuenta stock — **🔜 Aprobado para implementar (2026-09-07)**, ver detalle abajo; (2) ~~recepción de mercadería~~ — **resuelto en la Fase 112**; (3) conteo físico / reconciliación con motivo registrado — ❌ descartado por ahora (2026-09-07), decisión del usuario: depende de si el cliente lo termina pidiendo. Verificado que `ADJUSTMENT` solo lo usa `updateLot()` (editar/devolver un lote puntual, sin motivo ni alcance por producto) — no cubre un conteo físico real, reconsiderar en el futuro si hace falta; (4) ~~historial de movimientos auditable~~ — **resuelto en la Fase 112**; (5) Lbs y peso real en stock — **🔜 Aprobado para implementar (2026-09-07)**, ver detalle abajo; (6) alertas de stock bajo con punto de reorden — ❌ descartado (2026-09-07), decisión del usuario: mantener el umbral fijo ≤5 ya aprobado en Webapp, sin punto de reorden configurable por producto; (7) daños de venta (`batch_damage`) — ❌ descartado (2026-09-07), decisión del usuario: el crédito en $ ya compensa al cliente, no hace falta descontar stock. Verificado que el gap es real (ni `batch_damage`/`computeDamageCredit` ni el crédito standalone de la Fase 76 tocan `products.stock`), queda así a propósito; (8) soporte offline — descartado a propósito, Almacén es online-only desde la Fase 112 |
+| ✅ | ~~**`convertPreOrder` no descuenta stock (sub-punto 1 de arriba)**~~ | Implementado (2026-09-07). `preOrderController.ts` — mismo patrón route-aware que `createBatch`: por cada línea, `UPDATE products SET stock = GREATEST(stock - 1, 0)` salvo que el barcode ya esté en `route_items` de la ruta de esa pre-orden. `route_id` resuelto server-side vía `SELECT route_id FROM route_stops WHERE pre_order_id = ?` — sin cambios de Android. `orders.stock_decremented` marcado por fila para que `cancelBatch`/`editBatch` reviertan bien. `tsc --noEmit` limpio |
+| ❌ | ~~**Lbs y peso real en stock (sub-punto 5 de arriba) — `products.stock` queda en unidades, no en peso**~~ | Implementado y luego **revertido en la misma sesión (2026-09-07)**. Se había agregado `stockUnitsFor()` (peso ÷ weight_per_unit) en 8 sitios de Almacén, pero el usuario confirmó con un producto real de producción (Chicharrón Delgado 5#, weight/lb=5, stock=16) que en Recepción/Carga a ruta el almacenista **tipea cantidad de bolsas** (ej. "1" para 1 bolsa), no peso total — al revés de lo que asumía la Fase 118. Con la conversión activa, tipear "1" contra weight_per_unit=5 redondeaba a **0**, sin mover el stock — bug real que el fix mismo hubiera introducido. Revertidos los 8 sitios a su comportamiento original (suma/resta directa del número tipeado, sin conversión) y eliminado el helper `stockUnitsFor` y su import (`isLbsUnit` en `warehouseController.ts`). `tsc --noEmit`: mismos 9 errores preexistentes de antes de esta sesión, confirmado revert limpio sin residuos (`grep` de `stockUnitsFor`/`stockDelta` sin resultados). **Gap real de la Fase 118 sigue sin resolver** — falta definir con el usuario, viendo el flujo real de Recepción/Carga a ruta en producción, si hace falta algún ajuste ahí antes de reabrir este ítem |
 
 ### Fase 115 — Módulo Routes: rutas directas/no directas, reconciliación, consignación y cortesías (diseño confirmado 2026-09-02, sin implementar todavía)
 
@@ -4914,12 +4920,11 @@ en toda la app. Resultado: limpio, sin nada nuevo que corregir.**
   cantidad de producto. **Cero casos pendientes de este bug en toda la app.**
 - Los tres repos siguen compilando/buildeando limpio.
 
-**Fase 117 + Fase 118 quedan cerradas de punta a punta.** Pendiente real
-para producción: correr el resto de las migraciones SQL de la Fase 117
-(`voided_at`/`voided_by`/`void_reason`/`stock_decremented`/`note` — la de
-`route_items.quantity` de la Fase 118 ya se corrió) si no se hizo todavía, y
-probar los flujos completos contra un TC22/emulador real — todo lo de esta
-sesión sigue verificado solo por compilación.
+**Fase 117 + Fase 118 quedan cerradas de punta a punta.** Migraciones SQL
+(`voided_at`/`voided_by`/`void_reason`/`stock_decremented`/`note`,
+`route_items.quantity`) y deploy en las tres partes ya realizados
+(2026-09-07). Queda testing manual de los flujos completos contra
+producción/TC22 real.
 
 **Fix adicional (2026-09-04, reportado por el usuario probando en el
 dispositivo) — `btnSaveReturns`/`btnSaveReceipt` mismo bug de contraste
@@ -4974,3 +4979,102 @@ filtro Pendientes explícitamente. Detalle completo en
 
 Sin correr `git commit` todavía en ninguno de los 3 repos — cambios en el
 working tree.
+
+## Repaso de backlog + orden de implementación (2026-09-07)
+
+Sesión de repaso completo del backlog ("Pendiente / Mejoras futuras", todas
+las secciones) tema por tema con el usuario — Backend, Webapp, Android y
+Módulo Inventario. Varios ítems del backlog estaban desactualizados (ya
+implementados sin haberse tachado) y se corrigieron in situ en sus tablas
+respectivas; el resto se decidió implementar o descartar explícitamente. Ver
+el detalle de cada decisión en la fila correspondiente de cada tabla más
+arriba — esta sección es solo el resumen y el orden acordado.
+
+**Aprobados para implementar, en dos tandas:**
+
+**Tanda 1 — ✅ COMPLETA E IMPLEMENTADA (2026-09-07), sin dependencia entre sí, bajo riesgo, no tocan código de stock/almacén:**
+1. Badge de stock bajo en productos (webapp)
+2. Dashboard semi-realtime, polling simple de 30s (webapp)
+3. Tabla de operadores del día en el dashboard (backend + webapp)
+4. Historial de precios mejorado — precio promedio por cliente (backend + Android)
+5. `orders.product_id` en vez de `barcode` (backend, columna aditiva)
+
+**Tanda 2 — ✅ COMPLETA (2026-09-07)**, con un ajuste respecto al plan original:
+6. `convertPreOrder` no descuenta stock — ✅ implementado
+7. Lbs y peso real en stock (conversión peso→unidades) — ❌ implementado y **revertido en la misma sesión**: el flujo real de Recepción/Carga a ruta tipea cantidad de bolsas, no peso, así que la conversión rompía el conteo (ver fila "Lbs y peso real en stock" en la tabla de Inventario más arriba para el detalle completo)
+
+**Tanda 3 — ✅ COMPLETA (2026-09-08):**
+10. Indicador verde en venta por ruta no distingue venta parcial — ✅
+    implementado. `MyRouteDetailActivity.kt` — `loadDetail()`/`bind()` pasan
+    la lista completa de `PendingOrderEntity` (antes solo un `Set<String>`
+    de presencia) hasta `renderItems()`, que agrupa por barcode y calcula
+    `soldQty` vs `item.quantity` (cargado): para Lbs cuenta filas del
+    carrito (cada bolsa pesada guarda su propia fila,
+    `ProductDetailActivity.kt:651-652`), para Case/Unit/Bucket suma
+    `quantity` directo (una sola fila por venta). Sin cambios de backend —
+    toda la data ya estaba disponible localmente.
+
+    **Diseño — 2 iteraciones el mismo día:** la primera versión pintaba el
+    fondo de toda la fila (rojo/ámbar/verde), mismo patrón que ya existía
+    para el estado binario anterior. El usuario probó en el TC22 y no le
+    sirvió — quería un indicador chico, no toda la fila coloreada. Ajuste
+    (2026-09-08, mismo día): punto de color de 12dp junto al nombre del
+    producto (`viewStatusDot`, `item_route_item.xml`, drawable
+    `dot_status.xml` — forma neutra, color real vía `backgroundTintList` en
+    runtime), la fila se queda con su fondo normal. Colores sólidos
+    (`R.color.red`/`amber`/`success`, mismos que ya usa el chip de estado de
+    la ruta arriba en la misma pantalla), no los tints claros de fondo
+    (`error_light`/`warning_light`/`success_light`) que se habían usado en
+    el primer intento. Sin compilar en este entorno (sin Java/Gradle),
+    revisado a mano — pendiente que el usuario corra
+    `:app:compileDebugKotlin`.
+
+**Tanda 4 — 🔜 PENDIENTE DE IMPLEMENTAR (agregada 2026-09-08, decisión del usuario)**, ambos sin diseño detallado todavía:
+8. Reporte de damage por período — falta definir dónde va en el dashboard y las columnas del query
+9. Nodemailer para eventos puntuales de la app — falta definir qué eventos disparan el email
+
+**Bug encontrado y ya resuelto el mismo día, fuera de las tandas originales:**
+11. Cancelar una ruta no devolvía el stock cargado — ✅ implementado y
+    probado en vivo por el usuario (2026-09-07), ver detalle completo más
+    abajo en esta misma sección.
+
+**Descartados en esta sesión** (con su razón, detalle completo en cada tabla):
+barcode faltante en sync automático, imágenes de productos, webhook QB→backend,
+Credit Memos separados en QBO, producción QBO (registro en Intuit Developer
+Console), email resumen diario, `units_per_case` en productos, `/settings`
+sin protección de rol consistente, buscar cliente por nombre desde
+MainActivity, conteo físico/reconciliación con motivo, alertas de stock bajo
+con punto de reorden configurable, y que los daños de venta (`batch_damage`)
+ajusten stock.
+
+**Ya estaban implementados, ítems desactualizados corregidos en su tabla:**
+badge de crédito de cliente activo, notificación de sync de pedido pendiente,
+pre-órdenes offline, historial/saldo de créditos por cliente (Android/webapp/backend).
+
+**Deploy confirmado por el usuario (2026-09-07) — backend, webapp y Android
+(APK recompilado), los tres al día con todo lo de esta sesión:** Tanda 1
+completa (1-5), punto 6 de la Tanda 2 (`convertPreOrder` descuenta stock),
+los 2 fixes de Consignación (liquidación parcial + reconciliación) y el
+`orders.product_id`. El punto 7 (Lbs/peso→unidades) quedó revertido, sin
+nada pendiente de desplegar por ese lado.
+
+**Fix adicional (2026-09-07, mismo día) — cancelar una ruta no devolvía el
+stock cargado.** Encontrado por el usuario probando en vivo (después de una
+mutación manual de una ruta de prueba que quedó en estado inconsistente —
+sin relación con este bug, resuelto por separado creando una ruta nueva).
+`deleteRoute` (`routeController.ts`, el endpoint que cancela una ruta) solo
+cambiaba `status = 'CANCELLED'`, sin tocar `products.stock`/`route_item_lots`
+en absoluto — todo lo cargado a esa ruta (`addRouteItem`/`registerConsignment`)
+quedaba descontado para siempre. Fix: antes de cancelar, por cada
+`route_item` se calcula lo mismo que `getExpectedReturns` (cargado − vendido
+vía `orders`/`route_stops.batch_id` − ya devuelto vía `route_returns` −
+liquidado vía `route_consignment_items`) y **solo ese remanente** se
+devuelve — restaura lotes (`route_item_lots`, mismo loop que
+`removeRouteItem`) y suma el remanente a `products.stock`. Evita inflar
+stock con unidades que ya se vendieron de verdad antes de cancelar. Sin
+migración SQL. `tsc --noEmit`: mismos 9 errores preexistentes, cero nuevos.
+**Probado en vivo por el usuario (2026-09-07): confirmado, funciona.**
+
+Sigue pendiente del backlog: el resto del gap 8 (el indicador verde de
+`renderItems()` no distingue venta parcial), el reporte de damage por
+período (falta diseño), y nodemailer (falta definir eventos).

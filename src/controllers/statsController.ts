@@ -51,7 +51,7 @@ export async function getStats(req: Request, res: Response): Promise<void> {
     // Para byDay: rango según período
     const dayInterval = period === 'month' ? 29 : period === 'week' ? 6 : 0;
 
-    const [[kpis], [byHour], [byDay], [top5], [recent], [[products]]] = await Promise.all([
+    const [[kpis], [byHour], [byDay], [top5], [recent], [[products]], [operators]] = await Promise.all([
       // KPIs del período
       pool.query(`
         SELECT
@@ -107,6 +107,21 @@ export async function getStats(req: Request, res: Response): Promise<void> {
         FROM products
         WHERE hidden = 0
       `),
+      // Tabla de operadores del período — pedidos, ingresos (mismo criterio
+      // que revenue_period: solo SENT sin cortesía) y último pedido por
+      // user_id. Solo lectura, sin migración — alimenta la tarjeta nueva del
+      // dashboard.
+      pool.query(`
+        SELECT o.user_id, u.name AS operator_name,
+               COUNT(*) AS orders_count,
+               COALESCE(SUM(CASE WHEN o.status='SENT' AND o.is_courtesy=0 THEN o.total ELSE 0 END),0) AS revenue,
+               MAX(o.created_at) AS last_order_at
+        FROM orders o
+        LEFT JOIN users u ON u.id = o.user_id
+        WHERE DATE(o.created_at) BETWEEN '${from}' AND '${to}' ${userFilter}
+        GROUP BY o.user_id, u.name
+        ORDER BY revenue DESC
+      `),
     ]) as any[];
 
     // Llenar horas sin datos con 0
@@ -153,6 +168,13 @@ export async function getStats(req: Request, res: Response): Promise<void> {
         noBarcode: Number(products.no_barcode),
         noWeight:  Number(products.no_weight),
       },
+      operators: (operators as any[]).map(r => ({
+        userId: r.user_id,
+        name: r.operator_name ?? '—',
+        ordersCount: Number(r.orders_count),
+        revenue: Number(r.revenue),
+        lastOrderAt: r.last_order_at,
+      })),
     });
   } catch (err) {
     logger.error('getStats error:', err);

@@ -287,14 +287,41 @@ export async function convertPreOrder(req: Request, res: Response): Promise<void
     const batchId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
     const inserted: { id: number; barcode: string; product_name: string; price: number; quantity: number; total: number }[] = [];
 
+    // Fix (2026-09-07) — convertPreOrder nunca descontaba products.stock,
+    // gap documentado desde la Fase 87 (a diferencia de createBatch, que
+    // resta 1 unidad por línea vendida). Mismo patrón route-aware que
+    // createBatch: si esta pre-orden es la parada de una ruta cuyo contenido
+    // ya se cargó al camión (route_items), no se vuelve a descontar acá —
+    // a diferencia de createBatch, acá el route_id no lo manda el cliente
+    // (no hace falta tocar Android) sino que se resuelve server-side vía
+    // route_stops.pre_order_id.
+    let routeLoadedBarcodes: Set<string> = new Set();
+    const [stopRowsForStock] = await pool.query(
+      'SELECT route_id FROM route_stops WHERE pre_order_id = ? LIMIT 1', [id]
+    ) as any[];
+    if (stopRowsForStock[0]?.route_id) {
+      const [routeItemRows] = await pool.query(
+        'SELECT barcode FROM route_items WHERE route_id = ? AND barcode IS NOT NULL',
+        [stopRowsForStock[0].route_id]
+      ) as any[];
+      routeLoadedBarcodes = new Set((routeItemRows as any[]).map((r: any) => r.barcode));
+    }
+
     for (const item of items as any[]) {
       const { barcode, product_name, price, quantity, total, unit, case_qty } = item;
       const finalTotal = total ?? (price != null && quantity != null ? price * quantity : 0);
+      // product_id (2026-09-07) — ver comentario en orderController.ts (createOrder/createBatch).
+      const [productRowsForId] = await pool.query('SELECT id FROM products WHERE barcode = ?', [barcode]) as any[];
+      const productId = productRowsForId[0]?.id ?? null;
+      const decremented = !routeLoadedBarcodes.has(barcode);
       const [result] = await pool.query(
-        "INSERT INTO orders (barcode, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name, unit, case_qty, payment_method, check_number, credit_applied, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')",
-        [barcode, product_name, price ?? 0, quantity ?? 0, finalTotal,
-         batchId, req.user?.id ?? null, preOrder.customer_id, preOrder.customer_name, unit ?? null, case_qty ?? null, payment_method ?? null, check_number ?? null, null]
+        "INSERT INTO orders (barcode, product_id, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name, unit, case_qty, payment_method, check_number, credit_applied, status, stock_decremented) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)",
+        [barcode, productId, product_name, price ?? 0, quantity ?? 0, finalTotal,
+         batchId, req.user?.id ?? null, preOrder.customer_id, preOrder.customer_name, unit ?? null, case_qty ?? null, payment_method ?? null, check_number ?? null, null, decremented ? 1 : 0]
       ) as any;
+      if (decremented) {
+        await pool.query('UPDATE products SET stock = GREATEST(stock - 1, 0) WHERE barcode = ?', [barcode]);
+      }
       inserted.push({ id: result.insertId, barcode, product_name, price: price ?? 0, quantity: quantity ?? 0, total: finalTotal });
     }
 

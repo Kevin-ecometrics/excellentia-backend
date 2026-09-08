@@ -714,7 +714,21 @@ ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS note VARCHAR(255) NULL 
 ALTER TABLE route_items MODIFY COLUMN quantity DECIMAL(10,2) NOT NULL DEFAULT 0;
 
 -- =============================================================================
--- Fin del schema — 24 tablas + migraciones Fase 48, 61, 112, 115, 116, 117, 118, 2026-08-31 y 2026-09-01
+-- Migración — orders.product_id (2026-09-07): vincular orders a products por
+-- id, no solo por barcode. orders.barcode = products.barcode es un JOIN por
+-- igualdad de string, frágil si el barcode cambia después de la venta o el
+-- producto no tiene barcode. Columna aditiva y nullable — no afecta órdenes
+-- viejas (quedan product_id = NULL; orders.barcode/product_name siguen
+-- siendo el snapshot histórico de la venta, sin cambios). createOrder/
+-- createBatch/editBatch/convertPreOrder/settleConsignment la completan de
+-- acá en adelante, resolviendo el id contra products por barcode al insertar
+-- — null si no matchea, nunca bloquea la venta por esto.
+-- Para bases existentes (ejecutar una sola vez)
+-- =============================================================================
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_id INT NULL AFTER barcode;
+
+-- =============================================================================
+-- Fin del schema — 24 tablas + migraciones Fase 48, 61, 112, 115, 116, 117, 118, 2026-08-31, 2026-09-01 y 2026-09-07
 -- =============================================================================
 SET FOREIGN_KEY_CHECKS = 1;
 SET FOREIGN_KEY_CHECKS = 1;

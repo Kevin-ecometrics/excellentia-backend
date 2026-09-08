@@ -241,6 +241,17 @@ export async function getProductPriceHistory(req: Request, res: Response): Promi
       [customerId, barcode]
     ) as any[];
 
+    // Precio promedio pagado por este cliente — ponderado por cantidad
+    // (SUM($)/SUM(cantidad)), no un promedio simple de precios, para que una
+    // compra de 50 lb no pese igual que una de 0.5 lb. Sobre todo el
+    // historial real, no solo las 10 filas que se muestran arriba.
+    const [[avgRow]] = await pool.query(
+      `SELECT SUM(price * quantity) / NULLIF(SUM(quantity), 0) AS avg_price
+       FROM orders
+       WHERE customer_id = ? AND barcode = ? AND status IN ('SENT','PENDING')`,
+      [customerId, barcode]
+    ) as any[];
+
     res.json({
       product: product ? {
         name: product.name,
@@ -249,6 +260,7 @@ export async function getProductPriceHistory(req: Request, res: Response): Promi
         min_price: product.min_price,
       } : null,
       history: historyRows,
+      avg_price: avgRow?.avg_price != null ? Number(avgRow.avg_price) : null,
     });
   } catch (err) {
     logger.error('getProductPriceHistory error:', err);

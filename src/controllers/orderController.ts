@@ -38,9 +38,17 @@ export async function createOrder(req: Request, res: Response): Promise<void> {
     // necesitar un endpoint de aprobación aparte para el caso "sin batch".
     const batchId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
+    // product_id (2026-09-07) — vínculo estable a products, no frágil a que
+    // cambie el barcode después de la venta (ver createBatch). orders.barcode
+    // sigue siendo el snapshot histórico para el ticket, product_id es solo
+    // un dato adicional — null si el producto no matchea (mismo criterio que
+    // el resto del proyecto, nunca bloquea la venta por esto).
+    const [productRowsForId] = await pool.query('SELECT id FROM products WHERE barcode = ?', [barcode]) as any[];
+    const productId = productRowsForId[0]?.id ?? null;
+
     const [result] = await pool.query(
-      "INSERT INTO orders (barcode, product_name, price, quantity, total, batch_id, device_id, user_id, is_courtesy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      [barcode, product_name, price, quantity, finalTotal, batchId, device_id ?? null, req.user?.id ?? null, is_courtesy ? 1 : 0]
+      "INSERT INTO orders (barcode, product_id, product_name, price, quantity, total, batch_id, device_id, user_id, is_courtesy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [barcode, productId, product_name, price, quantity, finalTotal, batchId, device_id ?? null, req.user?.id ?? null, is_courtesy ? 1 : 0]
     ) as any;
 
     const orderId = result.insertId;
@@ -185,9 +193,12 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
       // catálogo (reportería, "cuánto se regaló") — el $0 se aplica recién
       // en la línea de QBO (ver createBatchInvoice/qbInvoices.ts), nunca acá.
       const isCourtesy = item.is_courtesy ? 1 : 0;
-      const [productRows] = await pool.query('SELECT qb_item_id, min_price, weight_per_unit FROM products WHERE barcode = ?', [barcode]) as any[];
+      const [productRows] = await pool.query('SELECT id, qb_item_id, min_price, weight_per_unit FROM products WHERE barcode = ?', [barcode]) as any[];
       const product = productRows[0];
       const qbItemId = product?.qb_item_id ?? null;
+      // product_id (2026-09-07) — vínculo estable a products, ver comentario
+      // en createOrder. Null si el barcode no matchea, nunca bloquea la venta.
+      const productId = product?.id ?? null;
 
       if (product?.min_price != null) {
         const weightPerUnit = parseFloat(product.weight_per_unit) || 1.0;
@@ -202,8 +213,8 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
 
       const decremented = !routeLoadedBarcodes?.has(barcode);
       const [result] = await pool.query(
-        "INSERT INTO orders (barcode, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name, unit, case_qty, payment_method, check_number, is_courtesy, status, stock_decremented) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)",
-        [barcode, product_name, price, quantity, total ?? price * quantity, batchId, req.user?.id ?? null, customer_id ?? null, customer_name ?? null, unit ?? null, case_qty ?? null, payment_method ?? null, check_number ?? null, isCourtesy, decremented ? 1 : 0]
+        "INSERT INTO orders (barcode, product_id, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name, unit, case_qty, payment_method, check_number, is_courtesy, status, stock_decremented) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)",
+        [barcode, productId, product_name, price, quantity, total ?? price * quantity, batchId, req.user?.id ?? null, customer_id ?? null, customer_name ?? null, unit ?? null, case_qty ?? null, payment_method ?? null, check_number ?? null, isCourtesy, decremented ? 1 : 0]
       ) as any;
       inserted.push({ id: result.insertId, barcode, product_name, price, quantity, total: total ?? price * quantity, qb_item_id: qbItemId });
 
@@ -1098,14 +1109,17 @@ export async function editBatch(req: Request, res: Response): Promise<void> {
       const { barcode, product_name, price, quantity, total, unit, case_qty } = item;
       const isCourtesy = item.is_courtesy ? 1 : 0;
       const decremented = !routeLoadedBarcodes.has(barcode);
+      // product_id (2026-09-07) — ver comentario en createOrder/createBatch.
+      const [productRowsForId] = await pool.query('SELECT id FROM products WHERE barcode = ?', [barcode]) as any[];
+      const productId = productRowsForId[0]?.id ?? null;
       await pool.query(
         `INSERT INTO orders
-           (barcode, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name,
+           (barcode, product_id, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name,
             unit, case_qty, payment_method, check_number, is_courtesy, status, reserved_invoice_number,
             credit_applied, stock_decremented)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AWAITING_APPROVAL', ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AWAITING_APPROVAL', ?, ?, ?)`,
         [
-          barcode, product_name, price, quantity, total ?? price * quantity, batchId, first.user_id,
+          barcode, productId, product_name, price, quantity, total ?? price * quantity, batchId, first.user_id,
           first.customer_id, first.customer_name, unit ?? null, case_qty ?? null, first.payment_method,
           first.check_number, isCourtesy, first.reserved_invoice_number, first.credit_applied, decremented ? 1 : 0,
         ]

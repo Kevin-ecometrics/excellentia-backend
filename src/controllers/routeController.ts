@@ -320,20 +320,88 @@ export async function updateRoute(req: Request, res: Response): Promise<void> {
   }
 }
 
+// Fix (2026-09-07) — cancelar una ruta nunca devolvía al stock lo que se
+// había cargado (addRouteItem/registerConsignment) — quedaba descontado
+// para siempre aunque el camión nunca hubiera salido. No alcanza con
+// devolver `route_items.quantity` completo: si la ruta ya tenía ventas
+// reales antes de cancelarla (createBatch "por scratch"), esas unidades sí
+// salieron de verdad y devolverlas también inflaría el stock. Se calcula
+// lo mismo que getExpectedReturns (cargado − vendido − ya devuelto) y solo
+// eso se devuelve — restaura lotes (route_item_lots) igual que
+// removeRouteItem, y products.stock por el remanente real, no por lo
+// cargado a secas.
 export async function deleteRoute(req: Request, res: Response): Promise<void> {
   await ensureTables();
+  await ensureWarehouseTables();
+  await ensureRouteLinkedWarehouseTables();
   try {
     const { id } = req.params;
-    const [existing] = await pool.query('SELECT id, status FROM routes WHERE id = ?', [id]) as any[];
+    const [existing] = await pool.query('SELECT id, status, warehouse_id FROM routes WHERE id = ?', [id]) as any[];
     if ((existing as any[]).length === 0) {
       res.status(404).json({ error: 'Ruta no encontrada' });
       return;
     }
-    const currentStatus = (existing as any[])[0].status;
+    const route = (existing as any[])[0];
+    const currentStatus = route.status;
     if (!canTransitionStatus(currentStatus, 'CANCELLED')) {
       res.status(400).json({ error: `No se puede cancelar una ruta en estado '${currentStatus}'` });
       return;
     }
+    const warehouseId = route.warehouse_id ?? await getDefaultWarehouseId();
+
+    const [itemRows] = await pool.query(
+      'SELECT id, product_id, barcode, quantity FROM route_items WHERE route_id = ?', [id]
+    ) as any[];
+
+    const [soldRows] = await pool.query(
+      `SELECT o.barcode, SUM(o.quantity) AS sold_qty
+       FROM orders o JOIN route_stops rs ON rs.batch_id = o.batch_id
+       WHERE rs.route_id = ? AND o.status != 'CANCELLED'
+       GROUP BY o.barcode`, [id]
+    ) as any[];
+    const soldByBarcode = new Map<string, number>();
+    for (const r of soldRows as any[]) soldByBarcode.set(r.barcode, Number(r.sold_qty) || 0);
+
+    const [returnedRows] = await pool.query(
+      `SELECT product_id, SUM(quantity) AS returned_qty FROM route_returns WHERE route_id = ? GROUP BY product_id`, [id]
+    ) as any[];
+    const returnedByProduct = new Map<number, number>();
+    for (const r of returnedRows as any[]) returnedByProduct.set(r.product_id, Number(r.returned_qty) || 0);
+
+    const [consignmentRows] = await pool.query(
+      `SELECT rci.product_id, SUM(rci.quantity_sold + rci.quantity_returned) AS settled_qty
+       FROM route_consignment_items rci JOIN route_stops rs ON rs.id = rci.route_stop_id
+       WHERE rs.route_id = ? GROUP BY rci.product_id`, [id]
+    ) as any[];
+    const consignmentByProduct = new Map<number, number>();
+    for (const r of consignmentRows as any[]) consignmentByProduct.set(r.product_id, Number(r.settled_qty) || 0);
+
+    for (const item of itemRows as any[]) {
+      const sold = item.barcode ? (soldByBarcode.get(item.barcode) ?? 0) : 0;
+      const alreadyReturned = returnedByProduct.get(item.product_id) ?? 0;
+      const consignmentSettled = consignmentByProduct.get(item.product_id) ?? 0;
+      const outstanding = Math.max(Number(item.quantity) - sold - alreadyReturned - consignmentSettled, 0);
+      if (outstanding <= 0) continue;
+
+      const [lotRows] = await pool.query(
+        'SELECT id, lot_id, quantity FROM route_item_lots WHERE route_item_id = ?', [item.id]
+      ) as any[];
+      for (const lr of lotRows as any[]) {
+        await restoreLotQuantity(lr.lot_id, Number(lr.quantity));
+        await recordMovement({
+          warehouseId, productId: item.product_id, lotId: lr.lot_id, movementType: 'ROUTE_LOAD',
+          quantity: Number(lr.quantity), routeId: Number(id), createdBy: req.user?.id ?? null,
+        });
+      }
+      if ((lotRows as any[]).length === 0) {
+        await recordMovement({
+          warehouseId, productId: item.product_id, lotId: null, movementType: 'ROUTE_LOAD',
+          quantity: outstanding, routeId: Number(id), createdBy: req.user?.id ?? null,
+        });
+      }
+      await pool.query('UPDATE products SET stock = stock + ? WHERE id = ?', [outstanding, item.product_id]);
+    }
+
     await pool.query("UPDATE routes SET status = 'CANCELLED' WHERE id = ?", [id]);
     res.json({ message: 'Ruta cancelada' });
   } catch (err) {
@@ -994,7 +1062,7 @@ export async function settleConsignment(req: Request, res: Response): Promise<vo
     const warehouseId = routeRow.warehouse_id ?? await getDefaultWarehouseId();
 
     const results: any[] = [];
-    const soldLines: { barcode: string; product_name: string; price: number; quantity: number; total: number; unit: string | null; case_qty: number | null }[] = [];
+    const soldLines: { productId: number; barcode: string; product_name: string; price: number; quantity: number; total: number; unit: string | null; case_qty: number | null }[] = [];
 
     for (const line of items) {
       const { product_id } = line;
@@ -1009,7 +1077,7 @@ export async function settleConsignment(req: Request, res: Response): Promise<vo
         continue;
       }
       const [[consignmentRow]] = await pool.query(
-        `SELECT id, quantity_left, unit, case_qty FROM route_consignment_items
+        `SELECT id, quantity_left, quantity_sold, quantity_returned, unit, case_qty FROM route_consignment_items
          WHERE route_stop_id = ? AND product_id = ? AND settled_at IS NULL`,
         [stopId, product_id]
       ) as any[];
@@ -1017,8 +1085,14 @@ export async function settleConsignment(req: Request, res: Response): Promise<vo
         results.push({ error: 'No hay consignación sin liquidar para este producto en esta parada', line });
         continue;
       }
-      if (quantitySold + quantityReturned > Number(consignmentRow.quantity_left)) {
-        results.push({ error: `quantity_sold + quantity_returned (${quantitySold + quantityReturned}) supera quantity_left (${consignmentRow.quantity_left})`, line });
+      // Fix (2026-09-07) — comparar contra lo realmente pendiente
+      // (quantity_left − lo ya liquidado en settles parciales previos), no
+      // contra quantity_left a secas (que es el total histórico registrado,
+      // crece con cada registerConsignment). Sin esto, una segunda
+      // liquidación parcial podía pasar el chequeo aunque ya no quedara tanto.
+      const outstanding = Number(consignmentRow.quantity_left) - Number(consignmentRow.quantity_sold) - Number(consignmentRow.quantity_returned);
+      if (quantitySold + quantityReturned > outstanding + 0.0001) {
+        results.push({ error: `quantity_sold + quantity_returned (${quantitySold + quantityReturned}) supera lo pendiente (${outstanding})`, line });
         continue;
       }
 
@@ -1029,7 +1103,7 @@ export async function settleConsignment(req: Request, res: Response): Promise<vo
         if (product) {
           const price = Number(product.price) || 0;
           soldLines.push({
-            barcode: product.barcode ?? '', product_name: product.name,
+            productId: product_id, barcode: product.barcode ?? '', product_name: product.name,
             price, quantity: quantitySold, total: Math.round(price * quantitySold * 100) / 100,
             unit: consignmentRow.unit ?? null, case_qty: consignmentRow.case_qty ?? null,
           });
@@ -1043,14 +1117,27 @@ export async function settleConsignment(req: Request, res: Response): Promise<vo
         });
       }
 
+      // Fix (2026-09-07) — solo estampar settled_at cuando lo acumulado agota
+      // quantity_left; si queda remanente, la fila sigue abierta
+      // (settled_at NULL) para poder liquidarla de nuevo en una visita
+      // futura, en vez de quedar cerrada para siempre con la primera
+      // liquidación parcial.
+      const newSold = Number(consignmentRow.quantity_sold) + quantitySold;
+      const newReturned = Number(consignmentRow.quantity_returned) + quantityReturned;
+      const fullySettled = newSold + newReturned >= Number(consignmentRow.quantity_left) - 0.0001;
       await pool.query(
         `UPDATE route_consignment_items
-         SET quantity_sold = quantity_sold + ?, quantity_returned = quantity_returned + ?, settled_at = NOW(), settled_by = ?
+         SET quantity_sold = ?, quantity_returned = ?, settled_at = ${fullySettled ? 'NOW()' : 'NULL'}, settled_by = ?
          WHERE id = ?`,
-        [quantitySold, quantityReturned, req.user?.id ?? null, consignmentRow.id]
+        [newSold, newReturned, fullySettled ? (req.user?.id ?? null) : null, consignmentRow.id]
       );
 
-      results.push({ product_id, quantity_sold: quantitySold, quantity_returned: quantityReturned });
+      results.push({
+        product_id, quantity_sold: quantitySold, quantity_returned: quantityReturned,
+        total_sold: newSold, total_returned: newReturned,
+        remaining: Math.max(Number(consignmentRow.quantity_left) - newSold - newReturned, 0),
+        fully_settled: fullySettled,
+      });
     }
 
     // Venta real de la parte vendida — mismo batch para todas las líneas de
@@ -1064,9 +1151,9 @@ export async function settleConsignment(req: Request, res: Response): Promise<vo
       batchId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
       for (const item of soldLines) {
         await pool.query(
-          `INSERT INTO orders (barcode, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name, unit, case_qty, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
-          [item.barcode, item.product_name, item.price, item.quantity, item.total, batchId, req.user?.id ?? null, stop.customer_id, stop.customer_name, item.unit, item.case_qty]
+          `INSERT INTO orders (barcode, product_id, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name, unit, case_qty, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
+          [item.barcode, item.productId, item.product_name, item.price, item.quantity, item.total, batchId, req.user?.id ?? null, stop.customer_id, stop.customer_name, item.unit, item.case_qty]
         );
       }
       invoiceNumber = await reserveInvoiceNumber();
@@ -1198,23 +1285,39 @@ export async function getExpectedReturns(req: Request, res: Response): Promise<v
       returnedByProduct.set(r.product_id, bucket);
     }
 
+    // Fix (2026-09-07) — registerConsignment ya cuenta lo consignado como
+    // "cargado" (route_items), pero lo vendido/devuelto vía settleConsignment
+    // no se restaba de ningún lado acá: un producto consignado se veía para
+    // siempre como 100% pendiente de devolver, aunque ya estuviera liquidado.
+    const [consignmentRows] = await pool.query(
+      `SELECT rci.product_id, SUM(rci.quantity_sold + rci.quantity_returned) AS consignment_settled_qty
+       FROM route_consignment_items rci
+       JOIN route_stops rs ON rs.id = rci.route_stop_id
+       WHERE rs.route_id = ?
+       GROUP BY rci.product_id`, [id]
+    ) as any[];
+    const consignmentSettledByProduct = new Map<number, number>();
+    for (const r of consignmentRows as any[]) consignmentSettledByProduct.set(r.product_id, Number(r.consignment_settled_qty) || 0);
+
     const data = (loadedRows as any[]).map((row) => {
       const sold = row.barcode ? (soldByBarcode.get(row.barcode) ?? 0) : 0;
       const returned = returnedByProduct.get(row.product_id) ?? { good: 0, damaged: 0, expired: 0, transporterDamage: 0 };
       const alreadyReturned = returned.good + returned.damaged + returned.expired + returned.transporterDamage;
-      const expected = Math.max(Number(row.loaded_qty) - sold - alreadyReturned, 0);
+      const consignmentSettled = consignmentSettledByProduct.get(row.product_id) ?? 0;
+      const expected = Math.max(Number(row.loaded_qty) - sold - alreadyReturned - consignmentSettled, 0);
       // discrepancy sin clamping (a diferencia de expected_return_qty): un
       // valor negativo significa que se contó/devolvió más de lo que esta
       // ruta cargó de este producto — dato mal ingresado o algo se
       // duplicó. Es solo informativo (ver createReturns/getExpectedReturns
       // más arriba) — nunca bloquea, el admin decide qué hacer con eso.
-      const discrepancy = Number(row.loaded_qty) - sold - alreadyReturned;
+      const discrepancy = Number(row.loaded_qty) - sold - alreadyReturned - consignmentSettled;
       return {
         product_id: row.product_id, name: row.name, sku: row.sku, unit: row.unit,
         loaded_qty: Number(row.loaded_qty), sold_qty: sold,
         already_returned_qty: alreadyReturned, expected_return_qty: expected,
         returned_good_qty: returned.good, returned_damaged_qty: returned.damaged,
         returned_expired_qty: returned.expired, returned_transporter_damage_qty: returned.transporterDamage,
+        consignment_settled_qty: consignmentSettled,
         discrepancy,
         loaded_at: row.loaded_at, loaded_by_name: row.loaded_by_name,
       };
