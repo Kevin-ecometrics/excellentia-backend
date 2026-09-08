@@ -14,7 +14,8 @@ function extractToken(req: Request): string | null {
   // 1. HttpOnly cookie — webapp (same-domain)
   const cookieHeader = req.headers.cookie ?? '';
   const cookieMatch = cookieHeader.match(/(?:^|;\s*)jwt=([^;]+)/);
-  if (cookieMatch) return decodeURIComponent(cookieMatch[1]);
+  const cookieValue = cookieMatch?.[1];
+  if (cookieValue) return decodeURIComponent(cookieValue);
 
   // 2. Bearer header — Android app
   const authHeader = req.headers.authorization;

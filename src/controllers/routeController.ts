@@ -596,6 +596,7 @@ export async function updateStopStatus(req: Request, res: Response): Promise<voi
   await ensureTables();
   try {
     const { id, stopId } = req.params;
+    if (typeof id !== 'string') { res.status(400).json({ error: 'id de ruta es requerido' }); return; }
     const { status } = req.body;
     if (!['PENDING', 'DELIVERED', 'SKIPPED'].includes(status)) {
       res.status(400).json({ error: "status debe ser 'PENDING', 'DELIVERED' o 'SKIPPED'" });

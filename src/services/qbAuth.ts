@@ -38,6 +38,7 @@ function encryptToken(plain: string): string {
 function decryptToken(stored: string): string {
   if (!stored.includes(':')) return stored; // legacy plain-text fallback
   const [ivHex, encHex] = stored.split(':');
+  if (!ivHex || !encHex) return stored; // formato inesperado, mismo fallback que el legacy
   const decipher = createDecipheriv('aes-256-cbc', getAesKey(), Buffer.from(ivHex, 'hex'));
   return Buffer.concat([decipher.update(Buffer.from(encHex, 'hex')), decipher.final()]).toString('utf8');
 }

@@ -188,6 +188,7 @@ router.get('/stats', auth, adminOnly, async (_req: Request, res: Response) => {
 router.get('/:customerId', auth, async (req: Request, res: Response) => {
   await ensureTable();
   const { customerId } = req.params;
+  if (typeof customerId !== 'string') return res.status(400).json({ error: 'customerId es requerido' });
   try {
     const [[cached]] = await pool.query(
       'SELECT id AS Id, display_name AS DisplayName, active AS Active, address_line1 AS AddressLine1, city AS City, state_code AS StateCode, postal_code AS PostalCode FROM cached_customers WHERE id = ?',
@@ -221,6 +222,7 @@ router.get('/:customerId', auth, async (req: Request, res: Response) => {
 router.get('/:customerId/credit-balance', auth, async (req: Request, res: Response) => {
   try {
     const { customerId } = req.params;
+    if (typeof customerId !== 'string') return res.status(400).json({ error: 'customerId es requerido' });
     const balance = await getCustomerBalance(customerId);
     res.json(balance);
   } catch (err) {
@@ -233,6 +235,7 @@ router.get('/:customerId/credit-balance', auth, async (req: Request, res: Respon
 router.get('/:customerId/credits', auth, async (req: Request, res: Response) => {
   try {
     const { customerId } = req.params;
+    if (typeof customerId !== 'string') return res.status(400).json({ error: 'customerId es requerido' });
     const rows = await getCustomerCreditHistory(customerId);
     const balance = await getCustomerBalance(customerId);
     res.json({ data: rows, balance });

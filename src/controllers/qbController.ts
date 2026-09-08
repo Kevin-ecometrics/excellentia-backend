@@ -62,7 +62,13 @@ export async function qbDisconnect(_req: Request, res: Response): Promise<void> 
     // Revocar el token en Intuit si está disponible
     if (oauthClient.isAccessTokenValid()) {
       try {
-        await oauthClient.revoke({ token_type_hint: 'access_token' });
+        // Sin params: el propio SDK (OAuthClient.prototype.revoke) usa el
+        // access_token ya cargado cuando no se le pasa ninguno explícito —
+        // que es justo lo que hay acá, ya confirmado por isAccessTokenValid()
+        // arriba. token_type_hint nunca fue un campo real de RevokeParams en
+        // este SDK (no lo lee la implementación), solo generaba un error de
+        // tipos sin cumplir ningún propósito.
+        await oauthClient.revoke();
         logger.info('Token QBO revocado en Intuit');
       } catch (revokeErr) {
         logger.warn('No se pudo revocar el token en Intuit (ya expirado o inválido):', revokeErr);

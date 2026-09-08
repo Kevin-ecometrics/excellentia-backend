@@ -13,6 +13,19 @@ export function normalizeQbActive<T extends { qb_active?: unknown }>(row: T): T 
   return { ...row, qb_active: row.qb_active == null ? null : !!row.qb_active };
 }
 
+// Mismo criterio que extractQboErrorMessage en orderController.ts — la
+// librería intuit-oauth solo expone en error.message el texto genérico de
+// QBO, el motivo real vive en error.description / error.fault.errors[0].detail.
+function extractQboErrorMessage(err: unknown): string {
+  if (err && typeof err === 'object') {
+    const e = err as any;
+    const detail = e.fault?.errors?.[0]?.detail || e.description;
+    const base = e.message || 'Error desconocido';
+    return detail && detail !== base ? `${base} — ${detail}` : base;
+  }
+  return 'Error desconocido';
+}
+
 export async function listProducts(req: Request, res: Response): Promise<void> {
   try {
     const page = parseInt(req.query.page as string) || 1;
@@ -180,10 +193,19 @@ export async function updateProduct(req: Request, res: Response): Promise<void> 
     const [productRows] = await pool.query('SELECT qb_item_id FROM products WHERE id = ?', [id]) as any[];
     const qbItemId = productRows[0]?.qb_item_id;
 
+    // qbSynced null = no se intentó ningún push a QBO (sin qb_item_id, o
+    // ningún campo relevante cambió); true/false solo cuando sí se intentó
+    // al menos uno. qbSyncError se queda con el primer problema encontrado
+    // — alcanza para que el admin sepa que algo falló sin acumular ruido.
+    let qbSyncAttempted = false;
+    let qbSynced = true;
+    let qbSyncError: string | null = null;
+
     // Sync nombre, descripción, SKU y/o precio a QBO si se actualizaron. barcode
     // queda afuera a propósito — es un campo interno sin contraparte en QBO.
     if (name !== undefined || description !== undefined || sku !== undefined || price !== undefined) {
       if (qbItemId) {
+        qbSyncAttempted = true;
         try {
           await updateItemMeta(qbItemId, {
             ...(name !== undefined && { name }),
@@ -193,6 +215,8 @@ export async function updateProduct(req: Request, res: Response): Promise<void> 
           });
           logger.info(`QBO actualizado: producto ${id}, qb_item_id=${qbItemId}`);
         } catch (qbErr) {
+          qbSynced = false;
+          qbSyncError = qbSyncError ?? extractQboErrorMessage(qbErr);
           logger.warn(`No se pudo sincronizar a QBO para producto ${id}:`, qbErr);
         }
       }
@@ -200,19 +224,28 @@ export async function updateProduct(req: Request, res: Response): Promise<void> 
 
     // Sync stock a QBO si se actualizó el campo stock
     if (stock !== undefined && qbItemId) {
+      qbSyncAttempted = true;
       try {
         const result = await updateItemQtyOnHand(qbItemId, stock);
         if (result) {
           logger.info(`Stock QBO actualizado: producto ${id}, qb_item_id=${qbItemId}, qty=${stock}`);
         } else {
+          qbSynced = false;
+          qbSyncError = qbSyncError ?? 'El ítem no es de tipo Inventory en QuickBooks — el stock no se sincronizó';
           logger.warn(`Producto ${id} (qb_item_id=${qbItemId}) no es tipo Inventory en QBO — stock no sincronizado`);
         }
       } catch (qbErr) {
+        qbSynced = false;
+        qbSyncError = qbSyncError ?? extractQboErrorMessage(qbErr);
         logger.warn(`No se pudo sincronizar stock a QBO para producto ${id}:`, qbErr);
       }
     }
 
-    res.json({ message: 'Producto actualizado' });
+    res.json({
+      message: 'Producto actualizado',
+      qb_synced: qbSyncAttempted ? qbSynced : null,
+      ...(qbSyncError ? { qb_sync_error: qbSyncError } : {}),
+    });
   } catch (err) {
     logger.error('updateProduct error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
