@@ -4015,8 +4015,8 @@ para los TC22.
 | ✅ | ~~**Pre-órdenes offline**~~ | Verificado (2026-09-07) — ya estaba implementado, ítem desactualizado: `PreOrderRepository.kt` (`saveOfflinePreOrder`/`saveOfflineConversion`, tablas `PendingPreOrderEntity`/`PendingPreOrderConversionEntity`) + `SyncWorker.kt` (mismo worker de `pending_orders`, reintenta cada 15 min, notifica al éxito) — cubre crear y convertir pre-órdenes sin señal |
 | ✅ | ~~**Historial de precios mejorado**~~ | Implementado (2026-09-07). Backend: `getProductPriceHistory` (`productController.ts`) suma un `SELECT` agregado — promedio ponderado por cantidad (`SUM($)/SUM(cantidad)`, no promedio simple) sobre todo el historial real, no solo las 10 filas mostradas — nuevo campo `avg_price`. Android: `PriceHistoryResponse.avgPrice` (Models.kt), `TextView` nuevo `tvAvgPrice` en `activity_product_detail.xml` + `ProductDetailActivity.kt`, strings `label_avg_price_display` (ES/EN). `tsc --noEmit` limpio en backend; Android sin compilar en este entorno (sin Java/Gradle) — pendiente que el usuario corra `:app:compileDebugKotlin` |
 | ✅ | ~~**Venta desde ruta no prefillea la cantidad cargada, y el verde no distingue cantidad parcial**~~ | Encontrado por el usuario testeando Fase 115-118 en vivo (2026-09-07). El descuento doble de stock entre carga de ruta y venta **está bien** (sin bug ahí). **Parte 1 (2026-09-07):** para productos Lbs, `MyRouteDetailActivity.renderItems()` manda `route_items.quantity` (cantidad de bolsas) como extra `ProductDetailActivity.KEY_ROUTE_LOADED_UNITS` — `resetWeights()` arranca con esa cantidad de filas de peso en vez de 1 siempre. Solo aplica cuando `isLbsUnit(item.unit)`; Case/Unit/Bucket y el escaneo normal (`MainActivity`) sin cambios. **Parte 2 — Tanda 3 (2026-09-08):** indicador de 3 colores (rojo/ámbar/verde) en vez del chequeo binario — ver detalle completo en "Tanda 3" más abajo en esta misma sección. Sin compilar en este entorno (sin Java/Gradle), revisado a mano — pendiente que el usuario corra `:app:compileDebugKotlin` |
-| ✅ | ~~**`settleConsignment` cierra la fila con la primera liquidación parcial — el remanente quedaba perdido para siempre**~~ | Encontrado en revisión de código a pedido del usuario (2026-09-07) y arreglado el mismo día — verificado y revisado (2026-09-08). Fix en `routeController.ts:1088-1133`: compara contra `outstanding = quantity_left − quantity_sold − quantity_returned` (no contra `quantity_left` a secas) y solo estampa `settled_at` cuando lo acumulado agota `quantity_left` — si queda remanente, la fila sigue `settled_at IS NULL` para poder liquidarla de nuevo en una visita futura. **Pendiente:** el fix está en el working tree sin commitear todavía — falta commitear y desplegar |
-| ✅ | ~~**Reconciliación (`getExpectedReturns`) ignoraba por completo la consignación — discrepancia falsa permanente**~~ | Encontrado en la misma revisión (2026-09-07) y arreglado el mismo día — verificado y revisado (2026-09-08). Fix en `routeController.ts` (`getExpectedReturns` ~1292-1321 y `getRouteReturns` ~371-383): ahora suma `SUM(rci.quantity_sold + rci.quantity_returned)` desde `route_consignment_items` por producto y lo resta en `discrepancy`/`expected_return_qty`, mismo criterio que ya se usaba para `orders`/`route_returns`. **Pendiente:** el fix está en el working tree sin commitear todavía — falta commitear y desplegar |
+| ✅ | ~~**`settleConsignment` cierra la fila con la primera liquidación parcial — el remanente quedaba perdido para siempre**~~ | Encontrado en revisión de código a pedido del usuario (2026-09-07) y arreglado el mismo día — verificado, revisado y commiteado (2026-09-08). Fix en `routeController.ts:1088-1133`: compara contra `outstanding = quantity_left − quantity_sold − quantity_returned` (no contra `quantity_left` a secas) y solo estampa `settled_at` cuando lo acumulado agota `quantity_left` — si queda remanente, la fila sigue `settled_at IS NULL` para poder liquidarla de nuevo en una visita futura |
+| ✅ | ~~**Reconciliación (`getExpectedReturns`) ignoraba por completo la consignación — discrepancia falsa permanente**~~ | Encontrado en la misma revisión (2026-09-07) y arreglado el mismo día — verificado, revisado y commiteado (2026-09-08). Fix en `routeController.ts` (`getExpectedReturns` ~1292-1321 y `getRouteReturns` ~371-383): ahora suma `SUM(rci.quantity_sold + rci.quantity_returned)` desde `route_consignment_items` por producto y lo resta en `discrepancy`/`expected_return_qty`, mismo criterio que ya se usaba para `orders`/`route_returns` |
 
 ### Backend
 
@@ -4042,6 +4042,8 @@ para los TC22.
 | ❌ | ~~**`syncProductsFromQbo` inserta productos sin barcode**~~ | Descartado (2026-09-07) — decisión del usuario: el cliente ya fue avisado de que un producto sin barcode en QBO no se puede usar en la app, no hace falta unificar el fallback |
 | ✅ | ~~**Vincular `orders` a `products` por id, no por barcode**~~ | Implementado y desplegado (2026-09-07) — migración corrida en cPanel y backend deployado, confirmado por el usuario. Se completa (resuelto por barcode al insertar, null si no matchea) en `createOrder`, `createBatch`, `editBatch` (`orderController.ts`), `convertPreOrder` (`preOrderController.ts`) y `settleConsignment` (`routeController.ts`). Sin cambios de Android — el backend resuelve `product_id` del lado del servidor a partir del `barcode` que la app ya mandaba |
 | ❌ | ~~**Cancelar / editar factura ya generada (status `SENT`)**~~ | Descartado (2026-09-08) — decisión del usuario: cancelar/editar solo tiene sentido mientras el batch está `AWAITING_APPROVAL` (Fase 117, `cancelBatch`/`editBatch`, ya implementado), que es justo el paso de revisión antes de mandar algo a QBO. Una vez que una venta llega a `SENT` es porque ya pasó ese proceso de aprobación — no hace falta poder voidear/editar la factura después. Se preguntó el 2026-08-28 y se había confirmado el 2026-09-03 como "próximo módulo a encarar", pero con la Fase 117 ya implementada el caso de uso que lo motivaba quedó cubierto de otra forma; no se va a implementar |
+| ✅ | ~~**`updateProduct` no informaba si el push a QBO había fallado**~~ | Implementado (2026-09-08). `productController.ts` — la respuesta del `PUT /api/products/:id` ahora suma `qb_synced` (`true`/`false`/`null` si no se intentó ningún push — sin `qb_item_id` o ningún campo relevante cambió) y, si falló, `qb_sync_error` con el motivo real (función local `extractQboErrorMessage`, mismo criterio que la de `orderController.ts` — combina `error.message` + `error.description`/`fault.errors[0].detail`). Webapp (`ProductModal.tsx`) lee el campo: si `qb_synced === false`, el modal ya no se cierra solo — banner ámbar con el motivo (`prod_qbSyncFailed`) y el footer cambia a un solo botón "OK" (`common_ok`) que recién ahí cierra y refresca la lista. `tsc --noEmit` y `bun run build` limpios en los dos lados |
+| ✅ | ~~**9 errores preexistentes de `tsc --noEmit` en el backend**~~ | Arreglados (2026-09-08) — no rompían `bun run`/`bun run build` (Bun no type-checka) pero eran deuda técnica sin tocar desde hacía tiempo. 8 de los 9 eran el mismo patrón: `noUncheckedIndexedAccess: true` (`tsconfig.json`) tipa cualquier acceso indexado (`req.params.x`, un grupo de regex capturado, un `split(':')` destructurado) como posiblemente `undefined` — o `string[]` en el caso de `req.params`, cuyo tipo real es `{ [key: string]: string \| string[] }` (Express permite params array en rutas wildcard). Fix con guards `if (typeof x !== 'string') return res.status(400)...` en `routes/customers.ts` (×4), `controllers/routeController.ts` (`updateStopStatus`), y una variable intermedia en `middleware/auth.ts` (`cookieMatch?.[1]`) y `services/qbAuth.ts` (`ivHex`/`encHex` del `split`). El noveno (`controllers/qbController.ts`, `qbDisconnect`) era distinto — el tipo `RevokeParams` de `intuit-oauth` nunca declaró `token_type_hint` como campo válido; revisado el código fuente del SDK (`OAuthClient.js:356-393`) y confirmado que esa propiedad no la lee la implementación real — `revoke()` sin argumentos ya usa el `access_token` cargado (la llamada ya está detrás de un `isAccessTokenValid()`), así que se sacó el parámetro en vez de forzar el tipo. `tsc --noEmit` → 0 errores; `bun run build` limpio |
 
 ### Webapp
 
@@ -5027,9 +5029,8 @@ arriba — esta sección es solo el resumen y el orden acordado.
     (`R.color.red`/`amber`/`success`, mismos que ya usa el chip de estado de
     la ruta arriba en la misma pantalla), no los tints claros de fondo
     (`error_light`/`warning_light`/`success_light`) que se habían usado en
-    el primer intento. Sin compilar en este entorno (sin Java/Gradle),
-    revisado a mano — pendiente que el usuario corra
-    `:app:compileDebugKotlin`.
+    el primer intento. Probado por el usuario en el TC22 real y confirmado
+    — commiteado (Android).
 
 **Tanda 4 — 🔜 PENDIENTE DE IMPLEMENTAR (agregada 2026-09-08, decisión del usuario)**, ambos sin diseño detallado todavía:
 8. Reporte de damage por período — falta definir dónde va en el dashboard y las columnas del query
@@ -5077,6 +5078,247 @@ stock con unidades que ya se vendieron de verdad antes de cancelar. Sin
 migración SQL. `tsc --noEmit`: mismos 9 errores preexistentes, cero nuevos.
 **Probado en vivo por el usuario (2026-09-07): confirmado, funciona.**
 
-Sigue pendiente del backlog: el resto del gap 8 (el indicador verde de
-`renderItems()` no distingue venta parcial), el reporte de damage por
-período (falta diseño), y nodemailer (falta definir eventos).
+Sigue pendiente del backlog al cierre de esta sesión (2026-09-07): el resto
+del gap 8 (el indicador verde de `renderItems()` no distingue venta
+parcial), el reporte de damage por período (falta diseño), y nodemailer
+(falta definir eventos). **Ver sesión 2026-09-08 más abajo — el primero de
+los tres ya se cerró al día siguiente.**
+
+---
+
+## Sesión 2026-09-08 — cierre de Tanda 3, Tanda 4, revisión de Inventario/Almacén, sync QBO en productos, deuda técnica de tipos
+
+Continuación directa de la sesión del 2026-09-07 (mismo backlog, mismas
+tandas). Resumen de lo que se tocó, en orden:
+
+**1. Tanda 3 (#10) — indicador de venta parcial, cerrado con 2 iteraciones de diseño.**
+Ver detalle completo en "Tanda 3" más arriba en esta misma sección
+(`MyRouteDetailActivity.kt`, `item_route_item.xml`, `dot_status.xml`). Primer
+intento pintaba toda la fila; el usuario probó en el TC22 real, no le sirvió,
+se ajustó a un punto de color de 12dp junto al nombre. **Commiteado
+(Android).**
+
+**2. Tanda 4 creada** — Nodemailer y Reporte de damage por período, movidos
+de "sueltos sin tanda" a una tanda formal a pedido del usuario. Ninguno de
+los dos tiene diseño todavía; siguen siendo el único backlog activo al
+cierre de esta sesión.
+
+**3. Revisión a fondo del módulo de Inventario/Almacén** (a pedido del
+usuario, "¿hace falta agregarlo o ya está?") — verificado contra el código
+actual, no contra la documentación: **ya está completo e implementado** en
+backend (`warehouseController.ts`), webapp (`/warehouse`,
+`/warehouse/inventory`) y Android (6 activities dedicadas). El encabezado
+de la sección "Inventario" en este archivo decía "módulo nuevo — no existe
+todavía", desactualizado desde las Fases 111/112/114 — corregido acá mismo.
+
+**4. Cancelar/editar factura ya `SENT`** — descartado definitivamente.
+Decisión del usuario: el gate real ya es `AWAITING_APPROVAL` (Fase 117); una
+vez que algo llega a `SENT` es porque ya pasó por esa revisión, no hace
+falta poder tocarlo después.
+
+**5. Fase 118 (Lbs por peso real en stock) — descartada definitivamente.**
+Había quedado "revertida pero sin cerrar" desde el 2026-09-07. El usuario
+confirmó que así es como trabaja el cliente en la práctica: para productos
+Lbs el stock real vive del lado de QBO (`QtyOnHand`), el conteo local en
+bolsas alcanza. No se va a reabrir.
+
+**6. `updateProduct` — expone si el push a QBO falló** (gap que quedaba
+suelto desde antes de esta sesión, anotado en `CLAUDE.md`). Implementado
+backend + webapp — ver detalle en la tabla de Backend más arriba
+("`updateProduct` no informaba si el push a QBO había fallado").
+
+**7. 9 errores preexistentes de `tsc --noEmit` en el backend, arreglados.**
+Ver detalle en la tabla de Backend más arriba. Ninguno rompía
+`bun run`/`bun run build` (Bun no type-checka), pero era deuda técnica sin
+tocar — 8 por el flag `noUncheckedIndexedAccess`, 1 por un campo inválido
+(`token_type_hint`) en la llamada a `oauthClient.revoke()` del SDK
+`intuit-oauth`. `tsc --noEmit` → 0 errores al cierre de esta sesión.
+
+**Estado de commit/deploy al cierre (2026-09-08):** backend y webapp
+commiteados (puntos 3-7 de arriba); Android commiteado (punto 1). Sin
+confirmar deploy a producción de los cambios del punto 6 y 7 (los del
+2026-09-07 — Tanda 1/2, consignación, `product_id` — sí estaban deployados
+antes de arrancar esta sesión, confirmado por el usuario). Queda además
+`excellentia-webapp/public/excellentia.apk` modificado sin commitear —
+probablemente el APK actualizado con el fix del punto 1, pendiente de
+confirmar con el usuario.
+
+**Sigue pendiente del backlog:** únicamente la Tanda 4 (Nodemailer +
+reporte de damage por período), sin diseño todavía.
+
+---
+
+## Sesión 2026-09-08 (parte 2) — escaneo con gatillo físico no funcionaba (Zebra TC22), guía de DataWedge incompleta, gate de cliente faltante en el trigger
+
+Sesión separada, mismo día — arrancó como un reporte puntual de Almacén
+("¿hace falta que la ruta esté en progreso para agregar productos con el
+gatillo?") y terminó siendo un problema general de toda la app, no solo de
+ese módulo.
+
+**Síntoma reportado:** al escanear con el gatillo físico del TC22 (o con el
+botón "tap to scan" en pantalla), el escáner decodificaba bien (LED verde,
+beep) pero ninguna pantalla de la app reaccionaba — ni el diálogo de
+cantidad en Almacén, ni el detalle de producto en la pantalla de venta.
+
+**Descartado en el camino (no eran la causa):**
+- **Estado de la ruta.** Ni Android (`isLocked()`,
+  `WarehouseRouteDetailActivity.kt`) ni el backend (`addRouteItem`,
+  `routeController.ts`) restringen el escaneo por `PLANNED` vs
+  `IN_PROGRESS` — solo bloquean por `CANCELLED`/`returns_reviewed_at`. Una
+  ruta nueva funciona igual que una en progreso.
+- **Formato del código de barras.** El producto de prueba
+  (`753016001508`) es un UPC-A válido (dígito de verificación 8, correcto).
+  Generarlo como EAN-13 le agregaba un dígito de verificación **nuevo** al
+  final (6) porque el generador recalculaba el checksum tratando los 12
+  dígitos como datos crudos, sin reconocer que ya eran un UPC-A completo.
+  Se corrigió el barcode a UPC-A puro; el string coincide exacto con lo
+  guardado en `products.barcode`.
+
+**Causa raíz real, encontrada con la app DataWedge Demonstration** (viene
+de fábrica en los Zebra, sirve para probar el escáner sin depender de
+nuestra app): el hardware decodificaba perfecto y devolvía el string
+correcto — así que el problema estaba en cómo DataWedge le entrega el dato
+a nuestra app, no en el escáner. Revisando el perfil `TestScannerProfile` a
+mano en el dispositivo (DataWedge → Profiles → `TestScannerProfile`),
+**"Associated Apps" estaba vacío** — la app nunca quedó asociada a ese
+perfil, así que DataWedge no tenía a quién despachar el escaneo (cae al
+perfil default de fábrica, probablemente con salida por teclado en vez de
+por Intent — sin ningún campo de texto con foco, esas "teclas" no van a
+ningún lado, de ahí el "no pasa nada").
+
+`MainActivity.setupDataWedge()` crea el perfil y lo asocia con dos llamadas
+separadas a la API de DataWedge (`CREATE_PROFILE` y `SET_CONFIG` con
+`APP_LIST`) disparadas una detrás de la otra sin esperar confirmación de
+que la primera terminó — condición de carrera conocida de esa API. En este
+equipo la segunda llamada llegó antes de que el perfil terminara de crearse
+del lado del servicio, y la asociación de la app se perdió en silencio (el
+código no chequea ningún resultado de ninguna de las dos llamadas).
+
+**Fix aplicado:**
+1. **Workaround en el dispositivo afectado** (sin cambio de código): se
+   asoció manualmente `com.excellentia.scanner` al perfil
+   `TestScannerProfile` desde la app DataWedge → Associated Apps → "All
+   Activities" (`*`). **Probado en vivo por el usuario: funciona.**
+2. **Guía in-app corregida** — `msg_configure_datawedge`
+   (`values/strings.xml` y `values-es/strings.xml`, se abre desde el botón
+   de ayuda del escáner en `MainActivity`). Antes solo decía "asocia la app
+   y activa Intent output", sin mencionar ni el paso de "All Activities"
+   (`*`) ni que **Keystroke Output tiene que estar Disabled** (si queda
+   habilitado, el escaneo sale como si fueran teclas al aire y nunca llega
+   a la app — mismo síntoma que este bug). Ahora la guía tiene los 5 pasos
+   completos, para que si un equipo nuevo pega la misma condición de
+   carrera, se resuelva desde la propia app sin tener que redescubrirlo por
+   prueba y error.
+3. **Bug real encontrado en el camino, sin relación con DataWedge:**
+   `onBarcode()` (`MainActivity.kt:597`, la función que recibe el barcode
+   del **gatillo físico**) no pasaba por `requireCustomerSelected()` — a
+   diferencia del botón de tap-to-scan (`btnHoldScan`) y de entrada manual
+   (`btnManualEntry`), que sí lo chequean. Esto permitía escanear con el
+   gatillo y abrir el detalle de un producto para vender sin tener cliente
+   seleccionado. Fix: se agregó el mismo chequeo al inicio de `onBarcode()`
+   (mismo Snackbar "selecciona un cliente primero" que ya usan los otros
+   dos caminos, así los tres quedan consistentes). **Probado en vivo por el
+   usuario: funciona.**
+
+**Pendiente, no resuelto en esta sesión:** la condición de carrera en
+`setupDataWedge()` en sí (falta de espera/confirmación entre
+`CREATE_PROFILE` y `SET_CONFIG`) no se corrigió en código — solo se
+resolvió a mano en el dispositivo afectado y quedó documentada como
+mitigación en la guía in-app. Si se repite en otro equipo nuevo, falta
+decidir si conviene meter un delay/confirmación real en el código o seguir
+resolviéndolo a mano dispositivo por dispositivo.
+
+**Estado de compilación:** `./gradlew :app:compileDebugKotlin` →
+`BUILD SUCCESSFUL`, sin errores nuevos (2 warnings preexistentes de
+`SOFT_INPUT_ADJUST_RESIZE`, no relacionados a este cambio). Android sin
+commitear todavía.
+
+### Pendiente por implementar (sin diseño de código todavía) — múltiples barcodes por producto en Recepción
+
+Planteado por el usuario en esta misma sesión: algunos proveedores del
+cliente imprimen en la caja **más de un código de barras** por producto —
+uno "normal" (el UPC de siempre), y uno "combinado" que trae peso y lote
+metidos en el mismo símbolo. La motivación es reducir tipeo manual en
+Recepción (`createReceipt`), en particular el peso y la fecha de
+expiración, que hoy se escriben a mano por lote.
+
+**Datos reales recolectados en esta sesión (no es especulación, son
+escaneos reales con DataWedge Demonstration + fotos de caja del cliente):**
+
+Producto de prueba: *Tío Francisco – Panela Regular #6* (Rizo Lopez, Plant
+No. 06-10515). La caja tiene 3 códigos impresos:
+
+1. **Barcode "normal"** (arriba a la derecha en la etiqueta) → escaneado:
+   `227242003501`, decoder **UPCA**, 12 dígitos. Coincide con lo que ya
+   se guardaría en `products.barcode` — sin novedad, es el flujo de
+   siempre.
+2. **Barcode chico vertical** (junto al peso impreso, ej. "12.15") — **no
+   se pudo escanear** en la prueba (no decodificó con el TC22). Se
+   presume que es un código de solo-peso usado por básculas
+   etiquetadoras, pero queda sin confirmar — no vale la pena diseñar nada
+   para este hasta poder leerlo de verdad.
+3. **Barcode "combinado"** (grande, abajo) → escaneado: `350/4A-26189/12.15`,
+   decoder **CODE128**, 18 caracteres. Es texto plano con `/` como
+   separador (nada de Application Identifiers GS1 ni caracteres de
+   control) — parsea trivial en 3 campos:
+   - `350` — código de item interno de la planta (distinto del UPC, pero
+     coincide con el fragmento `...00350...` dentro del UPC de arriba —
+     no es casualidad, son el mismo número de planta expresado en dos
+     formatos).
+   - `4A-26189` — código de lote con fecha juliana (año `26` = 2026, día
+     `189` del año = 8 de julio de 2026).
+   - `12.15` — peso neto, coincide exacto con el impreso en la etiqueta.
+
+**Hallazgo importante — la fecha de expiración (USE BY) NUNCA está
+codificada en ningún barcode**, ni en este producto ni en las otras 3
+etiquetas fotografiadas (Queso Fresco, Cotija Rallado, Oaxaca Tiras, misma
+planta) — siempre es texto impreso suelto (`USE BY: 08-27-26` en este
+caso). Lo más cercano es la fecha juliana del lote, que es fecha de
+**producción**, no de vencimiento.
+
+**Patrón "+50 días" observado, pero marcado como NO confiable para
+automatizar:** en los 2 ejemplos con datos completos, fecha juliana del
+lote + 50 días calendario da exacto el USE BY impreso (Panela:
+8-jul-2026 + 50d = 27-ago-2026 ✓; Queso Fresco: 30-jun-2026 + 50d =
+19-ago-2026 ✓). Podría ser una regla real de vida útil de Rizo Lopez, pero
+**no se recomienda derivar la fecha de expiración de esto automáticamente**
+sin confirmación del proveedor — si la constante cambia por producto o el
+proveedor la ajusta sin avisar, el riesgo es de seguridad alimentaria
+(vender algo vencido o descartar algo bueno), no solo un dato mal cargado.
+
+**Complicación real que descarta un diseño "por producto":** no todos los
+proveedores del cliente usan este esquema — hay productos (ej. Longaniza,
+etiqueta "L.A. Warehouse") que traen **un solo barcode en total**, y ese
+único código también es variable por caja (`800/203/30`, mismo formato
+peso+lote que el "combinado" de arriba, pero sin ningún UPC fijo al lado).
+Como el peso cambia caja a caja, ese string **nunca puede ser el
+`products.barcode` fijo del catálogo** — cada caja nueva generaría un
+string distinto que no matchea con la anterior. Falta confirmar cómo se
+identifica hoy este tipo de producto en el sistema (¿búsqueda manual, sin
+escaneo?) antes de diseñar nada para este caso.
+
+**Diseño propuesto para cuando se implemente (discutido, no construido):**
+1. 100% aditivo — el flujo actual (matchear `products.barcode` exacto) se
+   mantiene intacto para todo lo que solo tiene un barcode. La mayoría de
+   los productos no cambian en nada.
+2. Detectar el barcode "combinado" **por forma** (patrón tipo
+   `\d+/[A-Za-z0-9]+-\d+/\d+\.\d+`), no por una bandera manual
+   producto-por-producto — si un escaneo no matchea ese patrón, se trata
+   como barcode normal, que es el comportamiento de hoy.
+3. Solo el primer campo (código de planta/proveedor, ej. `350`) sirve para
+   identificar el producto — el resto (lote, peso) es siempre variable
+   por caja. Ese código de planta no es el UPC, así que haría falta un
+   campo nuevo opcional en `products` (ej. `plant_code`/`supplier_item_code`),
+   poblado solo para los productos que de verdad usan este esquema.
+4. Con eso, en Recepción un segundo escaneo (el combinado) autocompletaría
+   **peso + código de lote** sin tocar la fecha de expiración, que sigue
+   siendo entrada manual como hoy (por el punto anterior sobre no derivarla).
+5. El caso "un solo barcode variable" (Longaniza-style) queda fuera de este
+   diseño hasta resolver primero cómo se identifica ese producto hoy.
+
+**Antes de implementar, falta:** relevar con el cliente cuántos
+productos/proveedores realmente usan cada esquema (¿vale la pena el campo
+nuevo para 3 productos o son decenas?), confirmar el flujo actual para
+productos tipo Longaniza, y decidir si perseguir el barcode chico de solo
+peso (sin poder leerlo aún, no se sabe ni el decoder). Sin fecha de
+implementación — queda en el backlog.

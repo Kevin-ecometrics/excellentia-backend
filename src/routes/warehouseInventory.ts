@@ -6,6 +6,7 @@ import {
   suggestLots,
   listAvailableProducts,
   backfillLots,
+  deleteBackfillLot,
   setLotCondition,
   updateLot,
   listMovements,
@@ -26,6 +27,7 @@ router.get('/lots/available-products',   auth, warehouseOnly, listAvailableProdu
 // operación de una sola vez sobre datos históricos, no una tarea diaria del
 // almacenista.
 router.post('/lots/backfill',            auth, adminOnly,     backfillLots);
+router.delete('/lots/:id/backfill',      auth, adminOnly,     deleteBackfillLot);
 router.post('/lots/:id/condition',       auth, warehouseOnly, setLotCondition);
 router.put('/lots/:id',                  auth, warehouseOnly, updateLot);
 router.get('/movements',                 auth, warehouseOnly, listMovements);

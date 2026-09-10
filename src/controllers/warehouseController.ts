@@ -628,6 +628,47 @@ export async function updateLot(req: Request, res: Response): Promise<void> {
   }
 }
 
+// Elimina un lote creado por backfillLots — a diferencia de updateLot/
+// setLotCondition, esto NO debe tocar products.stock ni generar un
+// movimiento, porque backfillLots tampoco lo hizo al crearlo (ver comentario
+// ahí). Restringido a lotes cuyo receipt_batch_id empieza con 'backfill-'
+// para que este endpoint no se pueda usar para borrar un lote de una
+// recepción real (esos sí tienen stock/movimientos reales detrás). También
+// exige que el lote siga intacto (remaining_qty === received_qty) — si ya
+// se usó para cargar una ruta, hay una fila en route_item_lots apuntando a
+// este id (FK sin ON DELETE CASCADE) y borrarlo dejaría ese registro roto.
+export async function deleteBackfillLot(req: Request, res: Response): Promise<void> {
+  await ensureWarehouseTables();
+  try {
+    const { id } = req.params;
+    const [[lot]] = await pool.query(
+      'SELECT id, receipt_batch_id, received_qty, remaining_qty, status FROM product_lots WHERE id = ?', [id]
+    ) as any[];
+    if (!lot) {
+      res.status(404).json({ error: 'Lote no encontrado' });
+      return;
+    }
+    if (!String(lot.receipt_batch_id).startsWith('backfill-')) {
+      res.status(400).json({ error: 'Solo se pueden eliminar lotes creados por Backfill' });
+      return;
+    }
+    if (lot.status !== 'ACTIVE') {
+      res.status(400).json({ error: `No se puede eliminar: el lote ya está en estado '${lot.status}'` });
+      return;
+    }
+    if (Number(lot.remaining_qty) !== Number(lot.received_qty)) {
+      res.status(409).json({ error: 'Ya se usó este lote para cargar una ruta — no se puede eliminar' });
+      return;
+    }
+
+    await pool.query('DELETE FROM product_lots WHERE id = ?', [id]);
+    res.json({ message: 'Lote eliminado' });
+  } catch (err) {
+    logger.error('deleteBackfillLot error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
 export async function listMovements(req: Request, res: Response): Promise<void> {
   await ensureWarehouseTables();
   try {
