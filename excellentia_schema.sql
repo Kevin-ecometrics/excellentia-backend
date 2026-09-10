@@ -411,6 +411,7 @@ CREATE TABLE IF NOT EXISTS `inventory_movements` (
     `quantity`       DECIMAL(10,2) NOT NULL,
     `route_id`       INT DEFAULT NULL,
     `settlement_id`  INT DEFAULT NULL,
+    `qb_synced`      TINYINT(1) DEFAULT NULL,
     `created_by`     INT DEFAULT NULL,
     `created_at`     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (`warehouse_id`) REFERENCES `warehouses`(`id`),
@@ -654,5 +655,12 @@ ALTER TABLE route_items MODIFY COLUMN quantity DECIMAL(10,2) NOT NULL DEFAULT 0;
 -- =============================================================================
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_id INT NULL AFTER barcode;
 
--- Fin del schema — 23 tablas + migraciones Fase 48, 111, 112, 115, 116, 117, 118, 2026-08-31, 2026-09-01 y 2026-09-07
+-- =============================================================================
+-- Migración — inventory_movements.qb_synced (2026-09-10): resultado real del
+-- sync a QBO por movimiento, antes descartado en silencio (ver
+-- src/db/schema.sql para el detalle completo).
+-- =============================================================================
+ALTER TABLE inventory_movements ADD COLUMN IF NOT EXISTS qb_synced TINYINT(1) DEFAULT NULL AFTER settlement_id;
+
+-- Fin del schema — 23 tablas + migraciones Fase 48, 111, 112, 115, 116, 117, 118, 2026-08-31, 2026-09-01, 2026-09-07 y 2026-09-10
 -- =============================================================================

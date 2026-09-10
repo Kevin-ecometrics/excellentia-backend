@@ -369,12 +369,34 @@ export async function deleteRoute(req: Request, res: Response): Promise<void> {
     for (const r of returnedRows as any[]) returnedByProduct.set(r.product_id, Number(r.returned_qty) || 0);
 
     const [consignmentRows] = await pool.query(
-      `SELECT rci.product_id, SUM(rci.quantity_sold + rci.quantity_returned) AS settled_qty
+      `SELECT rci.product_id, SUM(rci.quantity_sold + rci.quantity_returned) AS settled_qty,
+              SUM(rci.quantity_sold) AS sold_qty
        FROM route_consignment_items rci JOIN route_stops rs ON rs.id = rci.route_stop_id
        WHERE rs.route_id = ? GROUP BY rci.product_id`, [id]
     ) as any[];
     const consignmentByProduct = new Map<number, number>();
     for (const r of consignmentRows as any[]) consignmentByProduct.set(r.product_id, Number(r.settled_qty) || 0);
+
+    // Guard (2026-09-10, pedido del usuario) — no tiene sentido "cancelar"
+    // una ruta que ya tiene una entrega/venta real detrás: los productos
+    // vendidos ya están en manos del cliente, cancelar la ruta no los hace
+    // volver al stock (el cálculo de `outstanding` de abajo ya lo maneja
+    // bien — no restituye lo vendido, correcto), pero dejar que el admin
+    // "cancele" igual generaba confusión ("le doy cancelar y no me
+    // devuelve el stock"). Se corta acá, antes de tocar nada, en vez de
+    // dejar avanzar un cancelado parcial que no hace lo que el botón
+    // sugiere. No depende de `routes.status` (que puede seguir
+    // PLANNED/IN_PROGRESS si la ruta tiene más de una parada y solo
+    // alguna ya se entregó) — depende de si ya hubo una venta real.
+    const totalSold = Array.from(soldByBarcode.values()).reduce((s, v) => s + v, 0);
+    const totalConsignmentSold = (consignmentRows as any[]).reduce((s, r) => s + (Number(r.sold_qty) || 0), 0);
+    if (totalSold > 0 || totalConsignmentSold > 0) {
+      res.status(400).json({
+        error: 'No se puede cancelar: esta ruta ya tiene al menos una entrega/venta completada. ' +
+          'Para corregirla, cancelá o editá esa venta puntual desde Órdenes en vez de cancelar toda la ruta.',
+      });
+      return;
+    }
 
     for (const item of itemRows as any[]) {
       const sold = item.barcode ? (soldByBarcode.get(item.barcode) ?? 0) : 0;
@@ -721,12 +743,29 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
     // InsufficientStockError, para que Android reuse el mismo manejo de 409).
     let allocations: { lot_id: number; qty: number }[] = [];
     if (useStock) {
-      const [[stockRow]] = await pool.query('SELECT stock FROM products WHERE id = ?', [product.id]) as any[];
+      // 'STOCK' es para la misma porción que resuelve Backfill — stock que
+      // NUNCA tuvo lote — no todo products.stock a secas. Sin este chequeo,
+      // se podía pedir "stock general" por una cantidad que en realidad ya
+      // estaba reservada en un lote ACTIVE (visible en "Disponible"):
+      // products.stock bajaba igual, pero el lote se quedaba mostrando esas
+      // mismas unidades como disponibles (fantasma, ya no existen), y una
+      // carga posterior por FIFO normal desde ese lote podía dejar
+      // products.stock en negativo. `unbacked` es el mismo cálculo que
+      // `backfillLots` (gap = stock - suma de remaining_qty ACTIVE).
+      const [[stockRow]] = await pool.query(
+        `SELECT p.stock, COALESCE(SUM(pl.remaining_qty), 0) AS lot_qty
+         FROM products p
+         LEFT JOIN product_lots pl ON pl.product_id = p.id AND pl.warehouse_id = ? AND pl.status = 'ACTIVE'
+         WHERE p.id = ?
+         GROUP BY p.id`,
+        [warehouseId, product.id]
+      ) as any[];
       const currentStock = Number(stockRow?.stock) || 0;
-      if (currentStock < quantity) {
+      const unbacked = currentStock - Number(stockRow?.lot_qty ?? 0);
+      if (unbacked < quantity) {
         res.status(409).json({
-          error: `Stock insuficiente: disponible ${currentStock}, solicitado ${quantity}`,
-          available: currentStock, requested: quantity, product_id: product.id,
+          error: `Stock general insuficiente sin lote: disponible ${Math.max(unbacked, 0)}, solicitado ${quantity} — el resto ya tiene lote, cargalo desde "Disponible"`,
+          available: Math.max(unbacked, 0), requested: quantity, product_id: product.id,
         });
         return;
       }
@@ -766,7 +805,7 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
        ON DUPLICATE KEY UPDATE quantity = quantity + VALUES(quantity), updated_at = NOW()`,
       [id, product.id, product.barcode ?? null, quantity, req.user?.id ?? null]
     );
-    await pool.query('UPDATE products SET stock = stock - ? WHERE id = ?', [quantity, product.id]);
+    await pool.query('UPDATE products SET stock = GREATEST(stock - ?, 0) WHERE id = ?', [quantity, product.id]);
 
     const [[routeItem]] = await pool.query(
       'SELECT id FROM route_items WHERE route_id = ? AND product_id = ?', [id, product.id]

@@ -848,7 +848,29 @@ tocar `products.stock`** (ya está correcto) **ni generar un movimiento**
 existía; un `RECEIPT` falso hubiera aparecido en el historial como si hoy
 hubiera entrado mercadería nueva). Botón admin-only en la pestaña Disponible
 de `/warehouse/inventory` (preview → confirmar, mismo patrón que ya usaba la
-Liquidación diaria antes de eliminarse).
+Liquidación diaria antes de eliminarse). El preview permite tildar/destildar
+productos puntuales (checkbox por fila + "Seleccionar todo") en vez de
+aplicar siempre a todo el listado — `applyBackfill` manda `product_ids` con
+solo lo tildado; el backend ya aceptaba ese filtro desde el día uno
+(`backfillLots`), solo faltaba exponerlo en la UI.
+
+**Deshacer un backfill — `DELETE /api/warehouse/lots/:id/backfill`
+(2026-09-10).** Pedido tras probar la herramienta: si el admin se equivoca de
+producto (o tilda uno que no debía), hace falta poder revertirlo. No sirve
+reusar `updateLot`/`setLotCondition` para esto — los dos bajan
+`products.stock` como efecto colateral (piensan que estás devolviendo
+mercadería real o dándola de baja), y eso rompería el stock real que el
+backfill justamente no tocó. `deleteBackfillLot` (`warehouseController.ts`)
+es un endpoint dedicado que **solo** borra la fila de `product_lots`, sin
+tocar `products.stock` ni generar movimiento — simétrico con que crearlo
+tampoco los tocó. Tres validaciones antes de borrar: `receipt_batch_id` debe
+empezar con `backfill-` (no se puede usar este endpoint para borrar un lote
+de una recepción real), el lote debe seguir `ACTIVE`, y `remaining_qty` debe
+seguir igual a `received_qty` (si ya se cargó a una ruta, hay una fila en
+`route_item_lots` con FK a este lote sin `ON DELETE CASCADE` — borrarlo la
+dejaría rota). Webapp: en la pestaña Disponible, cada lote de backfill
+muestra una etiqueta `(backfill)` para distinguirlo de un lote real, y
+admin-only aparece un link "Eliminar" al lado.
 
 ### 6. Cargar a una ruta directo del stock general (sin lote)
 Alternativa al backfill para el día a día: `addRouteItem` acepta

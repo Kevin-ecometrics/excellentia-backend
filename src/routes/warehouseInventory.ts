@@ -4,12 +4,14 @@ import {
   createReceipt,
   listLots,
   suggestLots,
+  getUnbackedStock,
   listAvailableProducts,
   backfillLots,
   deleteBackfillLot,
   setLotCondition,
   updateLot,
   listMovements,
+  retryMovementSync,
 } from '../controllers/warehouseController.ts';
 import { auth } from '../middleware/auth.ts';
 import { warehouseOnly } from '../middleware/warehouseOnly.ts';
@@ -21,6 +23,7 @@ router.get('/warehouses',                auth,               listWarehouses);
 router.post('/receipts',                 auth, warehouseOnly, createReceipt);
 router.get('/lots',                      auth, warehouseOnly, listLots);
 router.get('/lots/suggest',              auth, warehouseOnly, suggestLots);
+router.get('/lots/unbacked',             auth, warehouseOnly, getUnbackedStock);
 router.get('/lots/available-products',   auth, warehouseOnly, listAvailableProducts);
 // Backfill de apertura: convierte stock pre-existente (sin lote) en lotes
 // reales, para que el FIFO de rutas lo pueda usar — adminOnly, es una
@@ -31,5 +34,6 @@ router.delete('/lots/:id/backfill',      auth, adminOnly,     deleteBackfillLot)
 router.post('/lots/:id/condition',       auth, warehouseOnly, setLotCondition);
 router.put('/lots/:id',                  auth, warehouseOnly, updateLot);
 router.get('/movements',                 auth, warehouseOnly, listMovements);
+router.post('/movements/:id/retry-sync', auth, adminOnly,     retryMovementSync);
 
 export default router;

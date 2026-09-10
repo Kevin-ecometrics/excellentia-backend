@@ -450,6 +450,7 @@ CREATE TABLE IF NOT EXISTS `inventory_movements` (
     `quantity`       DECIMAL(10,2) NOT NULL,
     `route_id`       INT DEFAULT NULL,
     `settlement_id`  INT DEFAULT NULL,
+    `qb_synced`      TINYINT(1) DEFAULT NULL,
     `created_by`     INT DEFAULT NULL,
     `created_at`     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (`warehouse_id`) REFERENCES `warehouses`(`id`),
@@ -727,8 +728,16 @@ ALTER TABLE route_items MODIFY COLUMN quantity DECIMAL(10,2) NOT NULL DEFAULT 0;
 -- =============================================================================
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_id INT NULL AFTER barcode;
 
+-- inventory_movements.qb_synced (2026-09-10) — antes recordMovement()
+-- sincronizaba a QBO en silencio y descartaba el resultado (solo quedaba un
+-- logger.warn si fallaba). Ahora el resultado real de cada intento queda acá
+-- (NULL = no aplica, el producto no tiene qb_item_id; 1/0 = éxito/fallo real)
+-- para que el Historial (webapp/Android) lo muestre y se pueda reintentar
+-- puntualmente vía POST /api/warehouse/movements/:id/retry-sync.
+ALTER TABLE inventory_movements ADD COLUMN IF NOT EXISTS qb_synced TINYINT(1) DEFAULT NULL AFTER settlement_id;
+
 -- =============================================================================
--- Fin del schema — 24 tablas + migraciones Fase 48, 61, 112, 115, 116, 117, 118, 2026-08-31, 2026-09-01 y 2026-09-07
+-- Fin del schema — 24 tablas + migraciones Fase 48, 61, 112, 115, 116, 117, 118, 2026-08-31, 2026-09-01, 2026-09-07 y 2026-09-10
 -- =============================================================================
 SET FOREIGN_KEY_CHECKS = 1;
 SET FOREIGN_KEY_CHECKS = 1;

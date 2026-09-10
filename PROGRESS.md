@@ -5322,3 +5322,168 @@ nuevo para 3 productos o son decenas?), confirmar el flujo actual para
 productos tipo Longaniza, y decidir si perseguir el barcode chico de solo
 peso (sin poder leerlo aún, no se sabe ni el decoder). Sin fecha de
 implementación — queda en el backlog.
+
+## Sesión 2026-09-10 — Backfill: selección + eliminar, bug de "stock general" en carga de rutas, sync a QBO visible (`qb_synced`)
+
+**Schema al día:** una sola migración nueva esta sesión —
+`ALTER TABLE inventory_movements ADD COLUMN IF NOT EXISTS qb_synced TINYINT(1) DEFAULT NULL AFTER settlement_id;`
+— reflejada en `src/db/schema.sql` y `excellentia_schema.sql` (`CREATE
+TABLE` + bloque de migraciones), a correr a mano contra la base (mismo
+criterio que toda migración de este proyecto). Nada más de lo de hoy tocó
+el schema (el botón de eliminar lote de backfill y el fix de "stock
+general" son lógica nueva sobre tablas existentes).
+
+**1. Backfill — selección por producto + botón "Eliminar" (webapp).**
+El preview de `/warehouse/inventory` → Disponible ahora deja tildar/destildar
+productos puntuales (checkbox por fila + "Seleccionar todo") antes de
+confirmar — `applyBackfill` manda `product_ids` con solo lo tildado; el
+backend (`backfillLots`) ya aceptaba ese filtro desde que se construyó,
+solo faltaba exponerlo en la UI. Además, nuevo endpoint
+`DELETE /api/warehouse/lots/:id/backfill` (`deleteBackfillLot`,
+admin-only) para deshacer un backfill mal aplicado — a propósito **no**
+reusa `updateLot`/`setLotCondition` (los dos bajan `products.stock` como
+efecto colateral, pensado para devoluciones/bajas reales, no para esto).
+Solo borra la fila de `product_lots`, sin tocar stock ni generar
+movimiento — simétrico con que crearlo tampoco los tocó. Tres
+validaciones antes de borrar: `receipt_batch_id` debe empezar con
+`backfill-` (no se puede usar para borrar un lote de una recepción real),
+el lote debe seguir `ACTIVE`, y `remaining_qty` debe seguir igual a
+`received_qty` (si ya se cargó a una ruta hay una fila en
+`route_item_lots` con FK a este lote sin `ON DELETE CASCADE` — borrarlo la
+dejaría rota). Webapp: cada lote de backfill muestra una etiqueta
+`(backfill)` en Disponible para distinguirlo de un lote real, y admin-only
+aparece un link "Eliminar" al lado.
+
+**2. Bug real encontrado por el usuario — "usar stock general" al cargar
+una ruta podía usar unidades que ya tenían lote.** `products.stock` es el
+total físico (con lote o sin lote); la opción `source: 'STOCK'` de
+`addRouteItem` solo validaba que `products.stock` alcanzara, sin fijarse
+si esa cantidad ya estaba reservada por un lote `ACTIVE` visible en
+Disponible. Consecuencia: se podía cargar a una ruta unidades que un lote
+seguía contando como disponibles — el lote quedaba mostrando stock
+fantasma (ya no existe físicamente), y una carga posterior por el flujo
+normal de lotes/FIFO desde ese mismo lote podía dejar `products.stock` en
+negativo (esa línea no tenía el piso `GREATEST(...,0)` que sí tiene el
+resto del código).
+
+**Fix (`routeController.ts`, `addRouteItem`):**
+- `source: 'STOCK'` ahora se limita a lo que de verdad **no tiene lote**
+  (`stock − suma de remaining_qty de lotes ACTIVE`, mismo cálculo que ya
+  usa `backfillLots`) — pedir más rechaza con `409` explicando que el
+  resto ya tiene lote y hay que cargarlo desde Disponible.
+- Agregado el piso `GREATEST(stock - cantidad, 0)` que faltaba en el
+  `UPDATE` de esta función.
+- Nuevo endpoint de solo lectura `GET /api/warehouse/lots/unbacked`
+  (`getUnbackedStock`) — mismo cálculo, para que un cliente pueda mostrar
+  el número real antes de intentar la carga, sin depender de chocar con
+  el 409 para enterarse.
+- **Android** (`WarehouseRouteDetailActivity.kt`, `showQuantityDialog`):
+  el checkbox "Usar stock general" ya no muestra `product.stock` (el
+  total, engañoso) — arranca deshabilitado en "(tengo 0)" y se completa al
+  toque de abrir el diálogo consultando el endpoint nuevo; si no hay nada
+  sin respaldo, se queda deshabilitado en vez de ofrecer una cantidad que
+  el backend igual va a rechazar. Nuevo `UnbackedStockDto`
+  (`data/Models.kt`) + `getUnbackedStock()` en `ApiService.kt`. Compila
+  limpio (`:app:compileDebugKotlin`), sin probar contra dispositivo real.
+
+**3. `inventory_movements.qb_synced` — visibilidad del sync a QBO (Fase
+114 se mantiene tal cual, esto solo la hace observable).** Pedido del
+usuario: "todo lo que reciba el warehouse" ya se reflejaba al instante en
+`products.stock` y se sincronizaba a QBO desde la Fase 114 — el hueco real
+no era la sincronización en sí (ya pasa sola) sino que es **silenciosa**:
+si `syncProductStockToQbo` fallaba (timeout, item inactivo, rate limit),
+nadie se enteraba, solo quedaba un `logger.warn` server-side. Se
+descartó revertir la Fase 114 (el usuario confirmó explícitamente que
+quiere mantenerla).
+
+`recordMovement()` ahora devuelve `{ movementId, qbSynced }` — inserta el
+movimiento, intenta el sync, y guarda el resultado real
+(`null` = no aplica, sin `qb_item_id`; `1`/`0` = éxito/fallo real) en la
+columna nueva `qb_synced`, en vez de descartarlo. `createReceipt` expone
+`qb_synced` por línea en la respuesta (para el banner de confirmación al
+recibir). `listMovements` expone la columna para el Historial. Nuevo
+endpoint `POST /api/warehouse/movements/:id/retry-sync` (admin-only) para
+reintentar puntualmente un movimiento que quedó sin sincronizar —
+`syncProductStockToQbo` se exportó para reutilizarlo ahí.
+
+**Parte visual completada (webapp + Android):**
+- Webapp (`InventoryClient.tsx`, Historial): badge rojo "No sincronizado a
+  QBO" solo cuando `qb_synced === 0` (silencioso en éxito/no-aplica, mismo
+  criterio "solo avisar la anomalía" que ya usa `qb_sync_error` en
+  `ProductModal.tsx`) + botón "Reintentar" admin-only que llama al
+  endpoint nuevo y actualiza esa fila en memoria sin refetchear todo.
+- Android `InventoryMovementsActivity` (Historial): mismo badge +
+  "Reintentar" (gateado por `securePrefs.getUserRole() == "admin"`,
+  mismo patrón que `TicketDetailActivity`), reusando `renderFiltered()`
+  para refrescar la fila tras el reintento.
+- Android `ReceivingActivity`: si algún ítem de la recepción vino con
+  `qb_synced == 0`, en vez del Snackbar genérico se muestra un diálogo
+  bloqueante nombrando qué productos no sincronizaron, aclarando que el
+  stock local ya quedó correcto y que se puede reintentar después desde
+  el Historial — la recepción nunca se revierte por esto.
+- DTOs nuevos: `UnbackedStockDto`/`RetryMovementSyncResponse`
+  (`Models.kt`), `qbSynced` agregado a `InventoryMovementDto` y
+  `ReceiptResultItem`.
+
+**Sin probar contra base real en esta sesión** — XAMPP MySQL estaba
+apagado, la migración de `qb_synced` quedó redactada y lista pero no
+verificada corriendo contra datos reales; todo lo demás se verificó por
+compilación (`tsc --noEmit` en ambos backends TS, `:app:compileDebugKotlin`
+en Android). Falta probar el flujo end-to-end (forzar un fallo de sync
+real, confirmar que el badge/reintento aparecen y funcionan) una vez la
+base esté arriba.
+
+**4. Fix (2026-09-10, encontrado probando en producción) — `qb_synced`
+viajaba como `true`/`false` en vez de `1`/`0`, y Android rompía al leer
+la respuesta de Recepción.** El usuario probó recibir mercadería contra
+`app.excellentiafoods.com` (rama ya desplegada) y le saltó un error en la
+app aunque el log de red mostraba `201 Created` — la recepción **sí** se
+había guardado bien (lote creado, stock sumado). La causa: `createReceipt`
+y `retryMovementSync` armaban su JSON a partir del `boolean` que devuelve
+`syncProductStockToQbo()` en memoria (nunca pasó por una fila de MySQL),
+mientras que `listMovements` lee la columna `qb_synced` directo de una fila
+real (`TINYINT(1)`, que `mysql2` sí devuelve como `number`) — dos
+endpoints del mismo campo, dos formatos distintos. Gson (Android,
+`qbSynced: Int?`) revienta al recibir `true` literal donde espera `1`/`0`.
+Fix: nueva `qbSyncedToDb()` en `warehouseController.ts` que normaliza el
+boolean a `1`/`0`/`null` antes de responder, aplicada en los dos puntos
+que tenían el problema. Pendiente desplegar para que se resuelva de
+verdad en producción — el fix quedó solo en el código local esta sesión.
+
+**5. Investigación (sin cambios de código) — productos con `stock`
+fuertemente negativo (ej. `-2714`), descartado como bug.** Se armó una
+consulta de diagnóstico (`HAVING p.stock < COALESCE(SUM(pl.remaining_qty),
+0)`, cuidado con el error `#1247` de MySQL si se compara contra el alias
+en vez de repetir la expresión completa en el `HAVING`) para buscar
+productos donde el stock local quedara por debajo de lo que sus lotes
+reclaman — la sospecha inicial era que fuera el mismo patrón del punto 4
+(recepción que el usuario canceló/devolvió pensando que había fallado,
+sin saber que sí se había guardado). Los resultados no encajaban con esa
+teoría: `lot_qty = 0.00` en las 8 filas (esos productos nunca pasaron por
+Recepción/Backfill) y magnitudes demasiado grandes para un puñado de
+recepciones mal deshechas. Causa real, confirmada en `syncEngine.ts`
+(`syncProductsFromQbo`) y `qbController.ts` (`syncProducts`): ambos
+escriben `stock = item.QtyOnHand` directo desde QBO, **sin piso en 0** —
+si el `QtyOnHand` del ítem ya está negativo del lado de QuickBooks (venta
+sin nunca recibir inventario ahí), el sync local solo lo refleja fielmente
+cada 5 minutos. El usuario confirmó que esos productos efectivamente están
+así en QBO por decisión/descuido del cliente — **no se tocó nada**, ni se
+agregó un `GREATEST(...,0)` al sync, para no ocultar un desvío real que
+hay que corregir en QuickBooks, no acá.
+
+**6. Manual de usuario del módulo Almacén (`Excellentia_Warehouse_User_Manual.docx`,
+Descargas) — actualizado en paralelo con el código de esta sesión.**
+Cuatro secciones existentes se corrigieron para reflejar los puntos 1-3 de
+arriba (uso de "stock general" limitado a lo sin lote, badge de sync en el
+Historial, selección + botón "Eliminar" en Backfill, nota de QBO
+actualizada con el aviso de Recepción y el reintento puntual). Se
+agregaron dos capítulos nuevos al final — **Cap. 12 "Delivering a Route"**
+(flujo del operador en Android: Mis Rutas, Start/Finish route, los 4 tipos
+de parada, Skip, vender desde una parada, y los puntos rojo/amarillo/verde
+de "cargado al camión") y **Cap. 13 "Courtesy Items"** (checkbox de
+Cortesía por línea, efecto en totales y en la factura de QBO) — pedidos
+explícitamente por el usuario porque no estaban documentados en absoluto.
+Los 20 marcadores `[AQUÍ VA LA CAPTURA: ...]` de todo el documento quedaron
+reemplazados por capturas reales (Android + Web Dashboard), tomadas por el
+usuario mientras probábamos cada feature — el documento no tiene ningún
+placeholder de captura pendiente al cierre de esta sesión.

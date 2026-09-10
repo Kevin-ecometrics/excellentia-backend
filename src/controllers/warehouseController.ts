@@ -246,8 +246,8 @@ export async function recordMovement(params: {
   quantity: number;
   routeId?: number | null;
   createdBy?: number | null;
-}): Promise<void> {
-  await pool.query(
+}): Promise<{ movementId: number; qbSynced: boolean | null }> {
+  const [result] = await pool.query(
     `INSERT INTO inventory_movements (warehouse_id, product_id, lot_id, movement_type, quantity, route_id, created_by)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
     [
@@ -259,8 +259,11 @@ export async function recordMovement(params: {
       params.routeId ?? null,
       params.createdBy ?? null,
     ]
-  );
-  await syncProductStockToQbo(params.productId);
+  ) as any;
+  const movementId = result.insertId;
+  const qbSynced = await syncProductStockToQbo(params.productId);
+  await pool.query('UPDATE inventory_movements SET qb_synced = ? WHERE id = ?', [qbSynced, movementId]);
+  return { movementId, qbSynced };
 }
 
 // recordMovement() es el único punto de paso de todo cambio de stock del
@@ -270,18 +273,39 @@ export async function recordMovement(params: {
 // pedía confirmación manual del admin): a este volumen de uso no hace falta
 // batchear, así que se sincroniza al toque, mismo patrón "silencioso" que ya
 // usa updateProduct (productController.ts) — si QBO falla, no revierte nada
-// local, queda logueado como warning nomás. Si una sola acción genera varias
-// filas de movimiento para el mismo producto (ej. una carga partida entre 2
-// lotes), esto sincroniza QBO más de una vez seguida con el mismo valor
-// final — redundante pero inofensivo (manda el stock actual, no un delta).
-async function syncProductStockToQbo(productId: number): Promise<void> {
+// local, sigue sin hacerlo. Se agregó (2026-09-10) que el resultado real
+// quede guardado en `inventory_movements.qb_synced` (null = no aplica, sin
+// qb_item_id; 1/0 = resultado real del intento) — antes se descartaba
+// (`logger.warn` nomás), invisible desde la webapp/Android; ahora el
+// Historial y el flujo de Recepción lo pueden mostrar y ofrecer reintentar.
+// Si una sola acción genera varias filas de movimiento para el mismo
+// producto (ej. una carga partida entre 2 lotes), esto sincroniza QBO más de
+// una vez seguida con el mismo valor final — redundante pero inofensivo
+// (manda el stock actual, no un delta).
+export async function syncProductStockToQbo(productId: number): Promise<boolean | null> {
   try {
     const [[product]] = await pool.query('SELECT stock, qb_item_id FROM products WHERE id = ?', [productId]) as any[];
-    if (!product?.qb_item_id) return;
+    if (!product?.qb_item_id) return null;
     await updateItemQtyOnHand(product.qb_item_id, Number(product.stock) || 0);
+    return true;
   } catch (err) {
     logger.warn(`recordMovement: fallo al sincronizar stock a QBO (producto ${productId}):`, err);
+    return false;
   }
+}
+
+// syncProductStockToQbo()/recordMovement() devuelven boolean|null (JS), pero
+// `inventory_movements.qb_synced` es TINYINT(1) — vía mysql2 sale como
+// number (0/1/null), no boolean (mismo gotcha ya documentado para qb_active
+// en productController.ts). listMovements() lee la columna directo de la
+// fila de MySQL, así que ya sale como number — pero createReceipt/
+// retryMovementSync arman su JSON a partir del boolean en memoria (nunca
+// pasó por una fila de MySQL), y sin este cast Android (Int?) rompía al
+// parsear `true`/`false` donde esperaba `1`/`0`/`null` (bug encontrado en
+// producción 2026-09-10, la recepción sí se guardaba bien — 201 — pero el
+// cliente no podía leer la respuesta).
+function qbSyncedToDb(qbSynced: boolean | null): number | null {
+  return qbSynced === null ? null : (qbSynced ? 1 : 0);
 }
 
 export async function listWarehouses(_req: Request, res: Response): Promise<void> {
@@ -343,14 +367,14 @@ export async function createReceipt(req: Request, res: Response): Promise<void> 
       const lotId = insertResult.insertId;
 
       await pool.query('UPDATE products SET stock = stock + ? WHERE id = ?', [qty, product.id]);
-      await recordMovement({
+      const { qbSynced } = await recordMovement({
         warehouseId, productId: product.id, lotId, movementType: 'RECEIPT',
         quantity: qty, createdBy: req.user?.id ?? null,
       });
 
       results.push({
         lot_id: lotId, product_id: product.id, product_name: product.name,
-        quantity: qty, expiration_date: expiration_date ?? null,
+        quantity: qty, expiration_date: expiration_date ?? null, qb_synced: qbSyncedToDb(qbSynced),
       });
     }
 
@@ -479,6 +503,42 @@ export async function backfillLots(req: Request, res: Response): Promise<void> {
     });
   } catch (err) {
     logger.error('backfillLots error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
+// Cuánto de products.stock NO tiene ningún lote ACTIVE que lo respalde — el
+// mismo cálculo que backfillLots, pero para un solo producto, consultado al
+// vuelo. Usado por WarehouseRouteDetailActivity (Android) para mostrar el
+// número real en el checkbox "Usar stock general" (antes mostraba
+// product.stock a secas, que incluye lo que ya tiene lote — ver el fix del
+// mismo problema en addRouteItem/source:'STOCK').
+export async function getUnbackedStock(req: Request, res: Response): Promise<void> {
+  await ensureWarehouseTables();
+  try {
+    const productId = Number(req.query.product_id);
+    if (!Number.isFinite(productId)) {
+      res.status(400).json({ error: 'product_id es requerido' });
+      return;
+    }
+    const warehouseId = req.query.warehouse_id ? Number(req.query.warehouse_id) : await getDefaultWarehouseId();
+    const [[row]] = await pool.query(
+      `SELECT p.stock, COALESCE(SUM(pl.remaining_qty), 0) AS lot_qty
+       FROM products p
+       LEFT JOIN product_lots pl ON pl.product_id = p.id AND pl.warehouse_id = ? AND pl.status = 'ACTIVE'
+       WHERE p.id = ?
+       GROUP BY p.id`,
+      [warehouseId, productId]
+    ) as any[];
+    if (!row) {
+      res.status(404).json({ error: 'Producto no encontrado' });
+      return;
+    }
+    const stock = Number(row.stock) || 0;
+    const unbacked = Math.max(stock - Number(row.lot_qty ?? 0), 0);
+    res.json({ data: { product_id: productId, stock, unbacked } });
+  } catch (err) {
+    logger.error('getUnbackedStock error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 }
@@ -678,7 +738,7 @@ export async function listMovements(req: Request, res: Response): Promise<void> 
     // "Editar" sin pedirle al cliente una consulta aparte por cada fila.
     let query = `
       SELECT im.id, im.warehouse_id, im.product_id, im.lot_id, im.movement_type, im.quantity,
-             im.route_id, im.settlement_id, im.created_by, im.created_at,
+             im.route_id, im.settlement_id, im.qb_synced, im.created_by, im.created_at,
              p.name AS product_name, p.sku,
              pl.expiration_date AS lot_expiration_date, pl.status AS lot_status,
              pl.received_qty AS lot_received_qty
@@ -698,6 +758,31 @@ export async function listMovements(req: Request, res: Response): Promise<void> 
     res.json({ data: rows });
   } catch (err) {
     logger.error('listMovements error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
+// Reintenta el push a QBO de un movimiento puntual que quedó qb_synced = 0
+// (o volver a intentar uno que ya salió bien, sin restricción — no tiene
+// costo, syncProductStockToQbo siempre manda el stock actual completo, no un
+// delta). No repite el INSERT en inventory_movements, solo reintenta el lado
+// QBO y actualiza el resultado en la fila existente.
+export async function retryMovementSync(req: Request, res: Response): Promise<void> {
+  await ensureWarehouseTables();
+  try {
+    const { id } = req.params;
+    const [[movement]] = await pool.query(
+      'SELECT id, product_id FROM inventory_movements WHERE id = ?', [id]
+    ) as any[];
+    if (!movement) {
+      res.status(404).json({ error: 'Movimiento no encontrado' });
+      return;
+    }
+    const qbSynced = await syncProductStockToQbo(movement.product_id);
+    await pool.query('UPDATE inventory_movements SET qb_synced = ? WHERE id = ?', [qbSynced, id]);
+    res.json({ qb_synced: qbSyncedToDb(qbSynced) });
+  } catch (err) {
+    logger.error('retryMovementSync error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 }
