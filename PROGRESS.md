@@ -5487,3 +5487,211 @@ Los 20 marcadores `[AQUÍ VA LA CAPTURA: ...]` de todo el documento quedaron
 reemplazados por capturas reales (Android + Web Dashboard), tomadas por el
 usuario mientras probábamos cada feature — el documento no tiene ningún
 placeholder de captura pendiente al cierre de esta sesión.
+
+## Sesión 2026-09-11 — Code review pre-aprobación de los 3 módulos (backend + webapp + Android) y 4 fixes críticos
+
+**Contexto:** la app está en proceso de aprobación para producción. Pedido
+explícito del usuario: revisar los 3 módulos por CORRECTITUD (bugs reales,
+no estilo/simplificación), sin fijarse en el estado de las ramas git (todo
+el trabajo de Almacén seguía en `warehouse-module`/`version-1.6.1-warehouse`,
+sin mergear a `main` en los tres repos — deliberado, no es el foco de esta
+revisión). Se lanzaron 4 revisiones en paralelo (agentes independientes,
+cada uno leyendo el CLAUDE.md correspondiente + el código real, buscando
+discrepancias entre lo documentado y lo que el código realmente hace):
+backend completo (aprobación/rutas/almacén), webapp (dashboard de
+aprobación + inventario), Android — núcleo de Almacén, y Android — flujo de
+ventas/sync/offline (separado del núcleo de Almacén por volumen de código,
+~10k líneas modificadas solo en Android). Los 4 devolvieron hallazgos reales;
+de la lista completa, el usuario decidió arreglar 4 antes de aprobar —
+los que corrompen datos/plata sin ningún workaround, o rompen UI en el
+100% de las ventas. El resto queda documentado como backlog abierto (ver
+al final de esta sección).
+
+**1. Backend — `orders` quedaban marcados `SENT` sin estar realmente
+facturados en QBO, en TRES lugares (`src/controllers/orderController.ts`).**
+Bug de mayor severidad de toda la revisión: pérdida silenciosa de revenue,
+sin forma de detectarlo desde la app — el registro local dice "enviado y
+facturado" cuando en QBO ese ítem nunca existió, y solo se descubre después
+en una reconciliación contable.
+
+Patrón exacto: cuando un batch mixto tiene ítems inválidos (sin
+`qb_item_id`, o `qb_active = 0` en QBO), esos ítems se marcan `FAILED` y se
+excluyen del array `items` que arma la factura real (`createBatchInvoice`
+solo recibe `validItems`). Pero el `UPDATE` de éxito posterior usaba
+`WHERE batch_id = ?` — todo el batch, sin filtrar por qué ítems realmente
+entraron en la factura — así que sobreescribía a `SENT` incluso las filas
+`FAILED` que nunca se facturaron, con el mismo `qb_invoice_id` de las que sí,
+borrando el `error_log` que explicaba por qué habían fallado.
+
+- `approveBatch` → `finalizeApproved()` (línea ~416): agregado
+  `validItemIds = validItems.map(o => o.id)` justo después de calcular
+  `validItems`; el `UPDATE` pasó de `WHERE batch_id = ?` a `WHERE id IN (?)`
+  con esos ids.
+- `retryBatchSync`: mismo patrón, en DOS puntos — el éxito directo
+  (`UPDATE ... WHERE id IN (?)`, antes `WHERE batch_id`) y la rama de
+  reconciliación tras timeout (mismo fix). La rama de fallo final (línea
+  ~870) ya usaba `id IN (?)` correctamente — no hizo falta tocarla.
+- `reconcileBatch`: **encontrado durante el fix, no estaba en la lista
+  original de los 4 agentes** — misma clase exacta de bug (`UPDATE ...
+  WHERE batch_id = ?` sin distinguir válidos de inválidos). Esta función ni
+  siquiera hacía el JOIN a `products` para poder saber qué ítems eran
+  válidos — se le agregó (`LEFT JOIN products p ON o.barcode = p.barcode`,
+  mismo patrón que `approveBatch`/`retryBatchSync`) y se calculó
+  `reconciledItems`/`reconciledIds` antes del `UPDATE`, con fallback a
+  "todos los ids" solo si por algún motivo ningún ítem matcheara como
+  válido (para no dejar el batch sin reconciliar en absoluto en ese caso
+  borde).
+
+**2. Backend — `createBatch` podía dejar escritura parcial si un ítem
+violaba `min_price` a mitad del batch (`orderController.ts`, función
+`createBatch`).** La validación de `min_price` corría item-por-item DENTRO
+del mismo loop que ya insertaba filas en `orders` y descontaba
+`products.stock` para los ítems anteriores — sin transacción. Si el ítem N
+(N > 1) violaba `min_price`, los ítems 1..N-1 ya habían quedado insertados
+como `PENDING` y con su stock ya descontado, pero la respuesta era un 400
+sin ningún `batchId` para poder limpiarlos — huérfanos y stock fantasma sin
+forma de detectarlos. `editBatch` ya tenía el patrón correcto (valida TODO
+el array antes de tocar la DB) desde que se escribió; este fix nunca se
+había aplicado a `createBatch`, el lugar de más volumen de uso.
+
+**Fix:** la validación de `min_price` se separó a su propio loop, que corre
+completo ANTES del loop que inserta/descuenta stock — mismo mensaje de
+error que antes, ningún cambio de contrato de API, solo el orden de
+ejecución. El loop de inserción dejó de re-consultar `min_price`/
+`weight_per_unit` de `products` (ya no hace falta, se validó en el paso
+previo) — la query dentro del loop de inserción quedó reducida a
+`SELECT id, qb_item_id FROM products WHERE barcode = ?`.
+
+**3. Webapp — el total mostrado al aprobar un batch no descontaba las
+cortesías (`app/orders/_components/OrdersClient.tsx`).** `is_courtesy` es
+por ítem (Fase 115.5) — `orders.total` conserva el precio de catálogo
+aunque el ítem se haya vendido a $0 (la línea de QBO sí sale en $0). El
+modal de Ticket ya calculaba bien el total neto (`courtesyTotal`, líneas
+~554-556), pero la celda de Total en la tabla principal y el modal
+"Aprobar y enviar a QBO" seguían usando `batch.total - batch.damageCredits
+- (batch.creditApplied ?? 0)`, SIN restar cortesías. Consecuencia: el admin
+tomaba una decisión financiera irreversible (aprobar → manda a QBO)
+mirando un total más alto de lo que realmente se iba a facturar, sin
+ningún indicio visual de que el número estaba mal.
+
+**Fix:** dos funciones nuevas a nivel de módulo, `courtesyTotalOf(batch)` y
+`netBatchTotal(batch)` (reusan exactamente el mismo cálculo que ya tenía el
+modal de Ticket), aplicadas en la celda de Total de la tabla (antes
+`batch.total - batch.damageCredits - (batch.creditApplied ?? 0)`, ahora
+`netBatchTotal(batch)`) y en el modal de confirmación de aprobación (mismo
+cambio). El modal de Ticket se dejó como estaba (su cálculo ya era
+correcto, no hacía falta tocarlo).
+
+**4. Android — el ticket que se muestra justo después de cerrar una venta
+mostraba el status equivocado y ocultaba los botones Editar/Cancelar
+(`CurrentOrderActivity.kt:1174`, `PreOrderDetailActivity.kt:1073`).**
+Precisión importante encontrada al discutirlo con el usuario: el bug NO
+afecta a todos los tickets — desde Historial (`HistoryActivity.kt:379-388`)
+el `orders_json` sale de datos reales traídos del servidor (`listOrders`),
+con `status`/`userId` correctos, así que ahí los botones siempre se veían
+bien. El bug es específico del camino directo post-checkout
+(`CurrentOrderActivity`/`PreOrderDetailActivity` → `OrderSuccessActivity` →
+`TicketDetailActivity`), donde el `OrderDto` se arma a mano en el cliente
+en vez de venir del servidor.
+
+Ahí, `status` estaba hardcodeado: `if (sent.isOfflinePending) "PENDING"
+else "SENT"` — código escrito para el comportamiento anterior a la Fase
+113; nadie lo actualizó cuando se agregó el flujo de aprobación de admin
+(toda venta online nace `AWAITING_APPROVAL`, nunca `SENT` directo). Además
+el `OrderDto` nunca pasaba `userId`. Consecuencia en
+`TicketDetailActivity.kt:324-327` (`canManageBatch = orderStatus ==
+"AWAITING_APPROVAL" && (isAdminUser || ownsBatch)`): con `status = "SENT"`
+mentiroso, `canManageBatch` daba `false` → los botones Editar/Cancelar no
+aparecían justo después de vender, aunque el batch sí estuviera
+`AWAITING_APPROVAL` en el servidor. Tenía workaround (salir, ir a
+Historial, reabrir el mismo batch — ahí sí aparecían), así que la
+severidad real es "UX molesta con paso alternativo", no "función rota sin
+salida" — se corrigió igual por ser un flujo de uso diario.
+
+**Fix:**
+- `CurrentOrderActivity.kt:1174` — `status` ahora sale de
+  `sent.response.orders.firstOrNull()?.status ?: "AWAITING_APPROVAL"`
+  (dato real que ya venía en `BatchResponse.orders: List<OrderResponse>`,
+  antes ignorado) en vez de hardcodear `"SENT"`. Se agregó
+  `userId = securePrefs.getUserId()`.
+- `PreOrderDetailActivity.kt:1073` — mismo problema, pero acá
+  `ConvertPreOrderResponse` (a diferencia de `BatchResponse`) NO trae un
+  array `orders[]` con status por fila — nunca lo tuvo. Como
+  `convertPreOrder` deja TODAS las filas nuevas en `AWAITING_APPROVAL` de
+  forma uniforme al mandarse online (confirmado en
+  `preOrderController.ts:409`, `UPDATE orders SET status =
+  'AWAITING_APPROVAL', ...`), se usó ese valor fijo en vez de `"SENT"`
+  (no hacía falta pedirle al backend un array que no tiene). También se
+  agregó `userId`.
+
+**Verificación de esta sesión:** `tsc --noEmit` limpio en backend y webapp;
+`./gradlew :app:compileDebugKotlin` → `BUILD SUCCESSFUL` en Android (un
+solo warning preexistente de `SOFT_INPUT_ADJUST_RESIZE`, no relacionado).
+**No se probó contra una base de datos real ni un dispositivo físico** —
+sin acceso a XAMPP/MySQL ni a un TC22 desde esta sesión. El usuario
+desplegó los 3 módulos después de esta sesión (backend, webapp, Android) —
+confirmado por el usuario el mismo 2026-09-11, sin detalle de qué build de
+Android se distribuyó a los TC22.
+
+**Backlog abierto — hallazgos de la misma revisión que NO se tocaron en
+esta sesión** (severidad media/baja, o requieren decisión de negocio antes
+de tocar código):
+
+- **Backend, concurrencia — FIFO de lotes sin lock.**
+  `computeFifoAllocation`/`applyFifoAllocation` (`warehouseController.ts`)
+  son lectura y escritura separadas sin `SELECT ... FOR UPDATE` ni
+  transacción, invocadas desde `addRouteItem`. El `UPDATE` de
+  `remaining_qty` tampoco tiene piso en 0. Dos cargas simultáneas del mismo
+  lote (dos almacenistas, o doble-tap) pueden dejarlo negativo.
+- **Backend, concurrencia — crédito de cliente puede duplicarse.**
+  `creditController.ts:58-68` (`applyCustomerCredit`) lee el balance y
+  recién después inserta el gasto `USED`, sin lock — dos batches
+  concurrentes del mismo cliente pueden ambos pasar la validación contra el
+  mismo balance viejo.
+- **Android — cola offline `pending_batches` nunca se limpia si el
+  servidor rechaza por una razón de negocio (no de red).** `SyncWorker`
+  solo borra la fila si el reintento tiene éxito; un rechazo real deja la
+  fila para siempre, sin que ninguna pantalla la muestre.
+- **Android — carrera entre `SyncWorker` y adjuntar el método de pago.**
+  Si la conectividad vuelve justo entre guardar el batch offline e imprimir
+  el segundo ticket con Cash/Check, el worker puede enviar y borrar la fila
+  de `pending_batches` antes de que `attachPaymentMethodOffline()` "pegue"
+  el pago — y ese resultado no se chequea, así que el ticket puede imprimir
+  un método de pago que nunca quedó guardado en el servidor.
+- **Android — `IssueCreditActivity.saveCredit()` sin protección ante
+  doble tap/timeout.** Puede duplicar un crédito standalone.
+- **Android — `EditBatchActivity` no valida en cliente que el total no
+  baje del crédito ya aplicado** — depende 100% del 400 del backend (que sí
+  muestra bien el mensaje). También permite guardar una línea en 0/0 en vez
+  de sacarla con el botón dedicado.
+- **Android — checkbox "usar stock general" trunca decimales**
+  (`WarehouseRouteDetailActivity.kt:597`, `.toInt()`) — muestra "tengo 2" en
+  vez de "2.9" en productos Lbs. Solo confunde, el backend valida bien
+  igual.
+- **Android — falta `formatQty()` en el resumen de pre-orden dentro de una
+  parada de ruta** (`WarehouseRouteDetailActivity.kt:416-417`,
+  `MyRouteDetailActivity.kt:225-226`) — usa `%.2f` directo, se ve "3.00" en
+  vez de "3" para Case/Unit.
+- **Webapp, concurrencia — `WarehouseClient.loadDetail` puede mezclar
+  datos de dos rutas** si el admin expande una ruta y luego otra antes de
+  que responda la primera fetch — el detalle mostrado puede quedar bajo el
+  header de ruta equivocado. Contraste: `OrdersClient.handleExpand` sí es
+  seguro porque indexa por `batchId` en un `Map`.
+- **Webapp — "Reintentar sync" en Inventario traga errores en silencio**
+  (`InventoryClient.tsx:128-142`, `.catch(() => {})`) — si falla, el botón
+  vuelve a la normalidad sin avisar nada.
+- **Pregunta abierta de negocio, NO de código — semántica de
+  `route_items.quantity` para productos Lbs.** `WarehouseRouteDetailActivity`
+  pide la cantidad a cargar como peso real (consistente con CLAUDE.md, Fase
+  118), pero un comentario en `MyRouteDetailActivity.kt:485` dice
+  "confirmado con el usuario: acá es cantidad de bolsas, no peso" y lo usa
+  así en `ProductDetailActivity.kt:274` (`units =
+  routeLoadedUnits?.toInt()...`) al vender desde una parada de ruta —
+  contradice el propósito documentado de la migración de la Fase 118. Si el
+  criterio real es "peso", el flujo de venta desde rutas para Lbs
+  prefillearía una cantidad de líneas sin sentido, y el indicador
+  rojo/ámbar/verde de vendido-vs-cargado en `MyRouteDetailActivity.kt:469`
+  también quedaría roto (compara conteo de bolsas contra lo que sería
+  peso). **No se tocó código** — hace falta reconfirmar con quien dio el
+  criterio original cuál es el correcto antes de arriesgarse a romper el
+  flujo de venta desde rutas para Lbs.

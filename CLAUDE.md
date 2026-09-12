@@ -419,6 +419,35 @@ venta, y `invoiceId` llega `null` hasta la aprobación — hay que verificar en
 el repo Android si algo depende de esos valores puntuales antes de dar esto
 por cerrado en producción.
 
+**Fix (2026-09-11) — el riesgo de arriba era real: Android hardcodeaba
+`status = "SENT"` en el ticket post-checkout.** Encontrado en un code
+review pre-aprobación. `CurrentOrderActivity.kt`/`PreOrderDetailActivity.kt`
+armaban a mano el `OrderDto` que arma el ticket justo después de vender, sin
+leer el status real devuelto por el servidor — código que quedó de antes de
+esta fase y nadie actualizó. Efecto: `TicketDetailActivity` (que decide
+mostrar Editar/Cancelar solo si `status == 'AWAITING_APPROVAL'`, ver Fase
+117 abajo) nunca mostraba esos botones justo después de cerrar una venta
+—sí se veían bien entrando desde Historial, que trae datos reales del
+servidor. Corregido en Android para leer el status real (o, en el caso de
+`convertPreOrder`, asumir `AWAITING_APPROVAL` — esa respuesta no trae
+`orders[]` por fila, y el backend siempre deja esas filas ahí de forma
+uniforme al convertir online). Detalle completo y otros 3 fixes de la misma
+sesión en `PROGRESS.md`, sesión 2026-09-11.
+
+**Fix (2026-09-11) — `approveBatch`/`retryBatchSync`/`reconcileBatch`
+podían marcar `SENT` un ítem que nunca se facturó en QBO.** Cuando un batch
+mixto tenía ítems inválidos (sin `qb_item_id`, o inactivos en QBO) junto
+con ítems válidos, esos inválidos se marcaban `FAILED` y se excluían de la
+factura real — pero el `UPDATE` de éxito de los 3 endpoints usaba `WHERE
+batch_id = ?` (todo el batch) en vez de filtrar por los ids que realmente
+se facturaron, así que terminaba pisando también a `SENT` los ítems
+`FAILED`, con el mismo `qb_invoice_id`, borrando el `error_log`. Pérdida
+silenciosa de revenue, sin forma de detectarla desde la app. Corregido en
+los 3 endpoints (`WHERE id IN (validIds)`); `reconcileBatch` además no
+tenía el JOIN a `products` que necesitaba para poder distinguir válidos de
+inválidos, se le agregó. Detalle completo en `PROGRESS.md`, sesión
+2026-09-11.
+
 ## Editar / Cancelar venta AWAITING_APPROVAL (Fase 117)
 
 Diseño completo (decisiones y alternativas descartadas) en `PROGRESS.md`.

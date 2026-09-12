@@ -187,19 +187,18 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
       routeLoadedBarcodes = new Set((routeItemRows as any[]).map(r => r.barcode));
     }
 
+    // Validación de min_price ANTES de insertar/descontar stock nada —
+    // mismo criterio que editBatch (ver ese comentario). Antes este chequeo
+    // corría item-por-item dentro del mismo loop que ya insertaba en orders
+    // y descontaba products.stock: si el ítem N violaba min_price, los
+    // ítems 1..N-1 ya habían quedado insertados (PENDING) y con su stock
+    // descontado, pero la respuesta 400 no traía ningún batchId para
+    // limpiarlos — huérfanos y stock fantasma. Con todo el batch validado
+    // de punta a punta primero, un rechazo no deja nada escrito.
     for (const item of items) {
-      const { barcode, product_name, price, quantity, total, unit, case_qty } = item;
-      // Fase 115.5 — cortesía: price/total locales guardan el valor real de
-      // catálogo (reportería, "cuánto se regaló") — el $0 se aplica recién
-      // en la línea de QBO (ver createBatchInvoice/qbInvoices.ts), nunca acá.
-      const isCourtesy = item.is_courtesy ? 1 : 0;
-      const [productRows] = await pool.query('SELECT id, qb_item_id, min_price, weight_per_unit FROM products WHERE barcode = ?', [barcode]) as any[];
+      const { barcode, price } = item;
+      const [productRows] = await pool.query('SELECT min_price, weight_per_unit FROM products WHERE barcode = ?', [barcode]) as any[];
       const product = productRows[0];
-      const qbItemId = product?.qb_item_id ?? null;
-      // product_id (2026-09-07) — vínculo estable a products, ver comentario
-      // en createOrder. Null si el barcode no matchea, nunca bloquea la venta.
-      const productId = product?.id ?? null;
-
       if (product?.min_price != null) {
         const weightPerUnit = parseFloat(product.weight_per_unit) || 1.0;
         const totalPerUnit = Math.round(price * weightPerUnit * 100) / 100;
@@ -210,6 +209,20 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
           return;
         }
       }
+    }
+
+    for (const item of items) {
+      const { barcode, product_name, price, quantity, total, unit, case_qty } = item;
+      // Fase 115.5 — cortesía: price/total locales guardan el valor real de
+      // catálogo (reportería, "cuánto se regaló") — el $0 se aplica recién
+      // en la línea de QBO (ver createBatchInvoice/qbInvoices.ts), nunca acá.
+      const isCourtesy = item.is_courtesy ? 1 : 0;
+      const [productRows] = await pool.query('SELECT id, qb_item_id FROM products WHERE barcode = ?', [barcode]) as any[];
+      const product = productRows[0];
+      const qbItemId = product?.qb_item_id ?? null;
+      // product_id (2026-09-07) — vínculo estable a products, ver comentario
+      // en createOrder. Null si el barcode no matchea, nunca bloquea la venta.
+      const productId = product?.id ?? null;
 
       const decremented = !routeLoadedBarcodes?.has(barcode);
       const [result] = await pool.query(
@@ -389,6 +402,7 @@ export async function approveBatch(req: Request, res: Response): Promise<void> {
       }
       return;
     }
+    const validItemIds = validItems.map((o: any) => o.id);
 
     const reservedInvoiceNumber = validItems[0].reserved_invoice_number ?? await reserveInvoiceNumber();
 
@@ -412,9 +426,13 @@ export async function approveBatch(req: Request, res: Response): Promise<void> {
     // éxito directo como si, tras un error (típicamente timeout), la
     // reconciliación contra QBO confirma que la factura sí se creó.
     const finalizeApproved = async (invoiceId: string | null) => {
+      // Solo los ítems que de verdad entraron en la factura (validItemIds) —
+      // los que se marcaron FAILED más arriba (sin qb_item_id / inactivos en
+      // QBO) nunca se mandaron a createBatchInvoice y no deben pisarse a
+      // SENT solo por compartir batch_id con los que sí se facturaron.
       await pool.query(
-        "UPDATE orders SET status = 'SENT', qb_invoice_id = ?, error_log = NULL, approved_by = ?, approved_at = NOW() WHERE batch_id = ?",
-        [invoiceId, req.user?.id ?? null, batchId]
+        "UPDATE orders SET status = 'SENT', qb_invoice_id = ?, error_log = NULL, approved_by = ?, approved_at = NOW() WHERE id IN (?)",
+        [invoiceId, req.user?.id ?? null, validItemIds]
       );
 
       for (const o of validItems) {
@@ -504,7 +522,9 @@ export async function reconcileBatch(req: Request, res: Response): Promise<void>
     const { batchId } = req.params;
 
     const [orderRows] = await pool.query(
-      'SELECT * FROM orders WHERE batch_id = ?',
+      `SELECT o.*, p.qb_item_id, p.qb_active FROM orders o
+       LEFT JOIN products p ON o.barcode = p.barcode
+       WHERE o.batch_id = ?`,
       [batchId]
     ) as any[];
 
@@ -545,12 +565,19 @@ export async function reconcileBatch(req: Request, res: Response): Promise<void>
 
     const invoiceId = found.DocNumber ?? String(docNumber);
 
+    // Igual que approveBatch/retryBatchSync: si el batch tiene filas ya
+    // FAILED por ser inválidas (sin qb_item_id / inactivas en QBO), esas
+    // nunca entraron en la factura que se acaba de encontrar por DocNumber
+    // — no hay que pisarlas a SENT junto con las que sí se facturaron.
+    const reconciledItems = orderRows.filter((o: any) => o.qb_item_id && o.qb_active !== 0);
+    const reconciledIds = reconciledItems.length > 0 ? reconciledItems.map((o: any) => o.id) : orderRows.map((o: any) => o.id);
+
     await pool.query(
-      "UPDATE orders SET status = 'SENT', qb_invoice_id = ?, error_log = NULL WHERE batch_id = ?",
-      [invoiceId, batchId]
+      "UPDATE orders SET status = 'SENT', qb_invoice_id = ?, error_log = NULL WHERE id IN (?)",
+      [invoiceId, reconciledIds]
     );
 
-    for (const o of orderRows) {
+    for (const o of orderRows.filter((o: any) => reconciledIds.includes(o.id))) {
       await pool.query(
         "INSERT INTO sync_log (entity_type, entity_id, action, qb_status, qb_id) VALUES ('order', ?, 'create_invoice', 'SUCCESS', ?)",
         [o.id, invoiceId]
@@ -743,6 +770,7 @@ export async function retryBatchSync(req: Request, res: Response): Promise<void>
       }
       return;
     }
+    const validItemIds = validItems.map((o: any) => o.id);
 
     const [damageRows] = await pool.query(
       'SELECT barcode, product_name, qty, unit, unit_price, amount, qb_item_id FROM batch_damage WHERE batch_id = ? AND qty > 0',
@@ -797,8 +825,8 @@ export async function retryBatchSync(req: Request, res: Response): Promise<void>
       }
 
       await pool.query(
-        "UPDATE orders SET status = 'SENT', qb_invoice_id = ?, error_log = NULL WHERE batch_id = ?",
-        [invoiceId ?? null, batchId]
+        "UPDATE orders SET status = 'SENT', qb_invoice_id = ?, error_log = NULL WHERE id IN (?)",
+        [invoiceId ?? null, validItemIds]
       );
 
       for (const o of validItems) {
@@ -840,8 +868,8 @@ export async function retryBatchSync(req: Request, res: Response): Promise<void>
         logger.info(`retryBatchSync: batch ${batchId} había fallado (${message}) pero la factura #${docNumber} sí existe en QBO — se toma como éxito`);
         const confirmedInvoiceId = reconciled.DocNumber ?? String(docNumber);
         await pool.query(
-          "UPDATE orders SET status = 'SENT', qb_invoice_id = ?, error_log = NULL WHERE batch_id = ?",
-          [confirmedInvoiceId, batchId]
+          "UPDATE orders SET status = 'SENT', qb_invoice_id = ?, error_log = NULL WHERE id IN (?)",
+          [confirmedInvoiceId, validItemIds]
         );
         for (const o of validItems) {
           await pool.query(
