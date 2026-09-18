@@ -5695,3 +5695,172 @@ de tocar código):
   peso). **No se tocó código** — hace falta reconfirmar con quien dio el
   criterio original cuál es el correcto antes de arriesgarse a romper el
   flujo de venta desde rutas para Lbs.
+
+---
+
+## Sesión 2026-09-18 — Rutas del día (admin) + carga/venta por parada + reconciliación por cliente
+
+Sesión larga a partir de feedback del cliente sobre el módulo Almacén tras
+probarlo en producción. Pasó por varias vueltas de diseño con el usuario
+antes de asentarse — se documenta el diseño **final**, con una nota de qué
+se descartó en el camino porque quedó parcialmente implementado y revertido.
+
+### Diseño final
+
+**El admin ya no arma rutas.** Solo mantiene, desde un apartado nuevo del
+dashboard, una lista de **qué clientes hay que visitar cada día** —
+`route_day_stops` (tabla nueva: `scheduled_date`, `customer_id`,
+`customer_name`, `assigned_route_id`, `UNIQUE(scheduled_date, customer_id)`
+— un cliente no puede repetirse el mismo día, decisión confirmada con el
+usuario). El almacenista sigue creando/armando la ruta (camión, repartidor,
+paradas, orden, carga) exactamente como antes — lo único que cambió es que
+`addStop` ahora exige, **solo para paradas tipo `CUSTOMER`**, que ese cliente
+ya esté en la lista del día sin tomar (`assigned_route_id IS NULL`); al
+agregarlo a una ruta real queda "tomado", y se libera si se lo saca de esa
+ruta (`removeStop`). BATCH/PRE_ORDER/CONSIGNMENT quedan afuera de esta
+restricción — una pre-orden confirmada o un pedido ya facturado ya son su
+propia aprobación, y CONSIGNMENT es una parada espontánea de campo.
+
+**Vueltas de diseño descartadas en el camino** (para que quede el porqué,
+no solo el resultado): primero se implementó con el admin creando la ruta
+completa (nombre/fecha/repartidor) con sus paradas — se revirtió, el
+almacenista sigue creando la ruta. Después se implementó `route_day_stops`
+con 3 tipos (BATCH/PRE_ORDER/CUSTOMER, con auto-sugerencia desde pedidos/
+pre-órdenes) — se simplificó a solo CUSTOMER a pedido del usuario ("solo
+quiero poder seleccionar el día y a qué customer va asignado"), sacando
+`stop_type`/`batch_id`/`pre_order_id` de la tabla.
+
+**Carga y venta ahora son por parada, no por toda la ruta.** `route_items`
+ganó `route_stop_id` (obligatorio en la práctica, `addRouteItem` lo exige;
+la columna queda NULLable por si se borra la parada después de cargar,
+`ON DELETE SET NULL`). En Android, cargar en una ruta no-directa ahora pide
+primero "Cargando para: [Cliente] ▾" (autocompletado si hay una sola
+parada); al elegir una parada BATCH/PRE_ORDER se muestra una referencia
+auto-sugerida (`GET /api/routes/:id/stops/:stopId/expected-items`, lee
+`orders`/`pre_order_items` de esa venta/pre-orden — solo informativo, el
+almacenista sigue confirmando cantidades reales al escanear). En "Mis
+rutas", mientras se vende a un cliente, la lista de "Cargado" y el
+indicador vendido-vs-cargado se filtran a lo de ESE cliente en vez de toda
+la ruta — que era el pedido original del usuario ("necesito que el
+operator sepa qué productos son para cada cliente, para que no venda de
+más").
+
+**`route_stops.batch_id` ahora también se vincula para paradas CUSTOMER.**
+Antes solo lo traían las paradas BATCH desde que se creaban; una venta
+"desde cero" en una parada CUSTOMER nunca quedaba vinculada a su parada.
+`updateStopStatus` ahora acepta `batch_id` opcional en el body y lo setea
+(solo si estaba `NULL`) al marcar `DELIVERED` — Android se lo manda desde
+`CurrentOrderActivity.markRouteStopDeliveredIfAny()` con el batch recién
+creado. Esto es lo que permite que la reconciliación sepa qué se vendió en
+una parada CUSTOMER puntual, no solo en las BATCH.
+
+**Reconciliación (`getExpectedReturns`) desglosada por cliente — con una
+aproximación explícita para lo devuelto.** Cargado y vendido se calculan
+exactos por parada (route_items.route_stop_id / route_stops.batch_id). Lo
+devuelto (`route_returns`) y lo liquidado de consignación siguen siendo a
+nivel RUTA nomás — físicamente no hay forma de saber de qué parada volvió
+cada unidad una vez que todo vuelve mezclado en el mismo camión — así que
+se reparte con un algoritmo greedy determinístico (por orden de posición
+de parada, llenando la capacidad libre de cada una antes de pasar a la
+siguiente), documentado en el código como aproximación, no como dato real
+registrado. La pantalla de conteo físico (`RouteReturnsActivity`, Android)
+sigue siendo por PRODUCTO nomás — se fusionan las filas por parada de
+vuelta a una sola antes de armar los inputs, porque contar devoluciones
+por cliente no tiene sentido físico y además `createReturns` rechaza dos
+líneas GOOD del mismo producto en el mismo request.
+
+### Bugs encontrados y arreglados durante las pruebas de esta sesión
+
+- **`isLocked()` (Android) y 6 endpoints del backend no contemplaban
+  `COMPLETED`**, solo `CANCELLED` y `returns_reviewed_at` — una ruta ya
+  completada dejaba seguir cargando productos, agregando/quitando paradas,
+  reordenando, etc. Arreglado en `WarehouseRouteDetailActivity.isLocked()`
+  y en `addStop`/`removeStop`/`reorderStops`/`updateStopStatus`/
+  `addRouteItem`/`removeRouteItem`/`registerConsignment`
+  (`routeController.ts`) — todos ahora rechazan con "Ruta completada: no se
+  puede modificar". `settleConsignment` se dejó sin este bloqueo a
+  propósito (liquidar consignación es un paso que legítimamente pasa
+  después, a veces en otra visita). Se agregó también un banner en Android
+  explicando por qué los botones quedaron apagados (antes solo existía
+  para "devoluciones ya revisadas").
+- **`deleteRoute` no decía CUÁL venta bloqueaba la cancelación de la
+  ruta.** El mensaje genérico ("ya tiene al menos una entrega/venta
+  completada") hacía parecer que una venta ya cancelada seguía bloqueando,
+  cuando en realidad era OTRA parada de la misma ruta con una venta todavía
+  activa. Ahora el error lista los batches activos que están bloqueando
+  (`Ventas activas: Pancho Villa SY (batch xxx)`).
+- **Cliente duplicado el mismo día sin validar.** `createDayStop` ahora
+  chequea explícito antes de insertar (mensaje claro) y la tabla tiene un
+  `UNIQUE KEY (scheduled_date, customer_id)` real como red de seguridad
+  ante una carrera. El modal de "Agregar" en `/routes` también excluye del
+  buscador a los clientes que ya están en la lista del día elegido.
+- **El botón "Vender" de otras paradas quedaba tocable mientras había una
+  venta en curso** con otro cliente — podía pisar el contexto activo
+  (`SecurePreferences`) a mitad de una venta sin mandar. Ahora queda
+  visible pero deshabilitado (`MyRouteDetailActivity.renderStops`)
+  mientras `anySellingActive` es true para otra parada.
+- **Producto ya vendido se veía igual que pendiente** en la vista general
+  de "Cargado" (el momento entre terminar con un cliente y arrancar con el
+  siguiente, sin parada activa). Ahora muestra un badge "· Vendido" cuando
+  la parada de ese ítem ya está `DELIVERED`.
+
+### SQL corrido durante esta sesión (ya aplicado en la base del usuario)
+
+```sql
+CREATE TABLE IF NOT EXISTS route_day_stops (
+  id                INT AUTO_INCREMENT PRIMARY KEY,
+  scheduled_date    DATE NOT NULL,
+  customer_id       VARCHAR(50) NOT NULL,
+  customer_name     VARCHAR(255) NOT NULL,
+  assigned_route_id INT DEFAULT NULL,
+  created_by        INT DEFAULT NULL,
+  created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_day_stops_date (scheduled_date),
+  FOREIGN KEY (assigned_route_id) REFERENCES routes(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+ALTER TABLE route_day_stops ADD UNIQUE KEY uniq_day_customer (scheduled_date, customer_id);
+
+ALTER TABLE route_items
+  ADD COLUMN route_stop_id INT DEFAULT NULL AFTER product_id,
+  ADD CONSTRAINT fk_route_items_stop FOREIGN KEY (route_stop_id) REFERENCES route_stops(id) ON DELETE SET NULL;
+ALTER TABLE route_items ADD UNIQUE KEY route_product_stop (route_id, product_id, route_stop_id);
+ALTER TABLE route_items DROP INDEX route_product;
+```
+
+`route_items` existentes de antes de esta fecha quedan con `route_stop_id
+= NULL` — no hay forma de reconstruir a quién correspondían, no rompe
+nada, simplemente no muestran cliente en la UI para lo histórico.
+
+### Backlog abierto — no se tocó en esta sesión
+
+- **Ticket de recepción con lote y fecha de expiración** (pedido original
+  del cliente, sin empezar).
+- **Cortesías individuales por unidad suelta**, no solo por caja completa
+  (sin empezar).
+- **Motivo obligatorio al cancelar/saltear una parada de ruta** — "por qué
+  no fue a esa ruta" (sin empezar).
+- **Ver quién editó o canceló una venta, en el dashboard** — el dato ya
+  existe en `activity_log`/`orders.voided_by`, solo falta mostrarlo en
+  `/orders` (sin empezar).
+- **Pantalla obligatoria de notas/feedback** después del segundo ticket —
+  falta definir con el usuario qué es exactamente "el segundo ticket" y si
+  las notas necesitan verse en el dashboard (sin empezar).
+- **Múltiples camiones al mismo cliente el mismo día** — hoy no se puede
+  (`UNIQUE(scheduled_date, customer_id)` en `route_day_stops`), decisión
+  explícita del usuario de dejarlo así por ahora ("dejemoslo así").
+- **Reparto de devoluciones por cliente es una aproximación**, no un dato
+  real (ver diseño arriba) — el usuario lo aceptó así, pero vale
+  recordarlo si en algún momento se necesita precisión real ahí.
+
+### Verificación
+
+Backend (`tsc --noEmit`), webapp (`tsc --noEmit` + página servida sin
+errores contra el dev server) y Android (`:app:compileDebugKotlin`)
+compilan limpio. **Nada de esto se probó contra una base de datos real ni
+en un dispositivo físico más allá de las pruebas manuales que hizo el
+usuario en su propia base durante la sesión** (confirmó el flujo completo:
+crear día → agregar clientes → almacenista arma ruta → carga por parada →
+vende → cancela una venta → revisa devoluciones). Backend no desplegado a
+producción, webapp de producción sin el build nuevo, sin APK nuevo
+generado/distribuido a los TC22.
