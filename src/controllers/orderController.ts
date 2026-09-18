@@ -12,6 +12,26 @@ import { logActivity } from '../services/activityLog.ts';
 // ("A business validation error has occurred..."). El motivo real queda en
 // `.description` (o `.fault.errors[0].detail`), que es lo que de verdad sirve
 // para diagnosticar (factura duplicada, item inactivo, cliente inválido, etc).
+// Fase 117 (fix) — un batch AWAITING_APPROVAL sigue técnicamente editable/
+// cancelable aunque pertenezca a una ruta cuyas devoluciones ya revisó el
+// almacén (routes.returns_reviewed_at). Esa revisión ya asumió como
+// definitivo lo que salió/volvió del camión para esa venta — editar o
+// cancelarla después descuadra el sub-inventario sin que nada lo detecte.
+// Sin filtro de stop_type: un batch vendido "por scratch" en una parada
+// CUSTOMER también queda con rs.batch_id seteado (retroactivo, ver más abajo
+// en createBatch) aunque esa parada no sea 'BATCH' — mismo criterio ya usado
+// en getExpectedReturns (routeController.ts) para esta misma ambigüedad.
+// route_stops.batch_id nunca se setea para paradas PRE_ORDER, así que no
+// hace falta distinguir por tipo para saber "pertenece a esta ruta".
+async function getReviewedRouteForBatch(batchId: unknown): Promise<{ id: number; name: string } | null> {
+  const [rows] = await pool.query(
+    `SELECT r.id, r.name FROM route_stops rs JOIN routes r ON r.id = rs.route_id
+     WHERE rs.batch_id = ? AND r.returns_reviewed_at IS NOT NULL LIMIT 1`,
+    [batchId]
+  ) as any[];
+  return rows[0] ?? null;
+}
+
 function extractQboErrorMessage(err: unknown): string {
   if (err && typeof err === 'object') {
     const e = err as any;
@@ -79,9 +99,10 @@ export async function listOrders(req: Request, res: Response): Promise<void> {
 
     let query = `SELECT o.id, o.barcode, o.product_name, o.price, o.quantity, o.total, o.status, o.batch_id, o.qb_invoice_id, o.reserved_invoice_number, o.device_id, o.user_id, o.customer_id, o.customer_name, o.unit, o.case_qty, o.payment_method, o.check_number, o.credit_applied, o.is_courtesy, o.created_at, u.email AS user_email, u.name AS user_name,
       (SELECT COALESCE(SUM(bd.amount), 0) FROM batch_damage bd WHERE bd.batch_id = o.batch_id AND bd.qty > 0) AS damage_credits,
-      (SELECT r.id FROM route_stops rs JOIN routes r ON r.id = rs.route_id WHERE rs.batch_id = o.batch_id AND rs.stop_type = 'BATCH' LIMIT 1) AS route_id,
-      (SELECT r.name FROM route_stops rs JOIN routes r ON r.id = rs.route_id WHERE rs.batch_id = o.batch_id AND rs.stop_type = 'BATCH' LIMIT 1) AS route_name,
-      (SELECT r.scheduled_date FROM route_stops rs JOIN routes r ON r.id = rs.route_id WHERE rs.batch_id = o.batch_id AND rs.stop_type = 'BATCH' LIMIT 1) AS route_date
+      (SELECT r.id FROM route_stops rs JOIN routes r ON r.id = rs.route_id WHERE rs.batch_id = o.batch_id LIMIT 1) AS route_id,
+      (SELECT r.name FROM route_stops rs JOIN routes r ON r.id = rs.route_id WHERE rs.batch_id = o.batch_id LIMIT 1) AS route_name,
+      (SELECT r.scheduled_date FROM route_stops rs JOIN routes r ON r.id = rs.route_id WHERE rs.batch_id = o.batch_id LIMIT 1) AS route_date,
+      (SELECT r.returns_reviewed_at FROM route_stops rs JOIN routes r ON r.id = rs.route_id WHERE rs.batch_id = o.batch_id LIMIT 1) AS route_returns_reviewed_at
       FROM orders o LEFT JOIN users u ON o.user_id = u.id WHERE 1=1`;
     const params: any[] = [];
 
@@ -976,6 +997,12 @@ export async function cancelBatch(req: Request, res: Response): Promise<void> {
       return;
     }
 
+    const reviewedRoute = await getReviewedRouteForBatch(batchId);
+    if (reviewedRoute) {
+      res.status(400).json({ error: `Esta venta ya no se puede cancelar: el almacén ya revisó las devoluciones de la ruta "${reviewedRoute.name}" a la que pertenece.` });
+      return;
+    }
+
     // Revertir stock — solo las filas que de verdad lo habían descontado
     // (orders.stock_decremented, ver createBatch). Un ítem cargado desde una
     // ruta nunca se descontó acá, así que revertirlo sería incorrecto.
@@ -1057,6 +1084,12 @@ export async function editBatch(req: Request, res: Response): Promise<void> {
 
     if (orderRows.some((o: any) => o.status !== 'AWAITING_APPROVAL')) {
       res.status(400).json({ error: `Esta venta ya no se puede editar desde la app (status actual: ${orderRows[0].status}). Solo se puede editar mientras está esperando aprobación del administrador.` });
+      return;
+    }
+
+    const reviewedRoute = await getReviewedRouteForBatch(batchId);
+    if (reviewedRoute) {
+      res.status(400).json({ error: `Esta venta ya no se puede editar: el almacén ya revisó las devoluciones de la ruta "${reviewedRoute.name}" a la que pertenece.` });
       return;
     }
 
