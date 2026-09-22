@@ -2,6 +2,8 @@ import { Router } from 'express';
 import {
   listWarehouses,
   createReceipt,
+  listReceipts,
+  getReceiptDetail,
   listLots,
   suggestLots,
   getUnbackedStock,
@@ -21,6 +23,8 @@ const router = Router();
 
 router.get('/warehouses',                auth,               listWarehouses);
 router.post('/receipts',                 auth, warehouseOnly, createReceipt);
+router.get('/receipts',                  auth, warehouseOnly, listReceipts);
+router.get('/receipts/:receiptBatchId',  auth, warehouseOnly, getReceiptDetail);
 router.get('/lots',                      auth, warehouseOnly, listLots);
 router.get('/lots/suggest',              auth, warehouseOnly, suggestLots);
 router.get('/lots/unbacked',             auth, warehouseOnly, getUnbackedStock);

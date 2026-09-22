@@ -63,6 +63,10 @@ async function ensureTables() {
       customer_id   VARCHAR(50) DEFAULT NULL,
       customer_name VARCHAR(255) DEFAULT NULL,
       status        ENUM('PENDING','DELIVERED','SKIPPED') DEFAULT 'PENDING',
+      -- skip_reason (Fase 120) — obligatorio cuando status='SKIPPED'
+      -- (validado en updateStopStatus, no a nivel de columna porque el
+      -- resto de los status no lo necesitan). NULL en cualquier otro caso.
+      skip_reason   VARCHAR(255) DEFAULT NULL,
       created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (route_id) REFERENCES routes(id) ON DELETE CASCADE
     )
@@ -520,6 +524,63 @@ export async function createDayStop(req: Request, res: Response): Promise<void> 
   }
 }
 
+// Fase 121 — "Copiar a otra fecha" (pedido explícito del usuario, 2026-09-18):
+// un cliente que va todos los viernes obligaba a re-cargarlo a mano cada
+// semana. En vez de un motor de recurrencia (día de la semana fijo, qué
+// pasa si un cliente recurrente se cancela una semana puntual, etc.) se
+// eligió lo más simple: duplicar la lista de clientes de un día ya armado a
+// otra fecha, con un clic, cuando el admin decida hacerlo — nunca automático.
+// Nunca copia `assigned_route_id` — la fecha destino arranca sin ninguna
+// ruta armada todavía, igual que un día nuevo cualquiera. Clientes que ya
+// estén en la fecha destino se saltean (no son error — hace que el botón se
+// pueda apretar más de una vez sin romper nada, ej. si ya se había
+// agregado alguno a mano antes de copiar el resto).
+export async function copyDayStops(req: Request, res: Response): Promise<void> {
+  await ensureDayStopsTable();
+  try {
+    const { from_date, to_date } = req.body;
+    if (!from_date || !to_date) {
+      res.status(400).json({ error: 'from_date y to_date son requeridos' });
+      return;
+    }
+    if (from_date === to_date) {
+      res.status(400).json({ error: 'from_date y to_date no pueden ser el mismo día' });
+      return;
+    }
+
+    const [sourceRows] = await pool.query(
+      'SELECT customer_id, customer_name FROM route_day_stops WHERE scheduled_date = ?',
+      [from_date]
+    ) as any[];
+    if ((sourceRows as any[]).length === 0) {
+      res.status(404).json({ error: 'No hay clientes cargados en la fecha de origen' });
+      return;
+    }
+
+    const [existingRows] = await pool.query(
+      'SELECT customer_id FROM route_day_stops WHERE scheduled_date = ?',
+      [to_date]
+    ) as any[];
+    const existingIds = new Set((existingRows as any[]).map(r => r.customer_id));
+
+    let copied = 0;
+    let skipped = 0;
+    for (const row of sourceRows as any[]) {
+      if (existingIds.has(row.customer_id)) { skipped++; continue; }
+      await pool.query(
+        'INSERT INTO route_day_stops (scheduled_date, customer_id, customer_name, created_by) VALUES (?, ?, ?, ?)',
+        [to_date, row.customer_id, row.customer_name, req.user?.id ?? null]
+      );
+      copied++;
+    }
+
+    res.status(201).json({ copied, skipped });
+  } catch (err) {
+    logger.error('copyDayStops error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
 export async function listDayStops(req: Request, res: Response): Promise<void> {
   await ensureDayStopsTable();
   try {
@@ -801,9 +862,17 @@ export async function updateStopStatus(req: Request, res: Response): Promise<voi
   try {
     const { id, stopId } = req.params;
     if (typeof id !== 'string') { res.status(400).json({ error: 'id de ruta es requerido' }); return; }
-    const { status, batch_id } = req.body;
+    const { status, batch_id, reason } = req.body;
     if (!['PENDING', 'DELIVERED', 'SKIPPED'].includes(status)) {
       res.status(400).json({ error: "status debe ser 'PENDING', 'DELIVERED' o 'SKIPPED'" });
+      return;
+    }
+    // Fase 120 — motivo obligatorio al saltear una parada ("por qué no fue a
+    // esa ruta"), pedido explícito del usuario. Solo aplica al pasar a
+    // SKIPPED — volver a PENDING/DELIVERED no lo necesita.
+    const trimmedReason = typeof reason === 'string' ? reason.trim() : '';
+    if (status === 'SKIPPED' && !trimmedReason) {
+      res.status(400).json({ error: 'Se requiere un motivo para saltear esta parada' });
       return;
     }
     const [[routeRow]] = await pool.query('SELECT status, driver_user_id FROM routes WHERE id = ?', [id]) as any[];
@@ -823,8 +892,13 @@ export async function updateStopStatus(req: Request, res: Response): Promise<voi
       res.status(403).json({ error: 'Acceso denegado: esta ruta no está asignada a vos' });
       return;
     }
+    // skip_reason solo se pisa cuando de verdad se está saltando la parada —
+    // volver a PENDING/DELIVERED después de un SKIPPED lo limpia (ya no
+    // aplica), en vez de dejar un motivo viejo colgado de un estado que ya
+    // no es SKIPPED.
     const [result] = await pool.query(
-      'UPDATE route_stops SET status = ? WHERE id = ? AND route_id = ?', [status, stopId, id]
+      'UPDATE route_stops SET status = ?, skip_reason = ? WHERE id = ? AND route_id = ?',
+      [status, status === 'SKIPPED' ? trimmedReason : null, stopId, id]
     ) as any;
     if ((result as any).affectedRows === 0) {
       res.status(404).json({ error: 'Parada no encontrada' });

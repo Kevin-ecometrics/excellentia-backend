@@ -52,6 +52,14 @@ export async function ensureWarehouseTables(): Promise<void> {
       warehouse_id     INT NOT NULL,
       product_id       INT NOT NULL,
       barcode          VARCHAR(50) DEFAULT NULL,
+      -- lot_number (Fase 120) — el número de lote REAL que trae el
+      -- proveedor/cliente en la caja, escrito a mano por el almacenista al
+      -- recibir. Nada que ver con "id" (autoincremental interno, nunca
+      -- visible al usuario) — dos productos pueden compartir el mismo
+      -- lot_number del proveedor pero cada uno es su propia fila acá.
+      -- NULL = el producto no trae número de lote (opción explícita en el
+      -- modal de recepción, no un campo salteado sin querer).
+      lot_number       VARCHAR(100) DEFAULT NULL,
       expiration_date  DATE DEFAULT NULL,
       received_qty     DECIMAL(10,2) NOT NULL,
       remaining_qty    DECIMAL(10,2) NOT NULL,
@@ -341,6 +349,10 @@ export async function createReceipt(req: Request, res: Response): Promise<void> 
 
     for (const line of items) {
       const { barcode, product_id, expiration_date } = line;
+      // lot_number (Fase 120) — string libre tipeado por el almacenista, o
+      // NULL si tildó "sin número de lote" en el modal de recepción. Se
+      // normaliza acá (trim, '' -> null) por si el cliente manda espacios.
+      const lotNumber = typeof line.lot_number === 'string' && line.lot_number.trim() ? line.lot_number.trim() : null;
       const qty = Number(line.quantity);
       if (!barcode && !product_id) {
         results.push({ error: 'barcode o product_id es requerido', line });
@@ -352,17 +364,17 @@ export async function createReceipt(req: Request, res: Response): Promise<void> 
       }
 
       const [[product]] = product_id
-        ? await pool.query('SELECT id, barcode, name FROM products WHERE id = ?', [product_id]) as any[]
-        : await pool.query('SELECT id, barcode, name FROM products WHERE barcode = ?', [barcode]) as any[];
+        ? await pool.query('SELECT id, barcode, name, unit FROM products WHERE id = ?', [product_id]) as any[]
+        : await pool.query('SELECT id, barcode, name, unit FROM products WHERE barcode = ?', [barcode]) as any[];
       if (!product) {
         results.push({ error: 'Producto no encontrado', line });
         continue;
       }
 
       const [insertResult] = await pool.query(
-        `INSERT INTO product_lots (receipt_batch_id, warehouse_id, product_id, barcode, expiration_date, received_qty, remaining_qty, received_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [receiptBatchId, warehouseId, product.id, product.barcode ?? null, expiration_date ?? null, qty, qty, req.user?.id ?? null]
+        `INSERT INTO product_lots (receipt_batch_id, warehouse_id, product_id, barcode, lot_number, expiration_date, received_qty, remaining_qty, received_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [receiptBatchId, warehouseId, product.id, product.barcode ?? null, lotNumber, expiration_date ?? null, qty, qty, req.user?.id ?? null]
       ) as any;
       const lotId = insertResult.insertId;
 
@@ -372,8 +384,14 @@ export async function createReceipt(req: Request, res: Response): Promise<void> 
         quantity: qty, createdBy: req.user?.id ?? null,
       });
 
+      // barcode/unit (Fase 120) — para que Android pueda imprimir un ticket
+      // de recepción con lote + expiración sin tener que resolver el
+      // producto de nuevo contra el catálogo local. lot_number es el número
+      // real del proveedor (lo que se imprime en el ticket) — lot_id sigue
+      // yendo también, por si hace falta referenciar el registro interno.
       results.push({
-        lot_id: lotId, product_id: product.id, product_name: product.name,
+        lot_id: lotId, lot_number: lotNumber, product_id: product.id, product_name: product.name,
+        barcode: product.barcode ?? null, unit: product.unit ?? null,
         quantity: qty, expiration_date: expiration_date ?? null, qb_synced: qbSyncedToDb(qbSynced),
       });
     }
@@ -385,13 +403,86 @@ export async function createReceipt(req: Request, res: Response): Promise<void> 
   }
 }
 
+// Fase 120 (addendum) — pestaña nueva "Recibos" en el Sub-inventario
+// (Android/webapp): agrupa las líneas de `product_lots` por
+// `receipt_batch_id` (cada recepción del almacenista es un solo grupo,
+// aunque hayan sido 4 productos distintos) para poder buscar una recepción
+// pasada y reimprimir su ticket completo — hoy no hay forma de recuperar un
+// ticket de recepción viejo si se perdió/no salió bien la primera vez.
+// Excluye recepciones de `backfill-` (no son recepciones reales, ver
+// backfillLots) — no tiene sentido "reimprimir" un ajuste de apertura.
+export async function listReceipts(req: Request, res: Response): Promise<void> {
+  await ensureWarehouseTables();
+  try {
+    const { search, page, limit } = req.query;
+    const pageNum = parseInt(page as string) || 1;
+    const limitNum = parseInt(limit as string) || 20;
+    const offset = (pageNum - 1) * limitNum;
+
+    let query = `
+      SELECT pl.receipt_batch_id, MIN(pl.received_at) AS received_at,
+             MIN(pl.warehouse_id) AS warehouse_id, MIN(w.name) AS warehouse_name,
+             COUNT(*) AS item_count, MIN(u.name) AS received_by_name
+      FROM product_lots pl
+      LEFT JOIN warehouses w ON w.id = pl.warehouse_id
+      LEFT JOIN users u ON u.id = pl.received_by
+      WHERE pl.receipt_batch_id NOT LIKE 'backfill-%'
+    `;
+    const params: any[] = [];
+    // Buscar por número de recepción o por cualquier producto que haya
+    // venido en ese grupo — el almacenista rara vez recuerda el
+    // receipt_batch_id de memoria, pero sí qué productos recibió.
+    if (search) {
+      query += ` AND pl.receipt_batch_id IN (
+        SELECT pl2.receipt_batch_id FROM product_lots pl2 JOIN products p2 ON p2.id = pl2.product_id
+        WHERE pl2.receipt_batch_id LIKE ? OR p2.name LIKE ? OR pl2.lot_number LIKE ?
+      )`;
+      const like = `%${search}%`;
+      params.push(like, like, like);
+    }
+    query += ' GROUP BY pl.receipt_batch_id ORDER BY received_at DESC LIMIT ? OFFSET ?';
+    params.push(limitNum, offset);
+
+    const [rows] = await pool.query(query, params) as any[];
+    res.json({ data: rows });
+  } catch (err) {
+    logger.error('listReceipts error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
+// Detalle de una recepción puntual — mismo shape que los `items` que ya
+// devuelve `createReceipt` (sin `qb_synced`, que es un resultado de ese
+// momento puntual, no un dato persistido) para que Android reuse
+// `PrintService.printReceiptTicket()` tal cual, sin un modelo aparte.
+export async function getReceiptDetail(req: Request, res: Response): Promise<void> {
+  try {
+    const { receiptBatchId } = req.params;
+    const [rows] = await pool.query(
+      `SELECT pl.id AS lot_id, pl.lot_number, pl.product_id, p.name AS product_name,
+              pl.barcode, p.unit, pl.received_qty AS quantity, pl.expiration_date
+       FROM product_lots pl JOIN products p ON p.id = pl.product_id
+       WHERE pl.receipt_batch_id = ? ORDER BY pl.id`,
+      [receiptBatchId]
+    ) as any[];
+    if ((rows as any[]).length === 0) {
+      res.status(404).json({ error: 'Recepción no encontrada' });
+      return;
+    }
+    res.json({ receipt_batch_id: receiptBatchId, items: rows });
+  } catch (err) {
+    logger.error('getReceiptDetail error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
 export async function listLots(req: Request, res: Response): Promise<void> {
   await ensureWarehouseTables();
   try {
     const { warehouse_id, product_id, status } = req.query;
     let query = `
       SELECT pl.id, pl.receipt_batch_id, pl.warehouse_id, pl.product_id, pl.barcode,
-             pl.expiration_date, pl.received_qty, pl.remaining_qty, pl.status, pl.received_at,
+             pl.lot_number, pl.expiration_date, pl.received_qty, pl.remaining_qty, pl.status, pl.received_at,
              p.name AS product_name, p.sku, p.unit
       FROM product_lots pl JOIN products p ON p.id = pl.product_id
       WHERE 1=1
@@ -624,7 +715,7 @@ export async function updateLot(req: Request, res: Response): Promise<void> {
   await ensureWarehouseTables();
   try {
     const { id } = req.params;
-    const { quantity, expiration_date } = req.body;
+    const { quantity, expiration_date, lot_number } = req.body;
 
     const [[lot]] = await pool.query(
       'SELECT id, warehouse_id, product_id, received_qty, remaining_qty, status FROM product_lots WHERE id = ?', [id]
@@ -661,8 +752,12 @@ export async function updateLot(req: Request, res: Response): Promise<void> {
       updates.push('expiration_date = ?');
       params.push(expiration_date ?? null);
     }
+    if (lot_number !== undefined) {
+      updates.push('lot_number = ?');
+      params.push(typeof lot_number === 'string' && lot_number.trim() ? lot_number.trim() : null);
+    }
     if (updates.length === 0) {
-      res.status(400).json({ error: 'Nada para actualizar — mandá quantity y/o expiration_date' });
+      res.status(400).json({ error: 'Nada para actualizar — mandá quantity, expiration_date y/o lot_number' });
       return;
     }
 

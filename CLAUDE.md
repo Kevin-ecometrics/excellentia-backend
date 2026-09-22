@@ -54,6 +54,7 @@ src/
 | POST | `/api/orders/batch/:batchId/reconcile` | JWT+admin | Chequeo de solo lectura contra QBO por DocNumber para un batch FAILED/PENDING — sin reintentar el envío. Ver "Fix (2026-09-01)" abajo |
 | POST | `/api/orders/batch/:batchId/cancel` | JWT | Cancela un batch AWAITING_APPROVAL (revierte stock y créditos, 100% local). Disponible para el operador dueño del batch, no solo admin — ver "Fase 117" abajo |
 | POST | `/api/orders/batch/:batchId/edit` | JWT | Reemplaza los ítems de un batch AWAITING_APPROVAL (agregar/quitar/modificar), se queda esperando aprobación. Disponible para el operador dueño del batch, no solo admin — ver "Fase 117" abajo |
+| POST | `/api/orders/batch/:batchId/feedback` | JWT | Guarda (upsert) la nota de feedback obligatoria post-venta de Android (Fase 120), visible en `listOrders`/`/orders` de la webapp |
 | GET | `/api/products` | JWT | Listar productos — `?search=` matchea `name`/`barcode`/**`sku`** (Fase 108), `?sort=sku` ordena por secuencia NEW_SKU (marca A-Z, luego 001, 002…; sin NEW_SKU al final) |
 | GET | `/api/customers` | JWT | Clientes QB |
 | GET | `/api/customers/:customerId` | JWT | Un solo cliente — cache-first contra `cached_customers`, fallback a QB (Fase 102, ticket Android necesitaba resolver dirección para reprint) |
@@ -251,6 +252,10 @@ ALTER TABLE route_items MODIFY COLUMN quantity DECIMAL(10,2) NOT NULL DEFAULT 0;
 -- orders.product_id — vínculo estable a products, no frágil a que cambie el
 -- barcode después de la venta. Aditiva/nullable, no afecta órdenes viejas.
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_id INT NULL AFTER barcode;
+-- Fase 120 — motivo obligatorio al saltear una parada de ruta.
+ALTER TABLE route_stops ADD COLUMN IF NOT EXISTS skip_reason VARCHAR(255) DEFAULT NULL AFTER status;
+-- Fase 120 (addendum) — número de lote real del proveedor, distinto del `id` interno de product_lots.
+ALTER TABLE product_lots ADD COLUMN IF NOT EXISTS lot_number VARCHAR(100) DEFAULT NULL AFTER barcode;
 ```
 
 **`orders.unit`/`case_qty` — por qué importan para el ticket:** `unit` es el tipo de venta (Lbs/Case/Unit/Bucket) y `case_qty` las unidades por caja (`products.qty` cuando `unit = "Case"`, copiado al momento de la venta). Sin estos dos campos guardados en `orders`, reimprimir un pedido desde Historial no puede saber si era por peso o por caja — `listOrders` los expone ahora junto al resto de columnas.

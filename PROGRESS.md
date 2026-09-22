@@ -5834,18 +5834,16 @@ nada, simplemente no muestran cliente en la UI para lo histórico.
 
 ### Backlog abierto — no se tocó en esta sesión
 
-- **Ticket de recepción con lote y fecha de expiración** (pedido original
-  del cliente, sin empezar).
-- **Cortesías individuales por unidad suelta**, no solo por caja completa
-  (sin empezar).
-- **Motivo obligatorio al cancelar/saltear una parada de ruta** — "por qué
-  no fue a esa ruta" (sin empezar).
-- **Ver quién editó o canceló una venta, en el dashboard** — el dato ya
-  existe en `activity_log`/`orders.voided_by`, solo falta mostrarlo en
-  `/orders` (sin empezar).
-- **Pantalla obligatoria de notas/feedback** después del segundo ticket —
-  falta definir con el usuario qué es exactamente "el segundo ticket" y si
-  las notas necesitan verse en el dashboard (sin empezar).
+- ~~Ticket de recepción con lote y fecha de expiración~~ — implementado en
+  la Fase 120.
+- ~~Cortesías individuales por unidad suelta, no solo por caja completa~~
+  — implementado en la Fase 119.
+- ~~Motivo obligatorio al cancelar/saltear una parada de ruta~~ —
+  implementado en la Fase 120.
+- ~~Ver quién editó o canceló una venta, en el dashboard~~ — implementado
+  en la Fase 120.
+- ~~Pantalla obligatoria de notas/feedback después del segundo ticket~~ —
+  implementado en la Fase 120.
 - **Múltiples camiones al mismo cliente el mismo día** — hoy no se puede
   (`UNIQUE(scheduled_date, customer_id)` en `route_day_stops`), decisión
   explícita del usuario de dejarlo así por ahora ("dejemoslo así").
@@ -5864,3 +5862,491 @@ crear día → agregar clientes → almacenista arma ruta → carga por parada �
 vende → cancela una venta → revisa devoluciones). Backend no desplegado a
 producción, webapp de producción sin el build nuevo, sin APK nuevo
 generado/distribuido a los TC22.
+
+## Fase 119: Cortesía por unidad suelta en Case/Unit/Bucket — fix de escala + limpieza de ticket impreso (backend + Android) ✅
+
+### Contexto
+
+Backlog #2 ("cortesía por unidad suelta") ya tenía el split pagada/cortesía
+implementado en el backend (`courtesyRowsFor()`, `orderController.ts`,
+cambio sin commitear al arrancar la sesión) pero con un bug de fondo: la
+función comparaba `courtesy_qty` directo contra `quantity` sin conocer
+`case_qty` — para un producto Case (ej. 24 unidades por caja a $1.50),
+regalar "1 unidad suelta" se leía como "1 caja completa" y descontaba/
+acreditaba 24x de más. El síntoma reportado por el usuario fue justo ese:
+"pongo cortesía y me descuenta el case completo, no la unidad individual".
+
+### Backend
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 119.1 | `courtesyRowsFor()` — ahora acepta `case_qty` e interpreta `courtesy_qty` siempre en UNIDADES INDIVIDUALES (mismo criterio que `computeDamageCredit`/`unitValueOf` en `creditCalculator.ts`), convirtiéndolo a la escala de `quantity` (cajas) antes de clampar/repartir | `orderController.ts` | ✅ |
+| 119.2 | Los 3 call sites (`createOrder`, `createBatch`, `editBatch`) pasan `case_qty` a `courtesyRowsFor()` | `orderController.ts` | ✅ |
+| 119.3 | `createOrder` (venta individual) — ni siquiera recibía `case_qty`/`unit` del body ni los guardaba en el `INSERT` (gap preexistente); agregado a la destructuración y a las columnas insertadas | `orderController.ts` | ✅ |
+| 119.4 | `createOrder` — la respuesta solo devolvía `insertedIds[0]`; con cortesía parcial (2 filas) la fila de cortesía quedaba invisible para el cliente. Ahora expone `orders: [...]` con todas las filas insertadas, igual que `createBatch` | `orderController.ts` | ✅ |
+
+### Android
+
+Decisión de diseño explícita del usuario (ver conversación): agregar el
+modo "unidades sueltas" en vez de revertir a solo cajas completas —
+requiere que Android y backend compartan la misma convención
+(`courtesy_qty` = unidades individuales, nunca cajas).
+
+| # | Tarea | Archivo | Estado |
+|---|---|---|---|
+| 119.5 | `courtesyQuantityOrFull()` (BatchItem y PendingOrderEntity) — divide por `case_qty` para volver a la escala de `quantity` (cajas) antes de comparar/calcular $. Antes comparaba `courtesyQty` directo contra `quantity` sin pasar por `case_qty` — mismo bug que en el backend, pero del lado del cliente (afectaba el preview del carrito y el ticket impreso, sin tocar el backend en ese punto) | `data/Models.kt` | ✅ |
+| 119.6 | `askCourtesyQuantity()` — el diálogo pedía "cajas completas" (clamp a `quantity`); ahora pide UNIDADES INDIVIDUALES (clamp a `quantity × caseQty`), con `TextWatcher` que recorta en vivo si se tipea más del máximo. Default arranca en `1` (no en el máximo, para no regalar la fila entera sin querer) | `CurrentOrderActivity.kt` | ✅ |
+| 119.7 | `courtesyUnitsOrFull()` (nuevo, BatchItem y PendingOrderEntity) y `displayUnitsOf()` (nuevo, para filas ya divididas por el backend / `OrderDto`) — separan el valor usado para MOSTRAR (unidades individuales enteras) del usado para calcular $ (escala de cajas). Sin esto, una cortesía de "1 de 24" se mostraba como "0 unit(s)" en 3 pantallas distintas (`courtesyQty.toInt()` truncaba `1/24 = 0.04` a `0`) | `data/Models.kt` | ✅ |
+| 119.8 | Aplicado `courtesyUnitsOrFull()`/`displayUnitsOf()` en los 3 lugares donde se muestra la cantidad regalada: fila del carrito, "Courtesy Summary" del ticket impreso, y "Courtesy Summary" de la pantalla "Ver ticket"/reimpresión desde Historial (esta última lee `OrderDto` ya dividido por el backend, con `quantity` en escala de cajas — necesitaba su propia conversión) | `CurrentOrderActivity.kt`, `data/print/PrintService.kt`, `TicketDetailActivity.kt` | ✅ |
+| 119.9 | `formatCourtesyQty()` (nuevo) — dice "N individual unit(s)" en vez de solo "N unit(s)", para que no se confunda con el conteo de cajas en ningún punto (diálogo, carrito, ticket impreso, reimpresión) | `data/Models.kt` | ✅ |
+| 119.10 | Ticket impreso — QR de términos y condiciones de `500`→`260` dots, firma del cliente de `700`→`450` dots (a pedido del usuario, "todo lo demás está perfecto") | `data/print/PrintService.kt` | ✅ |
+| 119.11 | Fix impresora — el separador `·` (middle dot, U+00B7) en "Courtesy Summary"/"Negative Sale Summary" llegaba a la impresora como 2 bytes UTF-8 (`0xC2 0xB7`) y el font CPCL lo imprimía como basura (una "A" suelta). Reemplazado por un separador ASCII simple (`" - "`) en las dos líneas que lo usaban | `data/print/PrintService.kt` | ✅ |
+
+### Fuera de esta ronda
+
+- No se generó ni distribuyó un APK nuevo a los TC22 — todo verificado solo
+  por compilación (`tsc --noEmit` en backend, `:app:compileDebugKotlin` en
+  Android), sin probar contra una impresora física ni una base de datos
+  real.
+- Backend no desplegado a `app.excellentiafoods.com` — el fix de Android
+  depende de que el backend esté actualizado (misma convención de escala
+  para `courtesy_qty`), así que conviene desplegar los dos juntos.
+- `EditBatchActivity.kt` sigue con el toggle simple (`isCourtesy`
+  booleano, fila completa) — nunca tuvo cortesía parcial y no se le agregó
+  en esta ronda (fuera de alcance, no se pidió).
+
+## Fase 120: Motivo obligatorio al saltear parada, quién editó/canceló una venta, ticket de recepción y feedback obligatorio post-venta (backend + Android + webapp) ✅
+
+Cierra 4 ítems del backlog abierto (numerados 1-4 en la lista de "Backlog
+abierto" de la sesión anterior), a pedido explícito del usuario ("hoy
+tenemos que terminar del 1 al 4").
+
+### 1. Motivo obligatorio al cancelar/saltear una parada de ruta
+
+**Backend** — `route_stops.skip_reason` (columna nueva, VARCHAR(255)).
+`updateStopStatus` (`routeController.ts`) rechaza (400) pasar a `SKIPPED`
+sin `reason` en el body; al volver a `PENDING`/`DELIVERED` el motivo se
+limpia (no queda un motivo viejo colgado de un estado que ya no es
+SKIPPED). Expuesto gratis en `getRoute` (usa `SELECT *`).
+
+**Android** — `askSkipReason()` (`MyRouteDetailActivity.kt`) nuevo diálogo
+con `EditText` obligatorio entre "confirmar saltar" y el POST real —
+"Continuar" queda deshabilitado hasta que hay texto, para no gastar la
+llamada en un 400 previsible. El motivo se muestra debajo del chip
+"Skipped" en la lista de paradas.
+
+**Webapp** — `/warehouse` (`WarehouseClient.tsx`) muestra un badge rojo con
+el motivo en cada parada `SKIPPED` — antes el status de la parada ni
+siquiera se mostraba ahí.
+
+### 2. Ver quién editó o canceló una venta, en el dashboard
+
+**Backend** — `listOrders` no seleccionaba `approved_by`/`voided_by`/
+`void_reason` (ya existían en `orders` desde las Fases 113/117) ni tenía
+forma de exponer quién editó (`editBatch` reemplaza filas, no tiene columna
+propia — se resuelve con una subquery correlacionada contra
+`activity_log`, acción `BATCH_EDITED`, la más reciente por `batch_id`).
+Ahora `listOrders` trae `approved_by_name`/`voided_by_name` (JOIN a `users`)
+y `last_edited_by`/`last_edited_at`.
+
+**Webapp** — `/orders` (`OrdersClient.tsx`) muestra, debajo del tag de ruta:
+"Cancelada por X · fecha — 'motivo'" (si `CANCELLED`), "Aprobada por X ·
+fecha" (si `SENT`), y "Editada por X · fecha" si hubo un `BATCH_EDITED`
+después de crear el batch.
+
+### 3. Ticket de recepción con lote y fecha de expiración
+
+**Backend** — `createReceipt` (`warehouseController.ts`) ya guardaba
+lote/expiración por línea (`product_lots`) desde la Fase 112, pero la
+respuesta no traía `barcode`/`unit` — se agregaron al `SELECT` y a cada
+línea de la respuesta para que Android pueda armar el ticket sin resolver
+el producto de nuevo.
+
+**Android** — `PrintService.printReceiptTicket()`/`buildReceiptCpcl()`
+(nuevo, no reusa `buildCpcl()` — no hay cliente/factura/pago, es un
+comprobante interno) imprime producto + cantidad + `Lot #` + `Exp:` (si
+tiene) por línea, y un resumen de líneas fallidas al final si alguna no se
+recibió (error de producto no encontrado, etc). `ReceivingActivity` lo
+llama tras guardar, best-effort — mismo criterio que el resto de la app
+(sin impresora configurada o si falla la conexión, no bloquea el flujo, la
+recepción ya quedó guardada del lado del servidor).
+
+### 4. Pantalla obligatoria de notas/feedback tras el segundo ticket
+
+Bloqueada en el backlog anterior por no tener definido qué es "el segundo
+ticket" — aclarado con el usuario en esta sesión: es el ticket real que
+imprime `sendBatchAndPrint()`/el segundo `printTicket()` de
+`PreOrderDetailActivity` (con `Payment:` e invoice real), y la pantalla va
+**entre ese print y `OrderSuccessActivity`** ("Venta completada"), nunca
+después. Contenido: texto libre obligatorio, visible en el dashboard admin.
+
+**Backend** — tabla nueva `batch_feedback` (`batch_id` PK, `note`,
+`user_id`, creada perezosamente con `CREATE TABLE IF NOT EXISTS`, mismo
+patrón que `batch_signatures`). `POST /api/orders/batch/:batchId/feedback`
+(`submitBatchFeedback`, admite reintentos vía `ON DUPLICATE KEY UPDATE` —
+una nota por batch, no se duplica si la app reintenta por una reconexión).
+`listOrders` expone `feedback_note` vía subquery correlacionada.
+
+**Android** — `BatchFeedbackActivity` nueva (layout propio,
+`activity_batch_feedback.xml`): recibe TODOS los extras que ya traía el
+Intent hacia `OrderSuccessActivity` (batch_id, invoice, items, firma, etc.),
+pide la nota con "Continuar" deshabilitado hasta que hay texto, manda el
+POST (best-effort — si falla, avisa por Snackbar pero igual continúa, la
+venta ya está a salvo del lado del servidor) y recién ahí reenvía los
+mismos extras a `OrderSuccessActivity` y se cierra. Botón de atrás
+interceptado (`OnBackPressedCallback`) — no se puede saltear la pantalla.
+Se enganchó en los dos flujos que llegan a `OrderSuccessActivity` con un
+segundo ticket real: `CurrentOrderActivity.sendBatchAndPrint()` (venta
+normal) y `PreOrderDetailActivity` (conversión de pre-orden) — antes ambos
+saltaban directo a `OrderSuccessActivity`.
+
+**Webapp** — `/orders` (`OrdersClient.tsx`) muestra la nota en un recuadro
+con 💬 debajo del resto de metadata del batch, si existe.
+
+### Fuera de esta ronda
+
+- Ninguna migración SQL manual nueva más allá de `route_stops.skip_reason`
+  (agregada a `CLAUDE.md`) — `batch_feedback` se crea sola en el primer uso
+  (mismo patrón que `batch_signatures`), no hace falta correr nada a mano.
+- No se generó ni distribuyó un APK nuevo a los TC22 — todo verificado solo
+  por compilación (`tsc --noEmit` backend y webapp, `:app:compileDebugKotlin`
+  Android), sin probar contra una base de datos real ni una impresora física.
+- Backend no desplegado a `app.excellentiafoods.com`, webapp de producción
+  sin el build nuevo.
+- `EditBatchActivity.kt` (edición manual de un batch por admin) no pasa por
+  `BatchFeedbackActivity` — no llega a `OrderSuccessActivity`, no aplica.
+
+### Addendum (mismo día) — ticket del dashboard desalineado con la app + feedback con botón propio
+
+Dos pedidos de seguimiento del usuario tras probar la Fase 120 en vivo:
+
+1. **Bug encontrado — Order Completed/View Ticket en Android mostraba la
+   cortesía completa (-$1.50, "24 unidades") en vez de la parte real
+   regalada (-$0.75, "12 unidades") para una cortesía parcial (12 de 24).**
+   No era el mismo bug de `courtesyRowsFor()` ya cerrado — era un TERCER
+   lugar que nunca se tocó: el `Intent` que arma `sendBatchAndPrint()`
+   (`CurrentOrderActivity.kt`) y su gemelo en `PreOrderDetailActivity.kt`
+   para pasarle los datos a `OrderSuccessActivity`/"View ticket" mandaba
+   **una sola fila por producto** (el `total`/`quantity` de la caja
+   completa + un simple flag `isCourtesy`), sin el split pagada/cortesía
+   que sí aplican `openTicket()` (ticket #1) y el backend (dashboard). Fix:
+   mismo `flatMap` con split que ya usa `openTicket()`, aplicado también acá
+   con `courtesyQuantityOrFull()` sobre `sent.items` (`BatchItem`).
+
+2. **Mismo bug de escala, encontrado de paso en el ticket del dashboard
+   (`/orders`, `OrdersClient.tsx`)** — `formatDamageQty(o.quantity, o.unit)`
+   en el "Courtesy Summary" mostraba `Math.round(quantity)` sobre una
+   fila ya dividida por el backend, cuya `quantity` está en escala de CAJAS
+   (`courtesyRowsFor()`), no en unidades individuales — mismo bug que ya se
+   había cerrado en Android. Agregado `displayUnitsOf()`/`formatCourtesyQty()`
+   (espejo de `data/Models.kt`) y aplicado en esa línea.
+
+3. **Botón de feedback propio, al lado del botón "Ticket"** (`/orders`,
+   admin-only) — antes la nota se veía truncada como metadata bajo el
+   batch; ahora hay un botón "Feedback" (visible solo si el batch tiene
+   nota) que abre un modal dedicado con el texto completo, quién la dejó y
+   cuándo. Backend: `listOrders` ahora también expone `feedback_by_name`
+   (JOIN a `users`) y `feedback_at` (antes solo `feedback_note`).
+
+Verificado con `tsc --noEmit` (backend y webapp) y
+`:app:compileDebugKotlin` (Android) — sin errores nuevos. Sin probar
+contra una base de datos real ni un dispositivo físico.
+
+### Addendum 2 (mismo día) — vencimiento aproximado al expandir una orden en /orders
+
+Pregunta del usuario: al expandir una orden y ver los productos, ¿se puede
+mostrar la fecha de caducidad que cargó Almacén al recibir? Respuesta dada
+y aceptada: `orders` **no guarda de qué lote salió cada línea vendida**
+(ese vínculo solo existe para lo que se cargó a una ruta vía FIFO,
+`route_item_lots` — una venta de mostrador nunca pasa por ahí), así que no
+hay forma de mostrar el vencimiento exacto de lo vendido sin agregar
+`orders.lot_id` y resolver cómo repartir cuando una línea se cubre con
+más de un lote parcial. Se implementó la alternativa aprobada: el
+vencimiento **más próximo entre los lotes ACTIVOS de ese producto hoy**
+(alerta de "este producto tiene stock por vencer", no trazabilidad exacta).
+
+**Backend** — `listOrders` agrega `nearest_expiration` (subquery
+correlacionada: `MIN(expiration_date)` de `product_lots` `ACTIVE` para
+`o.product_id`).
+
+**Webapp** — `/orders`, tabla de productos al expandir un batch: columna
+"Expires (approx.)" (solo aparece si al menos un ítem del batch tiene
+fecha), en rojo si vence en ≤7 días — mismo criterio de alerta que ya usa
+Android en `InventoryMovementsActivity`.
+
+Verificado con `tsc --noEmit` (backend y webapp) sin errores.
+
+### Addendum 3 (mismo día) — número de lote REAL del proveedor, no el id interno
+
+Feedback tras probar el ticket de recepción impreso (ya arreglado el bug de
+`send()` que lo hacía fallar en silencio, ver addendum anterior): el
+"número de lote" que salía en el ticket era `product_lots.id`
+(autoincremental interno de MySQL) — no tiene ningún significado para el
+proveedor/cliente, que trae su propio número de lote escrito en la caja.
+Cada cliente puede traer un número de lote distinto para el mismo producto,
+así que hace falta pedirlo a mano al recibir, con una opción explícita para
+cuando el producto no trae ninguno.
+
+**Backend** — `product_lots.lot_number` (columna nueva, VARCHAR(100),
+independiente de `id`). `createReceipt` acepta `lot_number` por línea
+(string libre, `null` = sin número). `listLots` lo expone. `updateLot`
+permite corregirlo después (igual que ya se puede corregir `quantity`/
+`expiration_date`).
+
+**Android** — `askExpirationThenAdd()` (`ReceivingActivity.kt`) ahora pide,
+en el mismo diálogo, el número de lote (`EditText`) + un checkbox "Este
+producto no trae número de lote" (deshabilita el campo al tildarlo) — antes
+solo pedía la fecha de expiración. El ticket impreso
+(`PrintService.buildReceiptCpcl`) muestra `lot_number` ("Lot #: ABC123" o
+"Lot #: No lot number"), nunca más el `lot_id` interno.
+
+**Webapp** — `/warehouse/inventory` (pestaña Disponible) muestra el número
+de lote junto a la fecha de expiración de cada lote, cuando existe.
+
+**Fuera de esta ronda** — `UpdateLotRequest` (Android) ya tiene el campo
+`lotNumber` listo para mandar al backend, pero la pantalla "Editar lote"
+(`InventoryMovementsActivity`) todavía no tiene un campo de UI para
+corregirlo — el pedido original era sobre el flujo de recepción, no sobre
+la edición posterior.
+
+**Migración manual pendiente:**
+```sql
+ALTER TABLE product_lots ADD COLUMN IF NOT EXISTS lot_number VARCHAR(100) DEFAULT NULL AFTER barcode;
+```
+
+Verificado con `tsc --noEmit` (backend y webapp) y `:app:compileDebugKotlin`
+(Android) — sin errores. Sin probar contra una impresora física ni una base
+de datos real.
+
+### Addendum 4 (mismo día) — pestaña "Recibos" en Sub-inventario: buscar y reimprimir una recepción pasada
+
+Pedido del usuario: el Sub-inventario tenía "Disponible" e "Historial", pero
+no había forma de recuperar el ticket de una recepción ya hecha (ej. si
+recibió 4 productos juntos y el ticket no salió bien, o simplemente lo
+necesita de nuevo después). Se agregó una tercera pestaña.
+
+**Backend** — dos endpoints nuevos en `warehouseInventory.ts`:
+- `GET /api/warehouse/receipts` (`listReceipts`) — agrupa `product_lots`
+  por `receipt_batch_id` (una fila por recepción, no por producto), con
+  fecha, cantidad de ítems, depósito y quién la recibió. Soporta
+  `?search=` (matchea `receipt_batch_id`, nombre de producto o
+  `lot_number` — el almacenista raramente recuerda el ID de la recepción de
+  memoria, pero sí qué productos entraron). Excluye recepciones
+  `backfill-%` (no son recepciones reales).
+- `GET /api/warehouse/receipts/:receiptBatchId` (`getReceiptDetail`) —
+  detalle completo de una recepción puntual, mismo shape que ya devuelve
+  `createReceipt` (`product_name`, `barcode`, `unit`, `quantity`,
+  `lot_number`, `expiration_date`), para que Android reuse
+  `PrintService.printReceiptTicket()` tal cual sin un modelo aparte.
+
+**Android** — tercer chip "Receipts" en `InventoryMovementsActivity`
+(`activity_inventory_movements.xml`), sección nueva con buscador (debounce
+350ms) y una tarjeta por recepción con botón "Reprint" — trae el detalle y
+llama al mismo `printReceiptTicket()` que ya se usa al recibir por primera
+vez. Carga perezosa (recién al entrar a la pestaña).
+
+Verificado con `tsc --noEmit` (backend) y `:app:compileDebugKotlin`
+(Android) — sin errores. Sin probar contra una base de datos real ni una
+impresora física.
+
+### Addendum 5 (mismo día) — "View ticket" en vez de reimprimir directo
+
+Ajuste de UX pedido tras ver la pestaña "Recibos" en funcionamiento: el
+botón "Reprint" mandaba directo a la impresora sin poder confirmar antes
+qué se iba a reimprimir. Cambiado a **"View ticket"** — abre un diálogo con
+todo el contenido del ticket (mismo texto que se imprime: producto,
+cantidad, número de lote, expiración) y recién al fondo un botón
+"Reprint ticket" para mandarlo a la impresora. El detalle se trae una sola
+vez (`getReceiptDetail`) y se reusa tanto para armar el texto del diálogo
+como para el reprint real si se confirma, sin una segunda llamada al
+servidor.
+
+Verificado con `:app:compileDebugKotlin` — sin errores.
+
+### Addendum 6 (mismo día) — fechas sin formatear (DATE de MySQL serializa con hora/zona)
+
+Reportado tras probar: la expiración en el ticket de recepción salía como
+"2026-10-30T04:00:00.000Z" en vez de "2026-10-30", y en `/orders` la fecha
+de la ruta ("🚚 test friday · 2026-09-18T04:00:00.000Z") tenía el mismo
+problema — mientras que "Cancelada por... · 2026-09-18 19:13" sí salía bien
+porque esa línea ya hacía `.slice(0, 16).replace('T', ' ')`.
+
+**Causa:** columnas `DATE` de MySQL (`product_lots.expiration_date`,
+`routes.scheduled_date`) — `mysql2` las devuelve como objeto `Date` de JS
+(no como string), y al serializar a JSON con `res.json()` eso llama
+`toISOString()`, que agrega hora y zona aunque la columna nunca tuvo hora
+real. Mismo tipo de gotcha ya documentado en `CLAUDE.md` para
+`DECIMAL`/`TINYINT(1)`, pero en la dirección opuesta (acá sobra dato, no
+falta tipo).
+
+**Fix** — recortar a los primeros 10 caracteres (`YYYY-MM-DD`) en cada
+punto de renderizado, mismo criterio que ya usaba `/warehouse/inventory`
+para lotes:
+- `PrintService.buildReceiptCpcl()` y el diálogo "View ticket"
+  (`InventoryMovementsActivity.kt`) — `item.expirationDate.take(10)`.
+- `/orders` (`OrdersClient.tsx`) — `batch.routeDate.slice(0, 10)`.
+
+No se tocó el backend (normalizar `DATE` a string ahí sería un cambio más
+grande, con `typeCast` en `db/connection.ts`, afectando todas las columnas
+`DATE` del proyecto) — se optó por el fix puntual en cada pantalla
+afectada, igual que ya se hizo antes para este mismo tipo de columna.
+
+Verificado con `:app:compileDebugKotlin` y `tsc --noEmit` (webapp) — sin
+errores.
+
+### Addendum 7 (2026-09-18) — columna "Expires (approx.)" de /orders oculta temporalmente
+
+Seguimiento del Addendum 2: en producción, la columna mostraba una fecha
+pasada en rojo permanente para órdenes de "Gelatinas Mix Fruit" (aparecía
+como vencida "2026-09-10" en pleno 18 de septiembre), aunque el stock real
+vigente del producto vencía mucho después.
+
+**Diagnóstico (con SQL de validación sobre la base real):** la subquery
+`nearest_expiration` de `listOrders` (`orderController.ts:182`) solo filtra
+`status = 'ACTIVE'` — **no** `remaining_qty > 0`. Los lotes consumidos por
+completo por una ruta quedan con `remaining_qty = 0` pero siguen `ACTIVE`
+(nada los marca `DEPLETED` automáticamente) y, como su `expiration_date`
+suele ser vieja, dominan el `MIN` para siempre. La pestaña "Disponible" de
+`/warehouse/inventory` sí filtra `remaining_qty > 0` (`InventoryClient.tsx`),
+por eso ahí el producto se veía correcto (1.00 + 1.00 + 5.00, todos
+expirando 2026-10-30) mientras el dashboard de órdenes tomaba el 09-10 de
+lotes sin stock (ids 2 y 180; el 195 expiraba 09-17 y el 197 10-30, todos
+consumidos — verificado vía query). Con el `MIN` correcto (solo lotes con
+stock) dan 2026-10-30.
+
+Se auditó el resto de las consultas con `status = 'ACTIVE'`: las demás ya
+filtran bien — `computeFifoAllocation` (`warehouseController.ts:199`) y
+`listAvailableProducts` (`:521`) usan `remaining_qty > 0`; los JOINs de
+backfill (`:563`, `:619`) suman `remaining_qty` (un lote consumido suma 0).
+Único punto afectado: el `nearest_expiration` del dashboard de órdenes.
+
+**Decisión (temporal):** ocultar la columna por el momento en vez de
+arreglar la query, para no dejar un alerta engañosa en producción mientras
+se define el criterio. `OrdersClient.tsx` — la columna (header + celda) se
+gateó con `const SHOW_EXPIRES_COLUMN = false`; volver a `true` la restaura.
+El backend no se tocó: `nearest_expiration` sigue en `listOrders`.
+
+**Pendiente — fix de raíz para reactivar con criterio correcto:** agregar
+`AND pl.remaining_qty > 0` a la subquery de `orderController.ts:182` (que el
+dashboard solo alerte sobre stock que de verdad está disponible, igual que
+"Disponible"). Opcionalmente, higiene de datos: marcar `DEPLETED` los lotes
+consumidos que quedaron `ACTIVE` (ids 2, 180, 195, 197 del ejemplo) —
+`UPDATE product_lots SET status = 'DEPLETED' WHERE id IN (...)`; no existe
+endpoint para ese estado (`setLotCondition` solo acepta `DAMAGED`/`EXPIRED`).
+Nota: los lotes consumidos que queden `ACTIVE` son también ruido en
+`listLots`, que por defecto trae `ACTIVE`.
+
+Verificado con `bun run lint` (webapp; los errores reportados son
+preexistentes en el archivo y en artefactos de build de un worktree — la
+subquery no se tocó).
+
+## Feedback del cliente sobre Almacén (2026-09-21) — tasks a crear en ClickUp
+
+Reunión con el cliente el 2026-09-21, feedback puntual sobre el módulo
+Almacén ya en uso. Se van a cargar como tasks en ClickUp; quedan
+documentados acá para no perder el detalle técnico detrás de cada uno.
+
+1. **Devoluciones — mostrar si el producto es Case o Unidad.** Al revisar
+   devoluciones de ruta (`RouteReturnsActivity`) no se ve la unidad de venta
+   junto a cada producto, solo nombre y las 3 cantidades (Bueno/Dañado/
+   Vencido). El backend ya expone `unit` en `getExpectedReturns` desde la
+   Fase 118 — probablemente solo falta pintarlo en Android.
+
+2. **Vender/cargar en cantidad parcial.** El cliente pidió poder vender o
+   entregar cantidad parcial (ej. media caja) en vez de solo unidades
+   completas. *A confirmar con el cliente:* si es fraccionar precio/cantidad
+   de un producto Case en una venta, o cargar a una ruta menos que un lote
+   completo (o ambas).
+
+3. **Bug — falta fecha de expiración al recibir → timeout o duplicado.**
+   `POST /api/warehouse/receipts` sin `expiration_date` en una línea hace
+   timeout o crea el lote dos veces. A reproducir y corregir.
+
+4. **Productos con más de un lote de caducidad.** El sistema ya soporta N
+   lotes por producto con distinta fecha (`product_lots`, FIFO por
+   `expiration_date`). *A confirmar con el cliente:* qué es exactamente lo
+   que ve mal — puede ser un problema de visualización, o que espere un
+   comportamiento distinto (ej. aviso de cuál usar primero, o combinar
+   varios lotes en una misma entrega).
+
+5. **Pre-órdenes con stock faltante.** Hoy no hay manejo especial si una
+   pre-orden incluye un producto sin stock al convertir. *A confirmar con el
+   cliente:* qué debería pasar — avisar al vendedor, entregar lo que hay y
+   dejar pendiente el resto, o bloquear la entrega hasta que haya stock.
+
+6. **Productos Lbs (precio variable) — dos problemas.**
+   a) *Recepción:* el formulario debe pedir el peso real recibido, no
+      cantidad de piezas, igual que ya hace Venta/Ruta.
+   b) *Bug en revisión de devoluciones:* para productos Lbs, "Cargado" se
+      muestra como entero (1, 2, 3...) en vez del peso real con decimales,
+      mientras "Devuelto" sí se ve bien en Lbs. El backend (`getExpectedReturns`)
+      ya devuelve el número correcto — es un fix de formateo en Android,
+      mismo patrón `formatQty()`/`isLbsUnit()` ya usado en otras pantallas
+      desde la Fase 118.
+
+**Estado:** solo documentado, sin implementar. Próximo paso: cargar como
+tasks en ClickUp (2, 4 y 5 necesitan una vuelta más con el cliente antes de
+poder diseñarse) y arrancar implementación de los que ya están claros (1, 3, 6).
+
+### Contexto ampliado (2026-09-22) — vuelta del usuario sobre cada punto
+
+Detalle adicional que precisó el usuario sobre los 6 puntos de arriba, antes
+de arrancar implementación:
+
+1. Confirmado: falta la unidad de venta en pantalla. **Detalle nuevo:** hoy
+   el campo de cantidad devuelta para un producto Case **solo acepta cajas
+   completas**, no unidades sueltas — se solapa con el punto 2.
+2. Sin precisión nueva sobre en qué parte del flujo aplica (venta directa,
+   carga a ruta, devolución) — sigue *a confirmar con el cliente*. Único
+   caso concreto conocido hasta ahora es el del punto 1 (devoluciones).
+3. Confirmado tal cual, sin detalle adicional — listo para reproducir y
+   corregir.
+4. Sin precisión nueva — sigue *a confirmar con el cliente* si es un
+   problema de visualización o de comportamiento esperado.
+5. Sin precisión nueva — sigue *a confirmar con el cliente* qué debe pasar
+   (avisar / entregar parcial / bloquear).
+6. Confirmado tal cual (a y b), sin detalle adicional.
+
+## TODO — Almacén, estado consolidado (2026-09-22)
+
+### ✅ Implementado, sin commitear ni desplegar (Fases 119, 120, 121)
+
+- [x] Fase 119 — cortesía por unidad suelta en Case/Unit/Bucket (fix de
+      escala backend + Android).
+- [x] Fase 120.1 — motivo obligatorio al saltear una parada de ruta.
+- [x] Fase 120.2 — quién editó/canceló una venta, visible en `/orders`.
+- [x] Fase 120.3 — ticket de recepción con lote y fecha de expiración.
+- [x] Fase 120.4 — pantalla obligatoria de feedback tras el segundo ticket.
+- [x] Fase 121 — "Copiar a otra fecha" en day-stops.
+- [x] Addendums 1-7 (fixes de escala en ticket dashboard, botón feedback
+      propio, vencimiento aproximado, número de lote real, pestaña
+      "Recibos", "View ticket", fechas `DATE` sin hora).
+- **Pendiente en todos los de arriba:** commitear, desplegar backend a
+  `app.excellentiafoods.com`, build nuevo de webapp, APK nuevo a los TC22.
+  Nada de esto se probó contra una base de datos real ni una impresora
+  física.
+
+### 🔲 Pendiente — listo para implementar (feedback cliente 2026-09-21)
+
+- [ ] **#1** Devoluciones — mostrar unidad de venta (Case/Unit/Bucket/Lbs)
+      en `RouteReturnsActivity` (Android). Backend ya expone `unit`.
+- [ ] **#3** Bug — recepción sin `expiration_date` hace timeout o duplica
+      el lote (`createReceipt` / `ReceivingActivity`). A reproducir y
+      corregir.
+- [ ] **#6a** Recepción de productos Lbs — pedir peso real (decimal), no
+      cantidad de piezas (mismo criterio `isLbsUnit()` que Venta/Ruta).
+- [ ] **#6b** Revisión de devoluciones — "Cargado" de un producto Lbs se
+      muestra entero en vez de con decimales (bug de formateo en Android,
+      mismo patrón `formatQty()`/`isLbsUnit()` de la Fase 118).
+
+### 🔲 Pendiente — necesita una vuelta más con el cliente antes de diseñar
+
+- [ ] **#1 (parte 2)** Devoluciones de un producto Case solo aceptan cajas
+      completas, no unidades sueltas — decidir si se resuelve junto con #2.
+- [ ] **#2** Vender/cargar en cantidad parcial (ej. media caja) — confirmar
+      en qué parte del flujo aplica: venta directa, carga a ruta, y/o
+      devolución (ver nota de #1 arriba).
+- [ ] **#4** Productos con más de un lote de caducidad — confirmar si es un
+      problema de visualización o de comportamiento esperado.
+- [ ] **#5** Pre-órdenes con stock faltante — confirmar comportamiento
+      esperado (avisar / entregar parcial y dejar pendiente / bloquear).

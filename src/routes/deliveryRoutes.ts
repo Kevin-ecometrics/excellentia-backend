@@ -19,6 +19,7 @@ import {
   getConsignment,
   settleConsignment,
   createDayStop,
+  copyDayStops,
   listDayStops,
   deleteDayStop,
   getExpectedStopItems,
@@ -47,6 +48,7 @@ const router = Router();
 // asigna en qué camión y en qué orden.
 router.get('/day-stops',              auth, warehouseOnly, listDayStops);
 router.post('/day-stops',             auth, adminOnly, createDayStop);
+router.post('/day-stops/copy',        auth, adminOnly, copyDayStops);
 router.delete('/day-stops/:dayStopId', auth, adminOnly, deleteDayStop);
 router.get('/available',              auth, warehouseOnly, listAvailable);
 router.post('/',                      auth, warehouseOnly, createRoute);

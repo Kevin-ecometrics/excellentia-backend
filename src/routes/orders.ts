@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { createOrder, listOrders, getOrder, updateOrderStatus, forceSync, retryBatchSync, createBatch, approveBatch, reconcileBatch, exportCsv, getBatchDamage, updateBatchPayment, cancelBatch, editBatch } from '../controllers/orderController.ts';
+import { createOrder, listOrders, getOrder, updateOrderStatus, forceSync, retryBatchSync, createBatch, approveBatch, reconcileBatch, exportCsv, getBatchDamage, updateBatchPayment, cancelBatch, editBatch, submitBatchFeedback } from '../controllers/orderController.ts';
 import { auth } from '../middleware/auth.ts';
 import { adminOnly } from '../middleware/adminOnly.ts';
 
@@ -15,6 +15,7 @@ router.post('/batch/:batchId/reconcile', auth, adminOnly, reconcileBatch);
 router.post('/batch/:batchId/cancel', auth, cancelBatch);
 router.post('/batch/:batchId/edit', auth, editBatch);
 router.put('/batch/:batchId/payment', auth, updateBatchPayment);
+router.post('/batch/:batchId/feedback', auth, submitBatchFeedback);
 router.get('/', auth, listOrders);
 router.get('/:id', auth, getOrder);
 router.put('/:id/status', auth, adminOnly, updateOrderStatus);

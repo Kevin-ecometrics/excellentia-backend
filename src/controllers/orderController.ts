@@ -2,7 +2,7 @@ import type { Request, Response } from 'express';
 import pool from '../db/connection.ts';
 import { createBatchInvoice, findInvoiceByDocNumber } from '../services/qbInvoices.ts';
 import { updateItemQtyOnHand } from '../services/qbItems.ts';
-import { computeDamageCredit } from '../services/creditCalculator.ts';
+import { computeDamageCredit, isLbsUnit } from '../services/creditCalculator.ts';
 import { getCustomerBalance, applyCustomerCredit } from '../services/creditController.ts';
 import { withInvoiceNumber, reserveInvoiceNumber } from '../services/invoiceCounter.ts';
 import logger from '../services/logger.ts';
@@ -42,9 +42,61 @@ function extractQboErrorMessage(err: unknown): string {
   return 'Error desconocido';
 }
 
+// Cortesía por unidad suelta (backlog #2) — un ítem del carrito con
+// cantidad > 1 puede regalar solo UNA PARTE (ej. 2 de 5 cajas): el backend
+// normaliza ese ítem en DOS filas de `orders` (una pagada con
+// is_courtesy=0 + una cortesía con is_courtesy=1), así `is_courtesy` sigue
+// siendo un boolean por fila y nada corriente (createBatchInvoice, webapp,
+// stats, aprobaciones, listOrders, cancelBatch/editBatch) necesita saber de
+// cortesía parcial. Para Lbs (y para cortesía completa/ninguna) el ítem
+// sigue siendo UNA sola fila como antes. El descuento de stock es UNO por
+// ítem original (1 escaneo = 1 unidad física) — en el caso parcial se
+// atribuye solo a la fila pagada (`carriesStock`), y el caller la persiste
+// en orders.stock_decremented multiplicando por su flag `decremented` de ruta.
+function courtesyRowsFor(item: {
+  quantity: number;
+  total: number;
+  unit?: string | null;
+  case_qty?: number | null;
+  is_courtesy?: boolean;
+  courtesy_qty?: number;
+}): { quantity: number; total: number; is_courtesy: number; carriesStock: boolean }[] {
+  const quantity = Number(item.quantity) || 0;
+  const total = Number(item.total) || 0;
+  if (quantity <= 0) return [{ quantity, total, is_courtesy: 0, carriesStock: true }];
+
+  // `courtesy_qty` siempre viene en UNIDADES INDIVIDUALES sueltas (mismo
+  // criterio que computeDamageCredit/unitValueOf en creditCalculator.ts) —
+  // nunca en la escala de `quantity`. Para Case, `quantity` es el número de
+  // CAJAS y `price`/`total` valen por la caja completa (case_qty unidades
+  // c/u); sin convertir acá, "regalar 3 unidades sueltas de un case de 24"
+  // se comparaba/clampaba directo contra `quantity` (ej. 1 caja) y terminaba
+  // regalando la caja ENTERA en vez de 3/24 de su valor.
+  const caseSize = isLbsUnit(item.unit) ? 1 : (Number(item.case_qty) || 1);
+
+  // Compat retro: filas mandadas con is_courtesy=true y sin courtesy_qty
+  // (EditBatchActivity de Android) = cortesía completa de la fila.
+  let cqUnits = Number(item.courtesy_qty) || 0;
+  if (cqUnits <= 0 && item.is_courtesy) cqUnits = quantity * caseSize;
+  // Lbs no permite cortesía parcial (decisión de producto): solo 0 o completa.
+  if (isLbsUnit(item.unit)) cqUnits = cqUnits > 0 ? quantity : 0;
+  let cq = cqUnits / caseSize;
+  cq = Math.min(Math.max(cq, 0), quantity);
+
+  if (cq >= quantity) return [{ quantity, total, is_courtesy: 1, carriesStock: true }];
+  if (cq <= 0) return [{ quantity, total, is_courtesy: 0, carriesStock: true }];
+
+  const courtesyTotal = Math.round((total * cq / quantity) * 100) / 100;
+  const paidTotal = Math.round((total - courtesyTotal) * 100) / 100;
+  return [
+    { quantity: quantity - cq, total: paidTotal, is_courtesy: 0, carriesStock: true },
+    { quantity: cq, total: courtesyTotal, is_courtesy: 1, carriesStock: false },
+  ];
+}
+
 export async function createOrder(req: Request, res: Response): Promise<void> {
   try {
-    const { barcode, product_name, price, quantity, total, device_id, is_courtesy } = req.body;
+    const { barcode, product_name, price, quantity, total, device_id, unit, case_qty, is_courtesy, courtesy_qty } = req.body;
     if (!barcode || !product_name || price === undefined || quantity === undefined || quantity <= 0) {
       res.status(400).json({ error: 'Faltan campos requeridos' });
       return;
@@ -66,12 +118,25 @@ export async function createOrder(req: Request, res: Response): Promise<void> {
     const [productRowsForId] = await pool.query('SELECT id FROM products WHERE barcode = ?', [barcode]) as any[];
     const productId = productRowsForId[0]?.id ?? null;
 
-    const [result] = await pool.query(
-      "INSERT INTO orders (barcode, product_id, product_name, price, quantity, total, batch_id, device_id, user_id, is_courtesy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      [barcode, productId, product_name, price, quantity, finalTotal, batchId, device_id ?? null, req.user?.id ?? null, is_courtesy ? 1 : 0]
-    ) as any;
-
-    const orderId = result.insertId;
+    // Cortesía parcial → dos filas (pagada + cortesía), ver courtesyRowsFor.
+    // createOrder no descuenta stock en absoluto (gap preexistente, ver
+    // CLAUDE.md) — orders.stock_decremented queda en su default 0.
+    const rows = courtesyRowsFor({ quantity, total: finalTotal, unit, case_qty, is_courtesy, courtesy_qty });
+    // Cortesía parcial parte el ítem en 2 filas (pagada + cortesía) — se
+    // capturan las dos para exponerlas en la respuesta (mismo criterio que
+    // createBatch con `inserted`). Antes solo se devolvía insertedIds[0]: la
+    // fila de cortesía quedaba invisible para el cliente aunque existiera en
+    // orders, porque este endpoint todavía tenía el contrato de "1 fila = 1 orden".
+    // unit/case_qty también faltaban en el INSERT (gap preexistente) — sin
+    // persistirlos, reimprimir esta orden no puede saber si era Case/Lbs/etc.
+    const inserted: { id: number; quantity: number; total: number; is_courtesy: boolean }[] = [];
+    for (const row of rows) {
+      const [result] = await pool.query(
+        "INSERT INTO orders (barcode, product_id, product_name, price, quantity, total, batch_id, device_id, user_id, unit, case_qty, is_courtesy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [barcode, productId, product_name, price, row.quantity, row.total, batchId, device_id ?? null, req.user?.id ?? null, unit ?? null, case_qty ?? null, row.is_courtesy]
+      ) as any;
+      inserted.push({ id: result.insertId, quantity: row.quantity, total: row.total, is_courtesy: !!row.is_courtesy });
+    }
 
     // El número de factura se reserva al instante (el ticket sale con un
     // número real y secuencial), pero la venta queda AWAITING_APPROVAL — el
@@ -79,11 +144,18 @@ export async function createOrder(req: Request, res: Response): Promise<void> {
     // (POST /api/orders/batch/:batchId/approve, ver approveBatch más abajo).
     const invoiceNumber = await reserveInvoiceNumber();
     await pool.query(
-      "UPDATE orders SET status = 'AWAITING_APPROVAL', reserved_invoice_number = ? WHERE id = ?",
-      [invoiceNumber, orderId]
+      "UPDATE orders SET status = 'AWAITING_APPROVAL', reserved_invoice_number = ? WHERE batch_id = ?",
+      [invoiceNumber, batchId]
     );
 
-    res.status(201).json({ id: orderId, barcode, batchId, status: 'AWAITING_APPROVAL', invoiceNumber });
+    res.status(201).json({
+      id: inserted[0]?.id,
+      barcode,
+      batchId,
+      status: 'AWAITING_APPROVAL',
+      invoiceNumber,
+      orders: inserted.map(i => ({ id: i.id, barcode, quantity: i.quantity, total: i.total, is_courtesy: i.is_courtesy, status: 'AWAITING_APPROVAL' })),
+    });
   } catch (err) {
     logger.error('createOrder error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
@@ -92,18 +164,41 @@ export async function createOrder(req: Request, res: Response): Promise<void> {
 
 export async function listOrders(req: Request, res: Response): Promise<void> {
   try {
+    await ensureBatchFeedbackTable();
     const { status, barcode, device_id, customer_id, date_from, date_to, page, limit } = req.query;
     const pageNum = parseInt(page as string) || 1;
     const limitNum = parseInt(limit as string) || 20;
     const offset = (pageNum - 1) * limitNum;
 
+    // Fase 120 — quién editó/canceló una venta, visible en el dashboard.
+    // approved_by/voided_by ya existían (Fase 113/117) pero listOrders nunca
+    // los seleccionaba — quedaban solo consultables a mano en la DB.
     let query = `SELECT o.id, o.barcode, o.product_name, o.price, o.quantity, o.total, o.status, o.batch_id, o.qb_invoice_id, o.reserved_invoice_number, o.device_id, o.user_id, o.customer_id, o.customer_name, o.unit, o.case_qty, o.payment_method, o.check_number, o.credit_applied, o.is_courtesy, o.created_at, u.email AS user_email, u.name AS user_name,
+      -- Vencimiento aproximado (no exacto por lote — orders no guarda de qué
+      -- lote salió cada línea, ver conversación): la fecha de vencimiento
+      -- MÁS PRÓXIMA entre los lotes ACTIVOS de este producto hoy, no la del
+      -- lote real que se vendió en esta orden puntual. Sirve como alerta
+      -- ("este producto tiene stock por vencer"), no como trazabilidad.
+      (SELECT MIN(pl.expiration_date) FROM product_lots pl WHERE pl.product_id = o.product_id AND pl.status = 'ACTIVE' AND pl.expiration_date IS NOT NULL) AS nearest_expiration,
+      o.approved_by, o.approved_at, au.name AS approved_by_name,
+      o.voided_by, o.voided_at, o.void_reason, vu.name AS voided_by_name,
+      -- editBatch no tiene columna propia (reemplaza las filas por completo,
+      -- ver Fase 117) — el único rastro de "quién editó" vive en
+      -- activity_log (BATCH_EDITED). Se toma la más reciente por batch.
+      (SELECT al.user_email FROM activity_log al WHERE al.entity_type = 'batch' AND al.entity_id = o.batch_id AND al.action = 'BATCH_EDITED' ORDER BY al.created_at DESC LIMIT 1) AS last_edited_by,
+      (SELECT al.created_at FROM activity_log al WHERE al.entity_type = 'batch' AND al.entity_id = o.batch_id AND al.action = 'BATCH_EDITED' ORDER BY al.created_at DESC LIMIT 1) AS last_edited_at,
+      (SELECT bf.note FROM batch_feedback bf WHERE bf.batch_id = o.batch_id) AS feedback_note,
+      (SELECT bf.created_at FROM batch_feedback bf WHERE bf.batch_id = o.batch_id) AS feedback_at,
+      (SELECT fu.name FROM batch_feedback bf JOIN users fu ON fu.id = bf.user_id WHERE bf.batch_id = o.batch_id) AS feedback_by_name,
       (SELECT COALESCE(SUM(bd.amount), 0) FROM batch_damage bd WHERE bd.batch_id = o.batch_id AND bd.qty > 0) AS damage_credits,
       (SELECT r.id FROM route_stops rs JOIN routes r ON r.id = rs.route_id WHERE rs.batch_id = o.batch_id LIMIT 1) AS route_id,
       (SELECT r.name FROM route_stops rs JOIN routes r ON r.id = rs.route_id WHERE rs.batch_id = o.batch_id LIMIT 1) AS route_name,
       (SELECT r.scheduled_date FROM route_stops rs JOIN routes r ON r.id = rs.route_id WHERE rs.batch_id = o.batch_id LIMIT 1) AS route_date,
       (SELECT r.returns_reviewed_at FROM route_stops rs JOIN routes r ON r.id = rs.route_id WHERE rs.batch_id = o.batch_id LIMIT 1) AS route_returns_reviewed_at
-      FROM orders o LEFT JOIN users u ON o.user_id = u.id WHERE 1=1`;
+      FROM orders o LEFT JOIN users u ON o.user_id = u.id
+      LEFT JOIN users au ON o.approved_by = au.id
+      LEFT JOIN users vu ON o.voided_by = vu.id
+      WHERE 1=1`;
     const params: any[] = [];
 
     if (req.user?.role === 'operator') { query += ' AND o.user_id = ?'; params.push(req.user.id); }
@@ -237,7 +332,6 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
       // Fase 115.5 — cortesía: price/total locales guardan el valor real de
       // catálogo (reportería, "cuánto se regaló") — el $0 se aplica recién
       // en la línea de QBO (ver createBatchInvoice/qbInvoices.ts), nunca acá.
-      const isCourtesy = item.is_courtesy ? 1 : 0;
       const [productRows] = await pool.query('SELECT id, qb_item_id FROM products WHERE barcode = ?', [barcode]) as any[];
       const product = productRows[0];
       const qbItemId = product?.qb_item_id ?? null;
@@ -246,11 +340,17 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
       const productId = product?.id ?? null;
 
       const decremented = !routeLoadedBarcodes?.has(barcode);
-      const [result] = await pool.query(
-        "INSERT INTO orders (barcode, product_id, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name, unit, case_qty, payment_method, check_number, is_courtesy, status, stock_decremented) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)",
-        [barcode, productId, product_name, price, quantity, total ?? price * quantity, batchId, req.user?.id ?? null, customer_id ?? null, customer_name ?? null, unit ?? null, case_qty ?? null, payment_method ?? null, check_number ?? null, isCourtesy, decremented ? 1 : 0]
-      ) as any;
-      inserted.push({ id: result.insertId, barcode, product_name, price, quantity, total: total ?? price * quantity, qb_item_id: qbItemId });
+      // Cortesía parcial (backlog #2) — el ítem puede dividirse en dos filas;
+      // el descuento de stock sigue siendo UNO por ítem original y se
+      // atribuye solo a la fila pagada (carriesStock), ver courtesyRowsFor.
+      const rows = courtesyRowsFor({ quantity, total: total ?? price * quantity, unit, case_qty, is_courtesy: item.is_courtesy, courtesy_qty: item.courtesy_qty });
+      for (const row of rows) {
+        const [result] = await pool.query(
+          "INSERT INTO orders (barcode, product_id, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name, unit, case_qty, payment_method, check_number, is_courtesy, status, stock_decremented) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)",
+          [barcode, productId, product_name, price, row.quantity, row.total, batchId, req.user?.id ?? null, customer_id ?? null, customer_name ?? null, unit ?? null, case_qty ?? null, payment_method ?? null, check_number ?? null, row.is_courtesy, row.carriesStock && decremented ? 1 : 0]
+        ) as any;
+        inserted.push({ id: result.insertId, barcode, product_name, price, quantity: row.quantity, total: row.total, qb_item_id: qbItemId });
+      }
 
       if (decremented) {
         await pool.query(
@@ -1168,23 +1268,29 @@ export async function editBatch(req: Request, res: Response): Promise<void> {
 
     for (const item of items) {
       const { barcode, product_name, price, quantity, total, unit, case_qty } = item;
-      const isCourtesy = item.is_courtesy ? 1 : 0;
       const decremented = !routeLoadedBarcodes.has(barcode);
       // product_id (2026-09-07) — ver comentario en createOrder/createBatch.
       const [productRowsForId] = await pool.query('SELECT id FROM products WHERE barcode = ?', [barcode]) as any[];
       const productId = productRowsForId[0]?.id ?? null;
-      await pool.query(
-        `INSERT INTO orders
-           (barcode, product_id, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name,
-            unit, case_qty, payment_method, check_number, is_courtesy, status, reserved_invoice_number,
-            credit_applied, stock_decremented)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AWAITING_APPROVAL', ?, ?, ?)`,
-        [
-          barcode, productId, product_name, price, quantity, total ?? price * quantity, batchId, first.user_id,
-          first.customer_id, first.customer_name, unit ?? null, case_qty ?? null, first.payment_method,
-          first.check_number, isCourtesy, first.reserved_invoice_number, first.credit_applied, decremented ? 1 : 0,
-        ]
-      );
+      // Mismo split de cortesía parcial que createBatch — el descuento de
+      // stock es UNO por ítem (ver courtesyRowsFor) y la reversa de arriba
+      // ya sumó el stock de las filas viejas con stock_decremented=1.
+      const rows = courtesyRowsFor({ quantity, total: total ?? price * quantity, unit, case_qty, is_courtesy: item.is_courtesy, courtesy_qty: item.courtesy_qty });
+      for (const row of rows) {
+        await pool.query(
+          `INSERT INTO orders
+             (barcode, product_id, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name,
+              unit, case_qty, payment_method, check_number, is_courtesy, status, reserved_invoice_number,
+              credit_applied, stock_decremented)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AWAITING_APPROVAL', ?, ?, ?)`,
+          [
+            barcode, productId, product_name, price, row.quantity, row.total, batchId, first.user_id,
+            first.customer_id, first.customer_name, unit ?? null, case_qty ?? null, first.payment_method,
+            first.check_number, row.is_courtesy, first.reserved_invoice_number, first.credit_applied,
+            row.carriesStock && decremented ? 1 : 0,
+          ]
+        );
+      }
       if (decremented) {
         await pool.query('UPDATE products SET stock = GREATEST(stock - 1, 0) WHERE barcode = ?', [barcode]);
         barcodesToSync.add(barcode);
@@ -1204,6 +1310,61 @@ export async function editBatch(req: Request, res: Response): Promise<void> {
     res.json({ batchId, status: 'AWAITING_APPROVAL', itemCount: items.length });
   } catch (err) {
     logger.error('editBatch error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
+// Fase 120 — pantalla obligatoria de notas/feedback tras el segundo ticket
+// (pedido explícito del usuario): Android la muestra justo después de
+// sendBatchAndPrint() y antes de OrderSuccessActivity, texto libre
+// obligatorio. Un batch = una nota (mismo criterio que batch_signatures,
+// una sola fila por batch_id) — visible en el dashboard admin vía
+// listOrders (subquery correlacionada, ver más abajo). Reintentar el envío
+// (ej. reconexión tras perder señal) hace upsert en vez de duplicar.
+// listOrders también la necesita (subquery correlacionada sobre esta tabla
+// para mostrar la nota en el dashboard) — sin este guard, un dashboard
+// abierto antes de que exista la primera fila de feedback tiraría "table
+// doesn't exist" en vez de simplemente no mostrar nada.
+async function ensureBatchFeedbackTable() {
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS batch_feedback (
+      batch_id VARCHAR(100) PRIMARY KEY,
+      note TEXT NOT NULL,
+      user_id INT DEFAULT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )`
+  );
+}
+
+export async function submitBatchFeedback(req: Request, res: Response): Promise<void> {
+  try {
+    const { batchId } = req.params;
+    const { note } = req.body;
+    const trimmed = typeof note === 'string' ? note.trim() : '';
+    if (!trimmed) {
+      res.status(400).json({ error: 'Se requiere una nota de feedback' });
+      return;
+    }
+
+    const [orderRows] = await pool.query(
+      'SELECT id FROM orders WHERE batch_id = ? LIMIT 1', [batchId]
+    ) as any[];
+    if ((orderRows as any[]).length === 0) {
+      res.status(404).json({ error: 'Pedido no encontrado' });
+      return;
+    }
+
+    await ensureBatchFeedbackTable();
+    await pool.query(
+      `INSERT INTO batch_feedback (batch_id, note, user_id) VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE note = VALUES(note), user_id = VALUES(user_id)`,
+      [batchId, trimmed, req.user?.id ?? null]
+    );
+
+    res.status(201).json({ batchId, note: trimmed });
+  } catch (err) {
+    logger.error('submitBatchFeedback error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 }
