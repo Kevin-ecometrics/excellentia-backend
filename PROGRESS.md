@@ -6350,3 +6350,852 @@ de arrancar implementación:
       problema de visualización o de comportamiento esperado.
 - [ ] **#5** Pre-órdenes con stock faltante — confirmar comportamiento
       esperado (avisar / entregar parcial y dejar pendiente / bloquear).
+
+## Fase 122: #1, #3 y #6 del feedback del cliente (2026-09-22)
+
+### #3 — Bug de raíz: timeout/duplicado al recibir mercadería (no era específico de la fecha de vencimiento)
+
+**Causa real, encontrada al revisar `recordMovement()` (`warehouseController.ts`,
+punto de paso único de todo movimiento de stock del módulo Almacén):**
+sincronizaba stock a QBO con `await` **antes** de responder al cliente. Una
+recepción de varias líneas hace un `recordMovement` por línea, cada uno con
+su propia llamada HTTP a QBO, **secuencial** — con pocas líneas ya se supera
+fácil el timeout de 15s del cliente Android (`RetrofitClient`). El cliente
+mostraba error/timeout aunque el servidor terminara bien, y un reintento
+manual del almacenista duplicaba el lote/movimiento que ya se había creado.
+No tiene relación causal con la fecha de vencimiento en sí — la correlación
+que notó el cliente es porque recibir sin fecha es más rápido de tipear, así
+que se tienden a cargar más líneas seguidas antes de guardar, lo que hace
+más probable pisar el timeout.
+
+**Fix:** `recordMovement()` ya no espera la sincronización a QBO — la
+dispara en segundo plano (`syncProductStockToQbo(...).then(...).catch(...)`)
+y responde apenas termina el trabajo local (rápido, solo DB).
+`inventory_movements.qb_synced` se actualiza cuando la llamada a QBO
+termine, sea cual sea el resultado; si falla, sigue siendo reintentable
+desde el Historial (`retryMovementSync`), mismo criterio "silencioso" que
+el resto del proyecto (nada local se revierte por un fallo de QBO). Como es
+la única función de paso, el fix cubre los 6 call sites (recepción, carga/
+descarga de ruta, devolución, daño, ajuste) sin tocarlos uno por uno.
+Efecto secundario aceptado: la respuesta de `createReceipt` ya no puede
+avisar en el momento si el push a QBO falló (`qb_synced` llega siempre
+`null`) — sigue siendo visible y reintentable desde el Historial, que se
+actualiza solo cuando la sincronización en segundo plano termina.
+
+Verificado con `bun tsc --noEmit` (backend) — sin errores. Sin probar
+contra una base de datos real (no se pudo reproducir el timeout tal cual en
+este entorno, sin acceso a QBO ni a los TC22).
+
+### #1 — Unidad de venta visible en revisión de devoluciones
+
+`RouteReturnsActivity` (Android) ya usaba `exp.unit` internamente para
+decidir si el input de cantidad es decimal (Lbs) o entero (Case/Unit/
+Bucket) desde la Fase 118, pero nunca lo mostraba como texto — el
+almacenista no tenía forma de saber, mirando la pantalla, si estaba
+contando cajas, unidades o libras. Se agregó `unitDisplayLabel()`
+(`data/Models.kt`, nuevo — reusa `isLbsUnit()`/`isCaseUnitType()` ya
+existentes) y se muestra junto al nombre del producto: `"Nombre · Case/
+Unit"` / `"Nombre · Lbs"`.
+
+**Nota — detalle adicional del cliente, sin implementar:** además de no
+verse la unidad, hoy el conteo de un producto Case en devoluciones solo
+acepta cajas completas, no unidades sueltas — queda registrado como parte
+del punto #2 (cantidad parcial), que sigue pendiente de confirmar con el
+cliente.
+
+Sin compilar en este entorno (sin Java/Gradle) — revisado a mano, pendiente
+que el usuario corra `:app:compileDebugKotlin`.
+
+### #6a — Recepción de productos Lbs por peso real
+
+**Ya estaba implementado** (no encontrado en esta sesión, verificado
+leyendo el código): `askQtyThenDate()` (`ReceivingActivity.kt`) ya usa
+`isLbsUnit(product.unit)` para habilitar input decimal y clampear el
+mínimo a `0.01` en vez de `1.0` para productos Lbs, mismo criterio que
+Venta/Ruta. No hizo falta ningún cambio — el punto ya estaba resuelto en el
+código, aunque el cliente lo siga reportando (ver nota de #6b abajo).
+
+### #6b — "Cargado" en Lbs se mostraba como entero en revisión de devoluciones
+
+**También ya estaba implementado** en el código (comentario existente
+"Fase 118 (fix)" en `RouteReturnsActivity.kt`): tanto el texto "Cargado
+X.XX · vendido X.XX · esperado de vuelta X.XX" (`wh_expected_label`, string
+con `%.2f` fijo) como los inputs de cantidad (`qtyField()`) ya usan
+`isLbsUnit(exp.unit)` para decimales desde esa fase.
+
+**Conclusión:** el bug que describe el cliente ya no existe en el código
+fuente, pero **nunca se generó ni distribuyó un APK nuevo a los TC22** desde
+la Fase 118 (limitación repetida en varias secciones de este documento) —
+los dispositivos en uso real siguen corriendo una versión vieja que sí
+tenía el bug. No se necesita ningún cambio de código para #6a/#6b; se
+necesita compilar y distribuir un APK actualizado.
+
+### Pendiente después de esta ronda
+
+- Generar y distribuir un APK nuevo a los TC22 — sin esto, #6a/#6b (ya
+  resueltos en código) y el fix de #1 no llegan al uso real.
+- Desplegar el backend a `app.excellentiafoods.com` — sin esto, el fix de
+  #3 (`recordMovement`) no aplica en producción.
+- Reproducir el timeout de #3 contra una base de datos/QBO real para
+  confirmar el diagnóstico end-to-end (se corrigió por análisis de código,
+  no se pudo reproducir en este entorno).
+
+## Fase 123: Recepción offline (2026-09-22)
+
+Pedido del usuario: el almacén tiene pésima conexión — Recepción
+(`ReceivingActivity`) dependía 100% de la red (buscar producto por barcode/
+nombre, guardar la recepción), sin ningún fallback, a diferencia de Venta/
+Pre-órdenes que ya tienen offline-first desde hace varias fases
+(`ProductRepository.findByBarcode` + `OrderRepository`/`PreOrderRepository`
+`.saveOffline*` + `SyncWorker`, tabla `pending_batches`/`pending_preorders`).
+**Alcance acotado a Recepción únicamente** (decisión explícita del usuario)
+— las demás pantallas de Almacén (cargar ruta, revisión de devoluciones)
+dependen de calcular cosas en vivo contra el servidor (ej. sugerencia FIFO
+de lotes) y quedan fuera de esta ronda.
+
+**Mismo patrón que ya existe para ventas**, replicado 1:1:
+
+- `PendingReceiptEntity`/`PendingReceiptDao` (nuevo, tabla `pending_receipts`
+  — `AppDatabase` versión 18 → 19) — igual que `PendingBatchEntity`/
+  `PendingBatchDao`, el request completo se serializa a JSON.
+- `WarehouseRepository.createReceipt()` (nuevo) — mismo criterio que
+  `OrderRepository.createBatch`: si `securePrefs.isOfflineMode()` está
+  prendido, ni intenta la red; si la llamada falla en el momento
+  (excepción — señal intermitente), encola local. Nunca lanza, siempre
+  `Result.success`/`failure`.
+- `SyncWorker` — nuevo bloque que reintenta `pending_receipts` igual que las
+  otras 3 colas, notificación nueva `NotificationHelper.showReceiptSynced()`.
+- `ReceivingActivity` — reescrito para depender de `ProductRepository`
+  (buscar por barcode/nombre, offline-first, mismo mecanismo que ya usa
+  `MainActivity` para vender sin señal) y `WarehouseRepository` (guardar) en
+  vez de llamar a `RetrofitClient` directo. Banner "Guardado sin conexión"
+  (mismo componente visual que el de `MainActivity`) cuando el modo offline
+  está prendido.
+- **Ticket impreso offline** — sin respuesta real del servidor (que
+  normalmente trae `lot_id`/`unit`/`qb_synced` reales), el ticket se arma
+  con lo que ya se tipeó en pantalla (`buildOfflineReceiptItems()`) — mismo
+  shape (`ReceiptResultItem`) que reusa `PrintService.printReceiptTicket()`
+  sin tocarlo. `qb_synced` queda `null` (no aplica el aviso de fallo de QBO
+  en el momento — recién se sabe cuando `SyncWorker` la mande de verdad).
+- `CreateReceiptResponse.localPendingId` (nuevo campo, mismo patrón que
+  `BatchResponse.localPendingId`) — id local de la fila en cola, por si hace
+  falta referenciarla después (no se usa todavía, dejado por consistencia).
+
+**Simplificación deliberada:** `ReceiptItemRequest` siempre manda `barcode`
+(nunca `product_id`) — antes ya se prefería barcode cuando estaba presente;
+ahora es la única vía, porque el catálogo cacheado (`CachedProductEntity`,
+usado offline) no tiene el `product_id` real del backend, solo su propio id
+autoincremental de SQLite. El backend (`createReceipt`) ya resuelve por
+barcode sin cambios.
+
+**Verificado con `:app:compileDebugKotlin` — compila limpio** (JDK
+encontrado en `~/.gradle/jdks/eclipse_adoptium-21-amd64-windows.2`, no hizo
+falta instalar nada). Sin probar contra una base de datos real ni un TC22
+físico — no se pudo simular una recepción real sin conexión en este
+entorno.
+
+### Fuera de esta ronda
+
+- Offline solo en Recepción — carga de ruta y revisión de devoluciones
+  siguen dependiendo de la red (fuera de alcance, ver arriba).
+- No se generó ni distribuyó un APK nuevo a los TC22.
+- Backend no desplegado.
+
+## Fase 124: Modal de recepción para Lbs — texto claro + precarga del peso esperado (2026-09-22)
+
+Pedido de seguimiento: "Cantidad recibida" (genérico, arranca en `1`) no
+tenía sentido para un producto Lbs — una caja de este tipo pesa varias
+libras (ej. 30, no 1), y el texto no aclaraba que se está pidiendo peso.
+
+**Aclarado con el usuario antes de tocar código:** el stock de un producto
+Lbs **ya** se maneja como peso real en todo el sistema (`products.stock`
+acumula libras, no cajas) — el campo `Qty` del catálogo es exclusivo de
+Case/Unit/Bucket y no aplica acá, así que no hacía falta ningún cambio de
+lógica de stock. El barcode de báscula sí trae el peso codificado, pero por
+ahora el almacén lo sigue tipeando a mano (no se implementó lectura
+automática — fuera de esta ronda).
+
+**Fix, `ReceivingActivity.askQtyThenDate()`:**
+- Título del diálogo condicional: para Lbs, `title_receiving_qty_lbs`
+  ("¿Cuántas libras trae esta caja?" / "How many lbs does this box weigh?")
+  en vez del genérico `title_receiving_qty` ("Cantidad recibida").
+- El campo de peso ya no arranca siempre en `"1"` — para Lbs, se precarga
+  con `product.weightPerUnit` (el peso esperado por caja ya cargado en el
+  catálogo, ej. "15/2lbs" = 30 lbs) cuando existe y es > 0, usando
+  `formatQty()` para no mostrar ceros de relleno. El almacenista solo ajusta
+  si la báscula/etiqueta da un peso distinto, en vez de partir siempre de un
+  valor que hay que borrar. Case/Unit/Bucket sin cambios (sigue en `1`).
+
+Verificado con `:app:compileDebugKotlin` — compila limpio. Sin probar
+contra un TC22 físico.
+
+## Fase 125: `products.stock` de Lbs pasa a ser conteo de cajas, no peso — + campo `supplier` en lotes (2026-09-22)
+
+Pedido del usuario, con una vuelta de preguntas para acotar el alcance
+(quedó registrada en la conversación, no repetida acá en detalle): decidió
+que **`products.stock` para un producto Lbs debe ser un conteo de cajas**,
+no libras — para que coincida con cómo Venta ya descuenta stock (-1 por
+línea escaneada, sin importar el peso/cantidad de esa línea, comportamiento
+documentado desde hace tiempo en la sección "Notas de diseño"/`createBatch`
+de este archivo). El fix de Recepción de la Fase 123-124 (precargar/pedir
+el peso real) se mantiene tal cual — sigue haciendo falta para el lote
+(`product_lots`, FIFO por vencimiento) y para el ticket — pero ya no se usa
+ese número para incrementar `products.stock`.
+
+**Backend (`warehouseController.ts`, `createReceipt`):**
+```js
+const stockDelta = isLbsUnit(product.unit) ? 1 : qty;
+await pool.query('UPDATE products SET stock = stock + ? WHERE id = ?', [stockDelta, product.id]);
+```
+`product_lots.received_qty`/`remaining_qty` siguen guardando el peso real
+tipeado (sin cambios) — el lote necesita el peso real para FIFO por
+vencimiento y para saber cuánto queda de esa caja puntual; solo el
+acumulado `products.stock` cambia de escala para Lbs. Case/Unit/Bucket
+**no cambian** — ahí ya era consistente sumar la cantidad recibida tal cual.
+
+**Alcance — ⚠️ SOLO Recepción, no el resto de los movimientos de stock.**
+Marcado explícitamente como fuera de esta ronda (el usuario lo aceptó así,
+priorizando cerrar Recepción hoy): los siguientes puntos **siguen moviendo
+`products.stock` por peso real para un producto Lbs**, y por lo tanto
+quedan inconsistentes con este fix hasta que se revisen con el mismo
+criterio:
+- Cargar/descargar una ruta (`addRouteItem`/`removeRouteItem`,
+  `routeController.ts`) — descuenta/restaura por el peso cargado, no por
+  caja.
+- Revisión de devoluciones (`createReturns`) — restituye stock por el peso
+  bueno devuelto.
+- Daño/vencimiento de un lote (`setLotCondition`) — da de baja por el peso
+  restante del lote.
+- Ajuste manual de un lote (`updateLot`) — el delta de `quantity` (peso) se
+  sigue aplicando 1:1 a `products.stock`; para Lbs debería no tocar stock en
+  absoluto (corregir el peso de una caja ya recibida no cambia cuántas cajas
+  hay), pero no se tocó en esta ronda.
+- Backfill de stock preexistente (`backfillLots`) — sigue comparando
+  `products.stock` contra la suma de `remaining_qty` de los lotes (que ahora
+  para Lbs están en escalas distintas: cajas vs. libras) — el cálculo de
+  "cuánto no tiene lote detrás" queda incorrecto para Lbs hasta que se
+  revise.
+
+**Siguiente pedido del usuario en la misma vuelta — proveedor por lote.**
+Agregado `product_lots.supplier` (columna nueva, texto libre, mismo
+criterio que `lot_number` de la Fase 120 — sin checkbox de "sin proveedor",
+vacío ya es suficientemente claro). Motivo: el mismo producto/barcode puede
+recibirse de más de un proveedor, y hasta ahora no había forma de
+diferenciar de cuál vino cada caja.
+
+- **Backend** — `createReceipt` acepta `supplier` por línea, se guarda en
+  `product_lots.supplier`; `listLots`, `getReceiptDetail` lo exponen;
+  `listReceipts` lo suma a la búsqueda (`?search=`, junto a
+  `receipt_batch_id`/nombre de producto/`lot_number`).
+- **Android** — nuevo campo "Proveedor (opcional)" en el mismo diálogo que
+  ya pide lote/expiración (`askExpirationThenAdd`, `ReceivingActivity`); se
+  muestra en el resumen de la línea antes de guardar, y se imprime en el
+  ticket de recepción (`PrintService.buildReceiptCpcl`, solo si se cargó).
+  Camino offline (`buildOfflineReceiptItems`) también lo incluye.
+- **Fuera de esta ronda** — no se agregó a la pantalla "Editar lote"
+  (`InventoryMovementsActivity`, mismo estado que quedó `lotNumber` en la
+  Fase 120 — el modelo ya tiene el campo listo pero la UI de edición
+  posterior no lo expone) ni a `/warehouse/inventory` (webapp).
+
+**Migración manual pendiente (agregada a la sección de arriba):**
+```sql
+ALTER TABLE product_lots ADD COLUMN IF NOT EXISTS supplier VARCHAR(255) DEFAULT NULL AFTER lot_number;
+```
+
+Verificado con `bun tsc --noEmit` (backend) y `:app:compileDebugKotlin`
+(Android, JDK de `~/.gradle/jdks/...`) — ambos compilan limpio. Sin probar
+contra una base de datos real ni un TC22 físico.
+
+### Pendiente real si se quiere consistencia completa
+
+Si más adelante se decide alinear el resto de los movimientos (ruta, 
+devoluciones, daño, ajuste, backfill) al mismo criterio "stock de Lbs = 
+cajas", es un trabajo aparte — cada uno de esos call sites hoy razona en 
+peso y habría que decidir, caso por caso, qué significa "+1 caja" cuando la 
+operación es sobre un lote que ya viene parcialmente consumido (ej. un lote 
+Lbs con `remaining_qty` a mitad de camino por FIFO entre varias rutas).
+
+## Fase 126: Reversión — `products.stock` de Lbs vuelve a ser peso real, se corrige Venta en su lugar (2026-09-22)
+
+**Decisión final tras revisar los 6 puntos de la Fase 125 uno por uno con el
+usuario:** dar marcha atrás al "stock en cajas" para Lbs. Motivo — un
+producto de peso variable se consume por **peso fraccionario** en todos
+lados (FIFO puede sacar 10 lbs de una caja de 30, una venta puede ser de
+3.2 lbs) — "conteo de cajas" no compone con eso apenas se toca una caja
+parcialmente (cargar ruta, devolver, dañar, ajustar). La inconsistencia real
+y arreglable estaba del otro lado: **Venta** descontaba -1 fijo por línea
+sin importar el peso vendido, el único punto de todo el sistema que no
+razonaba en peso para Lbs.
+
+**Revertido — `createReceipt` (`warehouseController.ts`):** vuelve a sumar
+el peso real (`qty`) a `products.stock`, sin distinguir por `unit`. Import
+de `isLbsUnit` removido (ya no se usa en este archivo).
+
+**Corregido — descuento de Venta, 4 call sites en `orderController.ts`:**
+para un producto Lbs, el delta contra `products.stock` ahora es el **peso
+real de la línea** (`quantity`/`o.quantity`, según el punto), no ±1 fijo.
+Case/Unit/Bucket no cambian (ahí -1 por línea sí tiene sentido, son
+unidades indivisibles).
+- `createBatch` (descuento al vender) — `stockDelta = isLbsUnit(unit) ? Number(quantity) : 1`.
+- `cancelBatch` (reversión al cancelar) — mismo criterio con `o.unit`/`o.quantity` de la fila.
+- `editBatch` — reversión de las filas viejas Y descuento de las filas
+  nuevas, mismo criterio en los dos puntos.
+- `createOrder` no se tocó — nunca descontó stock (gap preexistente,
+  documentado desde antes, sin relación con este fix).
+
+Con esto, `products.stock` de un Lbs vuelve a significar "libras reales en
+el almacén" en **todos** los call sites — lotes, recepción, ruta,
+devoluciones, daño, ajuste y ahora también venta — sin ningún punto que siga
+razonando en "cajas".
+
+**Agregado — "≈ N cajas" como referencia visual (webapp, `/products`):**
+`ProductRow.tsx` — debajo del número de stock, solo para productos Lbs con
+`weight_per_unit` cargado en el catálogo: `stock / weight_per_unit`, con 1
+decimal (ej. "≈ 17.6 cajas"). **Puramente informativo — nunca se guarda ni
+se usa en ningún cálculo real** (aclarado en comentario): las cajas reales
+no siempre pesan lo que dice el catálogo (por eso se pesan en Recepción),
+así que esto es una estimación, no un conteo exacto. String nuevo
+`prod_approxCases` (ES/EN, `app/lib/i18n.ts`).
+
+**Fuera de esta ronda** — el "≈ N cajas" solo se agregó en `/products`
+(webapp). No se agregó en Android (catálogo, modal de producto) ni en
+`/warehouse/inventory` — decir si hace falta ahí también queda para una
+próxima vuelta.
+
+Verificado con `bun tsc --noEmit` en **los dos backends** (excellentia y
+excellentia-webapp) — ambos compilan limpio. Sin probar contra una base de
+datos real.
+
+## Fase 127: Modal de recepción — proveedor, lote y expiración pasan a ser obligatorios (2026-09-22)
+
+Pedido del usuario: en el diálogo de lote/expiración de `ReceivingActivity`
+(Android), los 3 campos eran opcionales — ahora **todos son obligatorios**
+para poder tocar "Confirmar":
+- **Proveedor** — ahora siempre requiere texto (antes opcional).
+- **Lote** — o se escribe un número de lote, o se tilda "sin número de
+  lote" (ya existía la opción, pero antes también se podía dejar los dos
+  sin tocar; ahora hay que elegir explícitamente uno de los dos caminos).
+- **Fecha de expiración** — ahora obligatorio elegir una fecha (antes se
+  podía guardar sin fecha).
+
+**Implementación** — el diálogo se arma con `.create()` en vez de dejar que
+el builder cierre solo al tocar "Confirmar" (mismo patrón ya usado en
+`MyRouteDetailActivity.askSkipReason()`): se intercepta el click del botón
+positivo, se valida, y si falta algo se marca en rojo (`EditText.error` para
+proveedor/lote, un texto de error debajo del botón de fecha) sin cerrar el
+diálogo ni perder lo que ya se tipeó. Recién si los 3 campos están completos
+se llama `addLine()` y se cierra.
+
+**⚠️ Nota que no llegué a chequear con el usuario:** `CLAUDE.md` documenta
+que "sin fecha de expiración es un dato válido (no todos los productos
+vencen)" — con este cambio, un producto que de verdad nunca vence (ej. sal,
+azúcar) va a obligar a poner una fecha igual, probablemente muy lejana a
+mano cada vez. No se agregó una opción tipo "no vence" (paralela a "sin
+número de lote") porque no se pidió explícitamente — si en la práctica
+molesta, es un ajuste chico agregar ese checkbox.
+
+**Fuera de esta ronda** — la validación es solo del lado de Android (UI).
+El backend (`createReceipt`) sigue aceptando los 3 campos como opcionales
+—no se agregó validación server-side— así que un llamado directo a la API
+(sin pasar por este modal) todavía puede mandar una recepción sin
+proveedor/lote/expiración.
+
+Verificado con `:app:compileDebugKotlin` — compila limpio. Sin probar
+contra un TC22 físico.
+
+## Fase 128: Mismo bug de "arranca en 1" para Lbs, pero al cargar una ruta (2026-09-23)
+
+Encontrado por el usuario probando la Fase 124-127 en el checklist de
+prueba: panel de reconciliación de `WarehouseRouteDetailActivity` mostraba
+`Loaded 2.00` / `Sold 13.65` para un producto Lbs — vendido más que lo
+"cargado" no tiene sentido físico. Causa: `showQuantityDialog()` (diálogo
+que pide cantidad al escanear un producto para cargarlo a la ruta,
+**distinto** del que ya se arregló ayer en `ReceivingActivity`) tenía
+exactamente el mismo bug — arrancaba siempre en `"1"` sin importar el tipo
+de producto, así que para Lbs alguien tipeaba un número chico (ej. "2")
+sin saber que se estaba pidiendo peso real, en vez de partir de una
+referencia razonable.
+
+**Fix** — mismo criterio que la Fase 124: se precarga con
+`product.weightPerUnit` (peso esperado del catálogo) cuando existe y es >
+0, y el título cambia a "¿Cuántas libras vas a cargar?" / "How many lbs are
+you loading?" (`title_load_quantity_lbs`, nuevo — no se reusó el de
+Recepción para no mezclar contextos). `showQuantityDialogForAvailable()`
+(el otro diálogo de carga, usado desde el picker "Disponible") **no tenía
+este bug** — ya precargaba con `product.availableQty`, el peso real
+restante del lote elegido, no un "1" a ciegas.
+
+Verificado con `:app:compileDebugKotlin` — compila limpio. Sin probar
+contra un TC22 físico ni corregir los datos de prueba ya cargados (el
+"Loaded 2.00" que reportó el usuario queda como dato histórico en esa ruta,
+esto solo previene que se repita).
+
+## Fase 129: Checkbox "Este producto no vence" en el modal de recepción (2026-09-23)
+
+Cierra el aviso pendiente de la Fase 127: hacer la fecha de expiración
+obligatoria para todo, sin excepción, obligaba a inventar una fecha lejana
+a mano para productos que de verdad nunca vencen (sal, azúcar, etc.).
+
+**Fix, `ReceivingActivity.askExpirationThenAdd()`:** checkbox nuevo `cb_no_expiration`
+("Este producto no vence"), mismo patrón que "sin número de lote" — al
+tildarlo, deshabilita el botón de fecha, limpia cualquier fecha ya elegida,
+y la validación de "Confirmar" deja de exigir `chosenDate`. Sin tildarlo,
+el comportamiento de la Fase 127 sigue igual (fecha obligatoria). El
+backend no cambió — `expiration_date = null` ya era un valor válido desde
+antes (`product_lots.expiration_date DEFAULT NULL`).
+
+Verificado con `:app:compileDebugKotlin` — compila limpio. Sin probar
+contra un TC22 físico.
+
+## Fix (2026-09-23) — error de compilación "Can not extract resource" (apóstrofe sin escapar)
+
+Reportado por el usuario al intentar compilar: `cb_no_expiration` en
+inglés (`strings.xml`, Fase 129) tenía `"This product doesn't expire"` —
+el apóstrofe de `doesn't` sin escapar rompe `aapt2` (Android exige `\'`
+o envolver el string entero en comillas dobles). Corregido a
+`doesn\'t`. Verificado con `:app:assembleDebug` completo (no solo
+`compileDebugKotlin`, que no siempre dispara el procesamiento de recursos
+con aapt2) — build exitoso, APK debug generado.
+
+## Fase 130: Revisión completa de las Fases 122-129 (2026-09-23)
+
+Repaso pedido por el usuario de todo lo hecho en la sesión — línea por línea
+de cada archivo tocado (backend y Android), para encontrar errores u
+omisiones antes de dar el trabajo por cerrado.
+
+### Confirmado correcto, sin cambios
+- `recordMovement()` (async QBO), `createReceipt` (lot_number/supplier/
+  stock en peso real), `listLots`/`getReceiptDetail`/`listReceipts`
+  (supplier expuesto y buscable).
+- Los 4 call sites de stock de Venta (`createBatch`/`cancelBatch`/
+  `editBatch` reversión y descuento) — `unit`/`quantity` en scope
+  correctamente en cada uno, cortesía parcial no interfiere (Lbs nunca
+  parte en dos filas).
+- `ReceivingActivity` completo (offline, modal Lbs, campos obligatorios,
+  checkbox "no vence") — sin bugs encontrados en la revisión.
+- `WarehouseRouteDetailActivity.showQuantityDialog()` (Fase 128) — correcto.
+- `RouteReturnsActivity` (unitDisplayLabel) — correcto.
+- `ProductRow.tsx` (≈ cajas, webapp) — correcto, guardas de `> 0` en su
+  lugar.
+- AppDatabase versión 19, migración `pending_receipts` — sin conflictos de
+  versión con nada más tocado en la sesión.
+
+### 3 gaps reales encontrados y corregidos en esta revisión
+
+1. **`updateLot` (backend) no aceptaba `supplier`** — se agregó `lot_number`
+   a la Fase 120 como editable después de recibido, pero `supplier` (Fase
+   125) se quedó afuera por descuido. Corregido: mismo patrón que
+   `lot_number` (trim, `''` → `null`).
+2. **`ProductLotDto` (Android) no tenía el campo `supplier`** — el backend
+   ya lo manda en `listLots` desde la Fase 125, pero como el DTO no lo
+   declaraba, Gson lo descartaba en silencio (sin crashear, simplemente
+   invisible). Agregado al modelo.
+3. **`UpdateLotRequest` (Android) no tenía `supplier`** — agregado por
+   paridad con `lotNumber` (mismo estado: el backend ya lo soporta, sin UI
+   en "Editar lote" todavía).
+4. **Diálogo "View ticket" de la pestaña "Recibos"** (`InventoryMovementsActivity.showReceiptTicketDialog`)
+   no mostraba el proveedor aunque `ReceiptResultItem.supplier` ya existía
+   desde la Fase 125 — se imprimía en el ticket físico pero no se veía acá.
+   Agregada la línea "Supplier: X".
+
+### Gaps que ya estaban documentados y siguen sin resolver (no son nuevos, no se tocaron)
+
+- "Editar lote" (`InventoryMovementsActivity.showEditLotDialog`) no expone
+  ni `lot_number` ni `supplier` en su UI — el backend y los modelos ya lo
+  soportan, mismo estado en el que quedó `lot_number` desde la Fase 120.
+- La pestaña "Disponible" (`renderAvailable()`) no muestra `lot_number` ni
+  `supplier` en la tarjeta de cada lote — mismo gap preexistente desde la
+  Fase 120, no introducido por esta sesión.
+- `≈ N cajas` solo está en `/products` (webapp) — no en Android ni en
+  `/warehouse/inventory`.
+- `webapp` no muestra `supplier` en ningún lado (`/warehouse/inventory`).
+
+Verificado con `bun tsc --noEmit` (backend) y `:app:assembleDebug` completo
+(Android, con procesamiento de recursos aapt2 incluido) — ambos compilan
+limpio después de los 4 fixes de esta revisión.
+
+## Estado consolidado de la sesión — Fases 122 a 130 (2026-09-22/23)
+
+Resumen ejecutivo de toda la sesión (backend + Android + webapp), para no
+tener que reconstruirlo leyendo las 9 fases sueltas de arriba.
+
+### ✅ Hecho y verificado (compila limpio en los 3 proyectos)
+
+**Backend (`excellentia`):**
+- [x] Fix de raíz del timeout/duplicado al recibir — `recordMovement()` ya
+      no espera la sincronización a QBO antes de responder (corre en
+      segundo plano). Cubre los 6 call sites del módulo Almacén.
+- [x] `product_lots.supplier` — columna nueva, capturable en `createReceipt`,
+      editable en `updateLot`, expuesta en `listLots`/`getReceiptDetail`,
+      buscable en `listReceipts`.
+- [x] `products.stock` de un producto Lbs vuelve a ser **peso real en
+      libras** en los 4 call sites de Venta (`createBatch`/`cancelBatch`/
+      `editBatch` reversión y descuento) — antes restaba/sumaba -1/+1 fijo
+      sin importar el peso. Ya era peso real en recepción, ruta,
+      devoluciones, daño y ajuste (sin tocar).
+
+**Android:**
+- [x] Unidad de venta visible en revisión de devoluciones
+      (`RouteReturnsActivity`).
+- [x] Recepción offline completa — cola local (`pending_receipts`),
+      `WarehouseRepository`, sync en segundo plano (`SyncWorker`), banner,
+      ticket armado local si offline. Solo Recepción (alcance acotado a
+      pedido del usuario).
+- [x] Modal de peso para Lbs (Recepción y Carga a ruta) — precarga
+      `weight_per_unit` del catálogo en vez de `"1"`, título aclarado por
+      contexto.
+- [x] Modal de recepción con proveedor + lote (o "sin lote") + expiración
+      (o "no vence") **obligatorios** para confirmar, con marcado en rojo
+      de lo que falte.
+- [x] `ProductLotDto`/`UpdateLotRequest`/`ReceiptItemRequest`/
+      `ReceiptResultItem` actualizados con `supplier`.
+- [x] Fix de compilación — apóstrofe sin escapar en un string en inglés.
+
+**Webapp (`excellentia-webapp`):**
+- [x] `≈ N cajas` en `/products`, debajo del stock, solo para Lbs con
+      `weight_per_unit` cargado — puramente visual, `stock ÷ weight_per_unit`.
+
+### 🔲 Pendiente — acción tuya, no de código
+
+- [x] **Migración SQL en tu base de datos** — confirmado por el usuario
+      (2026-09-23): `lot_number` y `supplier` ya corridas contra
+      `product_lots`.
+- [ ] Reiniciar el backend (`bun run dev` o el proceso que corresponda) para
+      que tome el código de esta sesión, si lo tenías corriendo desde antes.
+- [ ] Generar y distribuir un APK nuevo a los TC22 — nada de lo de Android
+      llega al uso real sin esto.
+- [ ] Desplegar el backend a `app.excellentiafoods.com` (o el destino que
+      corresponda) — nada de lo de backend llega a producción sin esto.
+- [ ] Commitear los cambios (backend y Android son repos separados) —
+      ninguno de los dos está commiteado todavía.
+
+### 🔲 Pendiente — gaps de UI conocidos, dejados fuera a propósito (no bloquean nada)
+
+- [ ] "Editar lote" (`InventoryMovementsActivity.showEditLotDialog`) no
+      tiene campos para corregir `lot_number` ni `supplier` después de
+      recibido — el backend y los modelos ya lo soportan, falta solo la UI.
+      Mismo estado en que quedó `lot_number` desde la Fase 120.
+- [ ] La pestaña "Disponible" (`renderAvailable()`) no muestra `lot_number`
+      ni `supplier` en la tarjeta de cada lote.
+- [ ] `≈ N cajas` solo existe en `/products` (webapp) — no en Android ni en
+      `/warehouse/inventory`.
+- [ ] `supplier` no se muestra en ningún lado de la webapp
+      (`/warehouse/inventory`).
+
+### 🔲 Pendiente — backlog del cliente (2026-09-21), sin tocar en esta sesión
+
+Estos son los puntos #2, #4 y #5 de la reunión original — siguen esperando
+una vuelta más con el cliente antes de poder diseñarse (ver sección
+"Feedback del cliente sobre Almacén" más arriba en este documento):
+- [ ] #2 — Vender/cargar en cantidad parcial (media caja) — confirmar en
+      qué parte del flujo aplica.
+- [ ] #4 — Productos con más de un lote de caducidad — confirmar si es
+      visual o de comportamiento.
+- [ ] #5 — Pre-órdenes con stock faltante — confirmar comportamiento
+      esperado.
+
+### Nada de esto se probó contra:
+- Una base de datos real (solo compilación/lectura de código).
+- Un TC22 físico.
+- Una impresora física.
+- QuickBooks Online real.
+
+## Fase 131: Los 4 gaps de UI pendientes, resueltos (2026-09-23)
+
+Cierra los 4 puntos que habían quedado documentados como "fuera de esta
+ronda" en la Fase 130.
+
+### 1. "Editar lote" ahora expone lote y proveedor
+`InventoryMovementsActivity.showEditLotDialog()` (Android) — agregados
+`etLotNumber`/`etSupplier`, prefilled con los valores actuales del lote.
+`updateLot()` ahora recibe `lotNumber`/`supplier` opcionales y los pasa al
+`UpdateLotRequest` (el backend ya los soportaba desde la Fase 120/125-131).
+Nota: dejar el campo en blanco NO borra un valor ya cargado (mismo criterio
+que el resto del formulario — solo se manda lo que tiene contenido); para
+borrar un dato ya cargado no hay una vía explícita todavía.
+
+### 2. Pestaña "Disponible" (Android) ahora muestra lote, proveedor y "≈ cajas"
+`renderAvailable()` — cada línea de lote ahora suma `· Lote: X` / `· Proveedor: Y`
+cuando existen. El encabezado de cada grupo de producto suma una línea
+"≈ N cajas" para Lbs con `weight_per_unit` cargado (mismo cálculo/criterio
+que la webapp: puramente informativo). Requirió: `ProductLotDto` (Android)
++ `weight_per_unit` en el backend (`listLots`, columna nueva en el SELECT).
+
+### 3. "≈ N cajas" — equivalente en Android
+No hay una pantalla de catálogo navegable en Android análoga a `/products`
+(la venta es scan-first, no hay listado tipo tabla) — se agregó en el lugar
+más equivalente: la pestaña "Disponible" del Sub-inventario (punto 2 de
+arriba), que es donde el almacenista revisa stock por producto.
+
+### 4. `/warehouse/inventory` (webapp) ahora muestra proveedor y "≈ cajas"
+`InventoryClient.tsx` — `ProductLot` suma `supplier`/`unit`/`weight_per_unit`
+(el backend ya los mandaba en `listLots` desde antes, salvo `weight_per_unit`,
+agregado ahora); `availableGroups` los propaga. Cada lote muestra
+"· Proveedor: X" cuando existe; cada grupo de producto Lbs muestra
+"≈ N cajas" debajo del badge de disponible, mismo criterio que `/products`.
+Strings i18n nuevos `wh_supplier`/`wh_approxBoxes` (ES/EN).
+
+### Backend — un cambio de una línea habilitó los puntos 2 y 4
+`listLots` — se agregó `p.weight_per_unit` al SELECT (antes solo devolvía
+`unit`, no el peso nominal de referencia).
+
+Verificado con `bun tsc --noEmit` en **los dos backends** y
+`:app:assembleDebug` completo (Android) — los 3 compilan limpio.
+Sin probar contra una base de datos real, un TC22 físico, ni la webapp en
+un browser real.
+
+### Gap conocido, no resuelto (fuera de alcance de este pedido)
+`ProductDetailActivity` (pantalla de venta en Android) no muestra
+"≈ cajas" al vender — no es un catálogo navegable, y agregarlo ahí exigiría
+pasar `weight_per_unit` como extra nuevo en cada Activity que lanza esta
+pantalla (`MainActivity`, `WarehouseRouteDetailActivity`, etc.), más
+alcance del que pidió el usuario para "el catálogo".
+
+## Fase 132: Backlog #4 y #5 aclarados y resueltos, #2 queda para después (2026-09-23)
+
+### #2 — Cantidad parcial: pospuesto a pedido explícito del usuario
+Sin cambios. Sigue documentado como pendiente, sin fecha.
+
+### #4 — "No queda claro que hay varios vencimientos distintos"
+Aclarado con el usuario: el problema es específicamente en el Sub-inventario
+— pestaña **Disponible**, que ya lista cada lote con su propia fecha, pero
+no hay ninguna señal que salte a la vista cuando esas fechas son distintas
+entre sí (hay que leer una por una y compararlas mentalmente).
+
+**Fix — badge "⚠ N vencimientos distintos"**, solo cuando de verdad hay más
+de una fecha distinta entre los lotes de un mismo producto (varios lotes
+que vencen el mismo día no cuentan, a propósito):
+- **Android** (`InventoryMovementsActivity.renderAvailable()`).
+- **Webapp** (`InventoryClient.tsx`, `/warehouse/inventory`) — mismo
+  criterio, aprovechando que ya se tocó este componente hoy (Fase 131).
+
+### #5 — Aviso de stock bajo/agotado al crear una pre-orden
+Aclarado con el usuario: **avisar, no bloquear** — la pre-orden es una
+intención de venta futura (se detalla recién al convertir), así que no
+tiene sentido impedir crearla por el stock de hoy.
+
+**Backend** (`createPreOrder`, `preOrderController.ts`) — por cada ítem,
+consulta `products.stock` por barcode; si es `<= 5` (mismo umbral que ya
+usa `ProductRow.tsx` en la webapp para "stock bajo"), lo agrega a
+`stock_warnings` en la respuesta (`{ barcode, product_name, stock }`).
+Nunca bloquea la creación — la pre-orden ya se insertó antes de este check.
+
+**Android** (`CreatePreOrderActivity`) — si `stock_warnings` viene con
+datos, muestra un diálogo no bloqueante ("Ojo con el stock") con la lista
+de productos afectados (distingue "está en 0" de "tiene poco stock (N)")
+justo después de crear, y recién ahí cierra la pantalla. Camino offline: no
+hay warnings (no se puede calcular sin conexión), cierra directo como antes.
+
+**Fuera de alcance** — `convertPreOrder` no se tocó (el aviso es solo al
+crear, no al convertir); el umbral de "stock bajo" está hardcodeado a `5`
+en el backend, no es configurable.
+
+Verificado con `bun tsc --noEmit` (backend y webapp) y `:app:assembleDebug`
+completo (Android) — los 3 compilan limpio. Sin probar contra una base de
+datos real ni un TC22 físico.
+
+## ⚠️ HALLAZGO CRÍTICO (sin resolver, pospuesto a pedido del usuario) — `products.stock` es INT, no DECIMAL
+
+Encontrado al construir la Fase 133 (botón "Inventario"): la columna real
+en `excellentia_schema.sql` es `stock INT DEFAULT 0` — **no** `DECIMAL`, y
+no hay ninguna migración en este documento que la haya cambiado.
+
+**Esto rompe la premisa central de toda la Fase 126** (stock de Lbs = peso
+real, ej. 12.87): cada `UPDATE products SET stock = stock + 12.87` se
+guarda en una columna entera — MySQL **redondea** el resultado al entero
+más cercano en cada escritura. No es un bug introducido hoy — la recepción
+por peso real ya escribía así desde antes (Fase 112+) — pero significa que
+el stock de un producto Lbs **nunca fue exacto**, y todo lo que se calculó
+hoy sobre ese número (`≈ N cajas`, el descuento de venta por peso real de
+la Fase 126) hereda ese redondeo acumulado.
+
+**Decisión del usuario (2026-09-23): pospuesto.** Se priorizó terminar el
+botón de Inventario (Fase 133) antes de tocar el schema. **Pendiente
+urgente para la próxima sesión:**
+```sql
+ALTER TABLE products MODIFY COLUMN stock DECIMAL(10,2) NOT NULL DEFAULT 0;
+```
+y actualizar dónde `stock` se tipa como entero:
+- Backend: revisar cualquier `parseInt`/cast a entero sobre `products.stock`.
+- Android: `Product.stock: Int` y `ProductDto.stock: Int` (`Models.kt`) —
+  pasarían a `Double`; revisar todos los usos (`stock <= 5`, `stock == 0`,
+  `intent.getIntExtra("STOCK", ...)` en `ProductDetailActivity`, etc.).
+- Webapp: tipo `Product.stock` en TypeScript (`/products`, `/warehouse/inventory`).
+
+## Fase 133: Botón "Inventario" en Almacén — consulta de stock, solo lectura (2026-09-23)
+
+Pedido explícito del usuario: agregar al hub de Almacén (`WarehouseActivity`,
+Android) un botón nuevo que dé acceso al almacenista a ver el mismo stock
+que ya ve el admin en `/products` (webapp) — **sin poder crear ni editar
+productos**, pura consulta.
+
+**Nueva pantalla `WarehouseInventoryActivity`** — reusa `GET /api/products`
+tal cual (`getAllProducts`, ya existía en `ApiService`, sin backend nuevo):
+trae el catálogo completo de una sola vez (límite 1000, mismo criterio que
+`OrderRepository` para cachear todo el catálogo) y filtra en el cliente por
+nombre/SKU/barcode a medida que se tipea en el buscador (sin golpear la red
+en cada letra). Por producto muestra:
+- **Producto** (nombre).
+- **Type** (unidad — Case/Unit, Lbs, Bucket — vía `unitDisplayLabel()`,
+  Fase 122).
+- **Stock**, con el mismo código de color que ya usa `ProductRow.tsx`
+  (rojo = 0, ámbar = ≤5, verde = resto).
+- **Columna extra que se ofreció agregar si convenía:** "≈ N cajas" para
+  Lbs con `weight_per_unit` cargado — mismo cálculo que `/products` y
+  Sub-inventario.
+
+Botón "Inventario" nuevo en `WarehouseActivity` (junto a "Recepción" y
+"Sub-inventario"), actividad registrada en el manifest.
+
+**Fuera de alcance, a propósito** — ningún botón de crear/editar/eliminar
+producto; esta pantalla es 100% de solo lectura, coherente con "la webapp
+es la única que gestiona productos, la app Android nunca los crea".
+
+Verificado con `:app:assembleDebug` completo — compila limpio. Sin probar
+contra una base de datos real ni un TC22 físico.
+
+## Pendiente para mañana — migración `products.stock` INT → DECIMAL(10,2)
+
+Decisión del usuario (2026-09-23): documentar el alcance completo y
+posponer la implementación para la próxima sesión. Relevamiento hecho con
+grep real sobre los 3 proyectos (no de memoria) — lista concreta de qué
+tocar:
+
+**Por qué hace falta:** `products.stock` es `INT` en la base real
+(`excellentia_schema.sql:39`, sin ninguna migración que lo cambie). Todo
+producto Lbs (peso variable) escribe valores decimales ahí (ej. 12.87) —
+MySQL los redondea al guardar en una columna entera. Afecta recepción,
+venta, y todo lo calculado sobre stock de Lbs desde la Fase 126 de hoy
+(y desde antes, en realidad — no es un bug nuevo de esta sesión).
+
+**Se aplica a toda la tabla `products`** (una sola columna, no se puede
+discriminar por tipo de producto) — pero en la práctica **solo cambia algo
+para Lbs**: Case/Unit/Bucket ya son siempre enteros, guardarlos como
+DECIMAL no altera su comportamiento (5 se guarda como 5.00, sin diferencia).
+
+### 1. Backend — solo schema, cero código
+```sql
+ALTER TABLE products MODIFY COLUMN stock DECIMAL(10,2) NOT NULL DEFAULT 0;
+```
+- `excellentia_schema.sql:39` — `` `stock` INT DEFAULT 0`` → `DECIMAL(10,2) NOT NULL DEFAULT 0`
+- `src/db/schema.sql:43` — misma definición duplicada, actualizar los dos.
+- Ningún controller necesita cambios — todos los `GREATEST(stock ± ?, 0)`
+  (orderController/warehouseController/routeController) usan `Number(...)`
+  sin cast a entero, siguen funcionando igual con la columna en DECIMAL.
+
+### 2. Android — 9 archivos, cambio mecánico `Int` → `Double`
+| Archivo | Qué cambia |
+|---|---|
+| `data/Models.kt:13` | `Product.stock: Int` → `Double` |
+| `data/Models.kt:68` | `ProductDto.stock: Int` → `Double` |
+| `data/Models.kt:886` | `RouteItemResponse.stock: Int` → `Double` |
+| `data/Models.kt:910` | `PreOrderStockWarning.stock: Int` → `Double` (agregado en la Fase 132) |
+| `data/local/entities/CachedProductEntity.kt:11` | `stock: Int` → `Double` |
+| `data/local/dao/ProductDao.kt:104` | `c.getInt(...)` → `c.getDouble(...)` |
+| `data/local/AppDatabase.kt:21` | `stock INTEGER DEFAULT 0` → `REAL` — **necesita bump de `DATABASE_VERSION` (hoy en 19) + migración de `cached_products` en `onUpgrade`** — la parte más delicada, toca datos ya cacheados en los TC22 |
+| `MainActivity.kt:641` | `SuggestionItem.stock: Int` → `Double` |
+| `ProductDetailActivity.kt:155,158` | `intent.getIntExtra("STOCK", -1)` → `getDoubleExtra`; `stock == 0` sigue igual con Double |
+| 5 call sites de `putExtra("STOCK", product.stock)` | `CreatePreOrderActivity.kt:360`, `MainActivity.kt:624,666`, `MyRouteDetailActivity.kt:490`, `PreOrderDetailActivity.kt:557` — quedan iguales una vez que `product.stock` sea Double (Kotlin resuelve el overload de `putExtra` solo) |
+
+### 3. Webapp — 1 archivo real
+- **`ProductModal.tsx`** — `parseInt(form.stock)` (×2, líneas 63/65) →
+  `parseFloat`; `<input type="number" step="1">` (línea 213) →
+  `step="0.01"`, para que el admin pueda escribir un stock con decimales al
+  editar un producto a mano.
+- `ProductRow.tsx`, `ProductsClient.tsx`, `page.tsx` — ya tipados `number`
+  en TS, sin cambios necesarios (van a mostrar decimales solos).
+
+**Riesgo principal a tener en cuenta mañana:** la migración de
+`AppDatabase.kt` en Android — es la única de las 3 partes que toca datos ya
+persistidos en los dispositivos (cache local de productos en los TC22), a
+diferencia del resto que son solo cambios de tipo en código nuevo.
+
+**Estado: sin implementar, pendiente para la próxima sesión.**
+
+## Fix (2026-09-23) — faltaba el peso de referencia en "Inventario" (WarehouseInventoryActivity)
+
+Reportado por el usuario tras probar el botón "Inventario" de la Fase 133:
+faltaba mostrar `weight_per_unit` (columna "Weight/lb" que ya se ve en
+`/products`, webapp) — el catálogo ya traía el dato (usado internamente
+para calcular "≈ cajas"), pero nunca se mostraba el número tal cual.
+
+Agregada la línea "Peso: N lb" / "Weight: N lb" (`wh_weight_per_unit`) para
+cualquier producto con `weight_per_unit` cargado en el catálogo, sin
+importar el tipo de unidad (mismo criterio que la columna de la webapp, que
+tampoco discrimina por tipo). Queda entre "Type" y "≈ N cajas" en cada
+tarjeta.
+
+Verificado con `:app:assembleDebug` — compila limpio.
+
+## Fase 134: Peso cargado visible en la ruta del operador (2026-09-23)
+
+Pedido del usuario: cuando el almacén asigna un producto Lbs a una ruta con
+un peso concreto (ej. 25 lbs), el operador/repartidor necesita ver en su
+pantalla de ruta que tiene "cargado" ese peso de ese producto en su camión.
+
+**Ya existía la base** — `MyRouteDetailActivity.renderItems()` (sección
+"PRODUCTOS CARGADOS", `label_route_items_loaded`) ya lista cada producto
+cargado con `route_items.quantity` (que para Lbs es peso real desde la
+Fase 118, `formatQty(item.quantity)`), junto a la unidad en la línea de
+metadata (`SKU · Lbs`). Solo faltaba que el número en sí (`tvItemQty`, la
+cifra grande a la derecha de cada fila) dejara inequívoco que es peso —
+antes era un número suelto que se podía confundir con piezas.
+
+**Fix** — para Lbs, `tvItemQty` ahora muestra `"25.00 lb"` en vez de solo
+`"25.00"` (`wh_loaded_lb_suffix`, nuevo). Case/Unit/Bucket sin cambios
+(siguen mostrando el número solo, ya es inequívoco ahí — "3" cajas no
+necesita sufijo).
+
+**Nota — encontrado de paso, no tocado:** hay un comentario en
+`openProductForBarcode()`/`renderItems()` que dice que
+`route_items.quantity` para Lbs "es cantidad de bolsas (no peso)" al
+armar el prefill de `ProductDetailActivity` (`ROUTE_LOADED_UNITS`) — esto
+es **anterior** a la Fase 118 (que redefinió `route_items.quantity` como
+peso real en todo el sistema) y parece haber quedado desactualizado sin
+que nadie lo revisara después. No lo toqué porque no fue parte de este
+pedido y tocar el prefill de venta-desde-ruta es un cambio de
+comportamiento aparte — **queda marcado para revisar** si en algún momento
+aparece un bug de "prefillea mal la cantidad de bolsas al vender desde una
+ruta".
+
+Verificado con `:app:assembleDebug` completo — compila limpio. Sin probar
+contra un TC22 físico.
+
+## Fase 135: Desglose de productos (y peso, para Lbs) en paradas BATCH del operador (2026-09-23)
+
+Seguimiento del pedido de la Fase 134: el operador necesitaba ver, por
+parada, qué le tiene que entregar al cliente — producto y libras
+incluidas. Revisando `MyRouteDetailActivity.renderStops()` encontré que
+esto **ya existía para paradas PRE_ORDER** (`itemsSummary`, lista con
+`• Producto — Qty unit`) pero **no para paradas BATCH** — el gap real
+para el caso más común (una venta ya facturada que solo falta entregar):
+`RouteStopBatch` (backend y Android) solo traía `total`/`item_count`, sin
+ningún desglose de qué productos son.
+
+**Backend** (`getRoute`, `routeController.ts`) — para cada parada BATCH,
+suma una segunda consulta (`SELECT product_name, quantity, unit FROM
+orders WHERE batch_id = ? AND status != 'CANCELLED'`) y la cuelga como
+`batch.items`. No hizo falta tabla nueva — todo ya está en `orders`, mismo
+criterio que ya se usaba para `pre_order_items`. `quantity` (DECIMAL)
+casteado con `Number(...)` antes de mandarlo (mismo gotcha de
+`mysql2`/JSON documentado varias veces en este archivo).
+
+**Android** — `RouteStopBatch.items: List<BatchOrderItem>` (nuevo,
+`Models.kt`). `renderStops()` arma `batchItemsSummary` con el mismo formato
+que ya usa `itemsSummary` para pre-órdenes (`• Producto — 12.50 Lbs`) y lo
+agrega debajo del total en dólares para paradas BATCH.
+
+Verificado con `bun tsc --noEmit` (backend) y `:app:assembleDebug` completo
+(Android) — ambos compilan limpio. Sin probar contra una base de datos real
+ni un TC22 físico.
+
+### Aclaración post-Fase 135 — qué ya existía vs. qué es nuevo
+
+Para no generar confusión releyendo esto más adelante:
+- El número exacto de peso (ej. 18.65) en el manifiesto general "PRODUCTOS
+  CARGADOS" **ya se veía desde la Fase 118** — la Fase 134 solo le agregó
+  el sufijo "lb" al número grande para que quede inequívoco que es peso.
+- Ver el producto y su peso **atado al nombre del cliente dentro de la
+  tarjeta de esa parada** ya existía para paradas PRE_ORDER, pero **no
+  para paradas BATCH** (venta ya facturada, el caso más común) — eso sí es
+  nuevo de la Fase 135.

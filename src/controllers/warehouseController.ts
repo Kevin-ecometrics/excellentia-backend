@@ -60,6 +60,12 @@ export async function ensureWarehouseTables(): Promise<void> {
       -- NULL = el producto no trae número de lote (opción explícita en el
       -- modal de recepción, no un campo salteado sin querer).
       lot_number       VARCHAR(100) DEFAULT NULL,
+      -- supplier (2026-09-22) — a qué proveedor le compraron esta caja
+      -- puntual. Pedido del cliente: puede tener 2 proveedores distintos
+      -- entregando el mismo producto (mismo barcode) y necesita poder
+      -- diferenciar de cuál vino cada lote — mismo criterio que lot_number
+      -- (texto libre tipeado por el almacenista, NULL = no se especificó).
+      supplier         VARCHAR(255) DEFAULT NULL,
       expiration_date  DATE DEFAULT NULL,
       received_qty     DECIMAL(10,2) NOT NULL,
       remaining_qty    DECIMAL(10,2) NOT NULL,
@@ -269,9 +275,26 @@ export async function recordMovement(params: {
     ]
   ) as any;
   const movementId = result.insertId;
-  const qbSynced = await syncProductStockToQbo(params.productId);
-  await pool.query('UPDATE inventory_movements SET qb_synced = ? WHERE id = ?', [qbSynced, movementId]);
-  return { movementId, qbSynced };
+  // Fix (2026-09-22, backlog #3) — antes se esperaba (`await`) la llamada a
+  // QBO acá mismo antes de responder. Una recepción con varias líneas hace
+  // un `recordMovement` por línea (cada uno con su propia llamada HTTP a
+  // QBO, secuencial) — con unas pocas líneas, la suma fácilmente supera el
+  // timeout de 15s del cliente Android (`RetrofitClient`): el cliente
+  // mostraba error/timeout aunque el servidor terminara bien, y un
+  // reintento manual del almacenista duplicaba el lote/movimiento que ya se
+  // había creado. La sincronización a QBO ahora corre en segundo plano —la
+  // respuesta HTTP vuelve apenas termina el trabajo local (rápido, solo DB)
+  // — y el resultado real se actualiza en `inventory_movements.qb_synced`
+  // cuando termine. Si falla, sigue siendo reintentable desde el Historial
+  // (`retryMovementSync`), mismo criterio "silencioso" que el resto del
+  // proyecto: nada local se revierte por un fallo de QBO.
+  syncProductStockToQbo(params.productId)
+    .then(qbSynced => pool.query(
+      'UPDATE inventory_movements SET qb_synced = ? WHERE id = ?',
+      [qbSyncedToDb(qbSynced), movementId]
+    ))
+    .catch(err => logger.warn(`recordMovement: fallo al actualizar qb_synced en segundo plano (movimiento ${movementId}):`, err));
+  return { movementId, qbSynced: null };
 }
 
 // recordMovement() es el único punto de paso de todo cambio de stock del
@@ -353,6 +376,11 @@ export async function createReceipt(req: Request, res: Response): Promise<void> 
       // NULL si tildó "sin número de lote" en el modal de recepción. Se
       // normaliza acá (trim, '' -> null) por si el cliente manda espacios.
       const lotNumber = typeof line.lot_number === 'string' && line.lot_number.trim() ? line.lot_number.trim() : null;
+      // supplier (2026-09-22) — igual que lot_number: texto libre, NULL si no
+      // se especificó. Distingue de qué proveedor vino ESTE lote puntual,
+      // para productos que reciben del mismo barcode pero de más de un
+      // proveedor.
+      const supplier = typeof line.supplier === 'string' && line.supplier.trim() ? line.supplier.trim() : null;
       const qty = Number(line.quantity);
       if (!barcode && !product_id) {
         results.push({ error: 'barcode o product_id es requerido', line });
@@ -372,12 +400,24 @@ export async function createReceipt(req: Request, res: Response): Promise<void> 
       }
 
       const [insertResult] = await pool.query(
-        `INSERT INTO product_lots (receipt_batch_id, warehouse_id, product_id, barcode, lot_number, expiration_date, received_qty, remaining_qty, received_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [receiptBatchId, warehouseId, product.id, product.barcode ?? null, lotNumber, expiration_date ?? null, qty, qty, req.user?.id ?? null]
+        `INSERT INTO product_lots (receipt_batch_id, warehouse_id, product_id, barcode, lot_number, supplier, expiration_date, received_qty, remaining_qty, received_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [receiptBatchId, warehouseId, product.id, product.barcode ?? null, lotNumber, supplier, expiration_date ?? null, qty, qty, req.user?.id ?? null]
       ) as any;
       const lotId = insertResult.insertId;
 
+      // Revertido (2026-09-22) — se probó por un momento que `products.stock`
+      // de un Lbs fuera conteo de cajas (+1 por caja recibida) en vez de peso
+      // real, para que coincidiera con el -1 fijo que descontaba Venta. Se
+      // dio marcha atrás: un producto de peso variable se consume por peso
+      // FRACCIONARIO en todos lados (FIFO puede sacar 10 lbs de una caja de
+      // 30, una venta puede ser de 3.2 lbs) — "conteo de cajas" no compone
+      // con eso apenas se toca una caja parcialmente (cargar ruta, devolver,
+      // dañar, ajustar), así que quedaba roto en más lugares de los que
+      // arreglaba. La solución real está del lado de Venta (ver
+      // orderController.ts): ahí se corrigió el -1 fijo para que reste el
+      // peso real vendido, dejando TODO el sistema consistente en libras
+      // para Lbs — lote, recepción, ruta, devoluciones, venta.
       await pool.query('UPDATE products SET stock = stock + ? WHERE id = ?', [qty, product.id]);
       const { qbSynced } = await recordMovement({
         warehouseId, productId: product.id, lotId, movementType: 'RECEIPT',
@@ -390,7 +430,7 @@ export async function createReceipt(req: Request, res: Response): Promise<void> 
       // real del proveedor (lo que se imprime en el ticket) — lot_id sigue
       // yendo también, por si hace falta referenciar el registro interno.
       results.push({
-        lot_id: lotId, lot_number: lotNumber, product_id: product.id, product_name: product.name,
+        lot_id: lotId, lot_number: lotNumber, supplier, product_id: product.id, product_name: product.name,
         barcode: product.barcode ?? null, unit: product.unit ?? null,
         quantity: qty, expiration_date: expiration_date ?? null, qb_synced: qbSyncedToDb(qbSynced),
       });
@@ -435,10 +475,10 @@ export async function listReceipts(req: Request, res: Response): Promise<void> {
     if (search) {
       query += ` AND pl.receipt_batch_id IN (
         SELECT pl2.receipt_batch_id FROM product_lots pl2 JOIN products p2 ON p2.id = pl2.product_id
-        WHERE pl2.receipt_batch_id LIKE ? OR p2.name LIKE ? OR pl2.lot_number LIKE ?
+        WHERE pl2.receipt_batch_id LIKE ? OR p2.name LIKE ? OR pl2.lot_number LIKE ? OR pl2.supplier LIKE ?
       )`;
       const like = `%${search}%`;
-      params.push(like, like, like);
+      params.push(like, like, like, like);
     }
     query += ' GROUP BY pl.receipt_batch_id ORDER BY received_at DESC LIMIT ? OFFSET ?';
     params.push(limitNum, offset);
@@ -459,7 +499,7 @@ export async function getReceiptDetail(req: Request, res: Response): Promise<voi
   try {
     const { receiptBatchId } = req.params;
     const [rows] = await pool.query(
-      `SELECT pl.id AS lot_id, pl.lot_number, pl.product_id, p.name AS product_name,
+      `SELECT pl.id AS lot_id, pl.lot_number, pl.supplier, pl.product_id, p.name AS product_name,
               pl.barcode, p.unit, pl.received_qty AS quantity, pl.expiration_date
        FROM product_lots pl JOIN products p ON p.id = pl.product_id
        WHERE pl.receipt_batch_id = ? ORDER BY pl.id`,
@@ -482,8 +522,8 @@ export async function listLots(req: Request, res: Response): Promise<void> {
     const { warehouse_id, product_id, status } = req.query;
     let query = `
       SELECT pl.id, pl.receipt_batch_id, pl.warehouse_id, pl.product_id, pl.barcode,
-             pl.lot_number, pl.expiration_date, pl.received_qty, pl.remaining_qty, pl.status, pl.received_at,
-             p.name AS product_name, p.sku, p.unit
+             pl.lot_number, pl.supplier, pl.expiration_date, pl.received_qty, pl.remaining_qty, pl.status, pl.received_at,
+             p.name AS product_name, p.sku, p.unit, p.weight_per_unit
       FROM product_lots pl JOIN products p ON p.id = pl.product_id
       WHERE 1=1
     `;
@@ -715,7 +755,7 @@ export async function updateLot(req: Request, res: Response): Promise<void> {
   await ensureWarehouseTables();
   try {
     const { id } = req.params;
-    const { quantity, expiration_date, lot_number } = req.body;
+    const { quantity, expiration_date, lot_number, supplier } = req.body;
 
     const [[lot]] = await pool.query(
       'SELECT id, warehouse_id, product_id, received_qty, remaining_qty, status FROM product_lots WHERE id = ?', [id]
@@ -756,8 +796,16 @@ export async function updateLot(req: Request, res: Response): Promise<void> {
       updates.push('lot_number = ?');
       params.push(typeof lot_number === 'string' && lot_number.trim() ? lot_number.trim() : null);
     }
+    // supplier (2026-09-23) — gap encontrado en revisión: se agregó a
+    // createReceipt/listLots/getReceiptDetail en la Fase 125 pero se olvidó
+    // acá, a diferencia de lot_number (que sí se puede corregir después de
+    // recibido). Mismo criterio de normalización.
+    if (supplier !== undefined) {
+      updates.push('supplier = ?');
+      params.push(typeof supplier === 'string' && supplier.trim() ? supplier.trim() : null);
+    }
     if (updates.length === 0) {
-      res.status(400).json({ error: 'Nada para actualizar — mandá quantity, expiration_date y/o lot_number' });
+      res.status(400).json({ error: 'Nada para actualizar — mandá quantity, expiration_date, lot_number y/o supplier' });
       return;
     }
 

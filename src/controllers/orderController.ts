@@ -352,10 +352,21 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
         inserted.push({ id: result.insertId, barcode, product_name, price, quantity: row.quantity, total: row.total, qb_item_id: qbItemId });
       }
 
+      // Fix (2026-09-22) — antes se restaba -1 fijo por línea escaneada, sin
+      // importar cuánto se vendió. Para un producto de peso variable (Lbs)
+      // eso está mal: vender 3.2 lbs de una caja de 30 restaba lo mismo que
+      // vender la caja entera. Un producto Lbs se consume por peso
+      // fraccionario en todo el resto del sistema (lotes, FIFO, recepción,
+      // ruta, devoluciones) — este era el único punto que no lo respetaba.
+      // Case/Unit/Bucket no cambian: ahí -1 por línea sí tiene sentido
+      // (unidades/cajas indivisibles). `quantity` es el original del ítem
+      // (antes del split de cortesía parcial) — courtesyRowsFor ya deja en
+      // claro que el descuento de stock es UNO por ítem, no por fila.
       if (decremented) {
+        const stockDelta = isLbsUnit(unit) ? Number(quantity) : 1;
         await pool.query(
-          'UPDATE products SET stock = GREATEST(stock - 1, 0) WHERE barcode = ?',
-          [barcode]
+          'UPDATE products SET stock = GREATEST(stock - ?, 0) WHERE barcode = ?',
+          [stockDelta, barcode]
         );
       }
     }
@@ -1106,10 +1117,13 @@ export async function cancelBatch(req: Request, res: Response): Promise<void> {
     // Revertir stock — solo las filas que de verdad lo habían descontado
     // (orders.stock_decremented, ver createBatch). Un ítem cargado desde una
     // ruta nunca se descontó acá, así que revertirlo sería incorrecto.
+    // Fix (2026-09-22) — mismo criterio que el descuento original: para Lbs
+    // se revierte el peso real de esa fila (`o.quantity`), no +1 fijo.
     const barcodesToSync = new Set<string>();
     for (const o of orderRows as any[]) {
       if (o.stock_decremented) {
-        await pool.query('UPDATE products SET stock = GREATEST(stock + 1, 0) WHERE barcode = ?', [o.barcode]);
+        const stockDelta = isLbsUnit(o.unit) ? Number(o.quantity) : 1;
+        await pool.query('UPDATE products SET stock = GREATEST(stock + ?, 0) WHERE barcode = ?', [stockDelta, o.barcode]);
         barcodesToSync.add(o.barcode);
       }
     }
@@ -1234,9 +1248,12 @@ export async function editBatch(req: Request, res: Response): Promise<void> {
     const barcodesToSync = new Set<string>();
 
     // Revertir el stock de los ítems VIEJOS que sí se habían descontado.
+    // Fix (2026-09-22) — para Lbs se revierte el peso real de esa fila
+    // (`o.quantity`), no +1 fijo, mismo criterio que cancelBatch.
     for (const o of orderRows as any[]) {
       if (o.stock_decremented) {
-        await pool.query('UPDATE products SET stock = GREATEST(stock + 1, 0) WHERE barcode = ?', [o.barcode]);
+        const stockDelta = isLbsUnit(o.unit) ? Number(o.quantity) : 1;
+        await pool.query('UPDATE products SET stock = GREATEST(stock + ?, 0) WHERE barcode = ?', [stockDelta, o.barcode]);
         barcodesToSync.add(o.barcode);
       }
     }
@@ -1291,8 +1308,11 @@ export async function editBatch(req: Request, res: Response): Promise<void> {
           ]
         );
       }
+      // Fix (2026-09-22) — mismo criterio que createBatch: para Lbs se resta
+      // el peso real de la línea editada, no -1 fijo.
       if (decremented) {
-        await pool.query('UPDATE products SET stock = GREATEST(stock - 1, 0) WHERE barcode = ?', [barcode]);
+        const stockDelta = isLbsUnit(unit) ? Number(quantity) : 1;
+        await pool.query('UPDATE products SET stock = GREATEST(stock - ?, 0) WHERE barcode = ?', [stockDelta, barcode]);
         barcodesToSync.add(barcode);
       }
     }

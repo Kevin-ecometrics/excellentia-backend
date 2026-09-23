@@ -56,6 +56,13 @@ export async function createPreOrder(req: Request, res: Response): Promise<void>
     ) as any;
     const preOrderId = result.insertId;
 
+    // Backlog cliente #5 (2026-09-21/23) — aviso de stock bajo/agotado al
+    // crear una pre-orden. Decisión de alcance (confirmada con el usuario):
+    // solo AVISAR, nunca bloquear — una pre-orden es una intención de venta
+    // futura (se entrega y detalla recién al convertir, días después), así
+    // que no tiene sentido impedir crearla por el stock de HOY. Mismo
+    // umbral de "stock bajo" que ya usa la webapp (ProductRow.tsx, <= 5).
+    const stockWarnings: { barcode: string; product_name: string; stock: number }[] = [];
     for (const item of items) {
       const { barcode, product_name, price, quantity, unit, case_qty } = item;
       const hasPricing = price != null && quantity != null;
@@ -64,9 +71,14 @@ export async function createPreOrder(req: Request, res: Response): Promise<void>
         'INSERT INTO pre_order_items (pre_order_id, barcode, product_name, price, quantity, total, unit, case_qty) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         [preOrderId, barcode, product_name, hasPricing ? price : null, hasPricing ? quantity : null, total, unit ?? null, case_qty ?? null]
       );
+
+      const [[product]] = await pool.query('SELECT stock FROM products WHERE barcode = ?', [barcode]) as any[];
+      if (product && Number(product.stock) <= 5) {
+        stockWarnings.push({ barcode, product_name, stock: Number(product.stock) });
+      }
     }
 
-    res.status(201).json({ id: preOrderId, status: 'DRAFT' });
+    res.status(201).json({ id: preOrderId, status: 'DRAFT', stock_warnings: stockWarnings });
   } catch (err) {
     logger.error('createPreOrder error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });

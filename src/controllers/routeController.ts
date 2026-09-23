@@ -201,7 +201,25 @@ export async function getRoute(req: Request, res: Response): Promise<void> {
            FROM orders WHERE batch_id = ? GROUP BY batch_id, customer_id, customer_name`,
           [stop.batch_id]
         ) as any[];
-        stops.push({ ...stop, batch: (batchRows as any[])[0] ?? null });
+        const batch = (batchRows as any[])[0] ?? null;
+        // Backlog cliente (2026-09-23) — el operador no tenía forma de ver
+        // QUÉ productos (y cuánto peso, para Lbs) tiene que entregar en una
+        // parada BATCH — antes `batch` solo traía el total en dólares y la
+        // cantidad de líneas, sin desglose. Mismo criterio que ya existía
+        // para PRE_ORDER (pre_order_items) — no requiere tabla nueva, ya
+        // está todo en `orders`.
+        if (batch) {
+          const [itemRows] = await pool.query(
+            "SELECT product_name, quantity, unit FROM orders WHERE batch_id = ? AND status != 'CANCELLED' ORDER BY id",
+            [stop.batch_id]
+          ) as any[];
+          // quantity es DECIMAL — mysql2 lo devuelve como string sin
+          // decimalNumbers configurado (mismo gotcha documentado varias
+          // veces en este proyecto); sin el cast, Android recibiría
+          // "3.00" entre comillas donde PreOrderItem.quantity espera Double.
+          batch.items = (itemRows as any[]).map(r => ({ ...r, quantity: Number(r.quantity) }));
+        }
+        stops.push({ ...stop, batch });
       } else if (stop.stop_type === 'PRE_ORDER' || stop.pre_order_id) {
         // PRE_ORDER, o CUSTOMER con pre-orden vinculada opcionalmente (ver
         // addStop) — se trae también pre_order_items para que la parada

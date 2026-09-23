@@ -256,6 +256,7 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_id INT NULL AFTER barcode;
 ALTER TABLE route_stops ADD COLUMN IF NOT EXISTS skip_reason VARCHAR(255) DEFAULT NULL AFTER status;
 -- Fase 120 (addendum) — número de lote real del proveedor, distinto del `id` interno de product_lots.
 ALTER TABLE product_lots ADD COLUMN IF NOT EXISTS lot_number VARCHAR(100) DEFAULT NULL AFTER barcode;
+ALTER TABLE product_lots ADD COLUMN IF NOT EXISTS supplier VARCHAR(255) DEFAULT NULL AFTER lot_number;
 ```
 
 **`orders.unit`/`case_qty` — por qué importan para el ticket:** `unit` es el tipo de venta (Lbs/Case/Unit/Bucket) y `case_qty` las unidades por caja (`products.qty` cuando `unit = "Case"`, copiado al momento de la venta). Sin estos dos campos guardados en `orders`, reimprimir un pedido desde Historial no puede saber si era por peso o por caja — `listOrders` los expone ahora junto al resto de columnas.
