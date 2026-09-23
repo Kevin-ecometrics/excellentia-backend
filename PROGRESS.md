@@ -7244,3 +7244,68 @@ COLUMN stock DECIMAL(10,2) NOT NULL DEFAULT 0;` en la base real de
 `app.excellentiafoods.com`, y distribuir el build nuevo de Android a los
 TC22 (el bump de versión de la DB local dispara la migración sola en el
 primer arranque post-actualización).
+
+## Fase 137: Serie de validaciones y fixes chicos — webapp + Android (2026-09-23)
+
+Sin cambios de backend ni de schema. Encontrados/pedidos en la misma sesión
+que cerró la Fase 136.
+
+**Webapp — fechas en hora local, no UTC crudo.** `OrdersClient.tsx`,
+`WarehouseClient.tsx` e `InventoryClient.tsx` mostraban `created_at`/
+`approvedAt`/`voidedAt`/etc. cortando el string ISO crudo
+(`slice(0,16).replace('T',' ')`) — como esas columnas son `TIMESTAMP` (UTC
+real), la hora se veía tal cual vino de MySQL, sin convertir a la zona del
+navegador. `fmtDate(iso)` (duplicada igual en los tres archivos, sin
+extraer a un helper compartido) usa `new Date(iso).toLocaleString(...)` para
+mostrar la hora ya convertida.
+
+**Android — `MyRouteDetailActivity`, gating de acciones sobre paradas:**
+- Se sacó el botón manual "Finalizar ruta" (`IN_PROGRESS → COMPLETED`) — el
+  backend (`maybeAutoCloseRoute`, `updateStopStatus`) ya cierra la ruta solo
+  apenas la última parada `PENDING` se resuelve, y dejar el botón manual era
+  riesgoso: `updateRoute` no valida que todas las paradas estén resueltas
+  antes de aceptar `status=COMPLETED`, así que un operador podía cerrar la
+  ruta a mano con paradas todavía pendientes.
+- `canAct` (qué paradas admiten Vender/Abrir pre-orden/Entregado/Saltar) pasó
+  de `PLANNED || IN_PROGRESS` a solo `IN_PROGRESS` — antes se podía operar
+  una parada sin haber tocado "Iniciar ruta".
+- El botón de Consignación (visible siempre, incluso con la parada ya
+  `DELIVERED` o la ruta `COMPLETED` — ver Fase 115.4) ahora sí se oculta si
+  la ruta sigue `PLANNED`: antes de arrancarla no hay nada que gestionar
+  físicamente todavía.
+
+**Android — `WarehouseActivity`: revertido el gate de Recepción/
+Sub-inventario contra "hay rutas hoy".** Ese gate (`hasRoutesToday`,
+agregado 2026-09-18) bloqueaba Recepción/Sub-inventario si no había ninguna
+ruta creada para el día — se sacó por completo (código muerto eliminado,
+no comentado): quedaba mal razonado (el almacén puede recibir mercadería o
+consultar stock aunque todavía no se haya armado la ruta del día).
+
+**Android — `TicketDetailActivity`: el botón de reintento QBO ya no
+aparece en una venta `CANCELLED`.** El backend ya rechazaba el reintento
+igual (`retryBatchSync`), pero mostrar el botón era confuso — una venta
+cancelada no debe reintentar el envío nunca, y el reenvío a QBO en general
+pasó a ser tarea exclusiva de la webapp (admin-only).
+
+**Android — `PreOrderDetailActivity`: sacar un producto de la pre-orden
+antes de convertir.** Pedido de backlog del cliente — en la puerta, el
+cliente a veces rechaza uno de varios productos de la pre-orden.
+`confirmRemoveDraftItem`/`removeDraftItem` sacan el ítem del draft (100%
+local, nunca se manda al backend si ya no está en `draftItems` al
+convertir) y re-indexan `finalizedByIndex` completo (no solo borran la
+entrada del índice sacado) para que las filas ya finalizadas no queden
+atadas al draft equivocado tras el corrimiento de índices. Exige que quede
+al menos 1 producto en la pre-orden.
+
+**Fix — `route_stops.batch_id` quedaba `NULL` para siempre en una parada
+`PRE_ORDER`.** `markRouteStopDeliveredIfAny()` (`PreOrderDetailActivity.kt`)
+no mandaba `batch_id` al marcar la parada `DELIVERED` tras convertir — el
+backend ya soportaba el campo (`updateStopStatus`, sin cambios necesarios
+ahí), solo faltaba que Android lo mandara. Sin él, `getExpectedReturns`
+(revisión de devoluciones, que junta "vendido" por `batch_id`) siempre
+mostraba "Sold 0.00" para una parada de pre-orden aunque la venta sí
+existiera en `orders` — mismo patrón que ya funcionaba para una parada
+`CUSTOMER` vendida desde cero.
+
+Verificado por compilación (`tsc --noEmit` en webapp, `:app:assembleDebug`
+en Android) — sin probar contra una base real ni un TC22 físico.
