@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS `products` (
     `min_price`       DECIMAL(10,2) NULL,
     `category`        VARCHAR(100),
     `brand`           VARCHAR(100),
-    `stock`           INT DEFAULT 0,
+    `stock`           DECIMAL(10,2) NOT NULL DEFAULT 0,
     `hidden`          TINYINT(1) NOT NULL DEFAULT 0,
     `description`     TEXT NULL,
     `unit`            VARCHAR(20) DEFAULT NULL,
@@ -736,8 +736,14 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_id INT NULL AFTER barcode;
 -- puntualmente vía POST /api/warehouse/movements/:id/retry-sync.
 ALTER TABLE inventory_movements ADD COLUMN IF NOT EXISTS qb_synced TINYINT(1) DEFAULT NULL AFTER settlement_id;
 
+-- products.stock: INT → DECIMAL(10,2) (2026-09-23). Stock de productos Lbs
+-- (peso variable) se guardaba redondeado al entero más cercano en cada
+-- escritura — no afecta Case/Unit/Bucket (ya son enteros). Ver PROGRESS.md,
+-- sesión 2026-09-23, para el detalle completo.
+ALTER TABLE products MODIFY COLUMN stock DECIMAL(10,2) NOT NULL DEFAULT 0;
+
 -- =============================================================================
--- Fin del schema — 24 tablas + migraciones Fase 48, 61, 112, 115, 116, 117, 118, 2026-08-31, 2026-09-01, 2026-09-07 y 2026-09-10
+-- Fin del schema — 24 tablas + migraciones Fase 48, 61, 112, 115, 116, 117, 118, 2026-08-31, 2026-09-01, 2026-09-07, 2026-09-10 y 2026-09-23
 -- =============================================================================
 SET FOREIGN_KEY_CHECKS = 1;
 SET FOREIGN_KEY_CHECKS = 1;

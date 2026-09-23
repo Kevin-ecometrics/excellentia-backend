@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS `products` (
     `min_price`       DECIMAL(10,2) NULL,
     `category`        VARCHAR(100),
     `brand`           VARCHAR(100),
-    `stock`           INT DEFAULT 0,
+    `stock`           DECIMAL(10,2) NOT NULL DEFAULT 0,
     `hidden`          TINYINT(1) NOT NULL DEFAULT 0,
     `description`     TEXT NULL,
     `weight_per_unit` DECIMAL(10,2) NULL,
@@ -662,5 +662,15 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_id INT NULL AFTER barcode;
 -- =============================================================================
 ALTER TABLE inventory_movements ADD COLUMN IF NOT EXISTS qb_synced TINYINT(1) DEFAULT NULL AFTER settlement_id;
 
--- Fin del schema — 23 tablas + migraciones Fase 48, 111, 112, 115, 116, 117, 118, 2026-08-31, 2026-09-01, 2026-09-07 y 2026-09-10
+-- =============================================================================
+-- Migración — products.stock: INT → DECIMAL(10,2) (2026-09-23). Stock de
+-- productos Lbs (peso variable) se guardaba redondeado al entero más
+-- cercano en cada escritura — no afecta Case/Unit/Bucket (ya son enteros).
+-- Ver PROGRESS.md, sesión 2026-09-23, para el detalle completo (incluye
+-- migración de Android/AppDatabase.kt y ajuste en la webapp). Para bases
+-- existentes (ejecutar una sola vez)
+-- =============================================================================
+ALTER TABLE products MODIFY COLUMN stock DECIMAL(10,2) NOT NULL DEFAULT 0;
+
+-- Fin del schema — 23 tablas + migraciones Fase 48, 111, 112, 115, 116, 117, 118, 2026-08-31, 2026-09-01, 2026-09-07, 2026-09-10 y 2026-09-23
 -- =============================================================================

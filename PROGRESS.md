@@ -7199,3 +7199,48 @@ Para no generar confusión releyendo esto más adelante:
   tarjeta de esa parada** ya existía para paradas PRE_ORDER, pero **no
   para paradas BATCH** (venta ya facturada, el caso más común) — eso sí es
   nuevo de la Fase 135.
+
+## Fase 136: Aplicada migración products.stock INT → DECIMAL(10,2) (2026-09-23)
+
+Se implementó lo documentado más arriba como pendiente. Las 3 partes:
+
+**Backend (solo schema):**
+- `excellentia_schema.sql:39` y `src/db/schema.sql:43` — `stock` pasa de
+  `INT DEFAULT 0` a `DECIMAL(10,2) NOT NULL DEFAULT 0` en el `CREATE TABLE`.
+- Migración `ALTER TABLE products MODIFY COLUMN stock DECIMAL(10,2) NOT
+  NULL DEFAULT 0;` agregada al final de ambos archivos, para bases ya
+  existentes (falta correrla en la base real de producción).
+- Cero cambios de código — los controllers ya usaban `Number(...)`/
+  `GREATEST(stock ± ?, 0)` sin cast a entero.
+
+**Webapp** — `ProductModal.tsx`: `parseInt(form.stock)` → `parseFloat`
+(×2, validación y submit), `step="1"` → `step="0.01"` en el input.
+
+**Android** — 9 archivos, `Int` → `Double`:
+- `Models.kt`: `Product.stock`, `ProductDto.stock`, `RouteItemResponse.stock`,
+  `PreOrderStockWarning.stock`.
+- `CachedProductEntity.kt`, `MainActivity.kt` (`SuggestionItem.stock`).
+- `ProductDao.kt` — `c.getInt("stock")` → `c.getDouble("stock")`.
+- `ProductDetailActivity.kt` — `getIntExtra("STOCK", -1)` →
+  `getDoubleExtra("STOCK", -1.0)`; el texto sigue usando `stock.toInt()`
+  para no tocar el string `%1$d` de `label_stock_available`.
+- Los 5 `putExtra("STOCK", product.stock)` (`CreatePreOrderActivity.kt`,
+  `MainActivity.kt` ×2, `MyRouteDetailActivity.kt`,
+  `PreOrderDetailActivity.kt`) resolvieron solos al overload Double, sin
+  tocarlos.
+- `AppDatabase.kt` — **la única parte que toca datos ya persistidos**:
+  `DATABASE_VERSION` 19 → 20, `onCreate` con `stock REAL DEFAULT 0`, y
+  bloque nuevo `if (oldVersion < 20)` en `onUpgrade` que dropea y recrea
+  `cached_products` (sin migrar filas — es un cache puro, se repuebla solo
+  en el próximo sync de productos, no hay riesgo de pérdida de datos reales
+  del dispositivo).
+
+Verificado: `node_modules/.bin/tsc --noEmit` limpio en backend y webapp;
+`:app:assembleDebug` completo compila limpio en Android. Sin probar contra
+una base de datos real ni un TC22 físico.
+
+**Pendiente para producción:** correr el `ALTER TABLE products MODIFY
+COLUMN stock DECIMAL(10,2) NOT NULL DEFAULT 0;` en la base real de
+`app.excellentiafoods.com`, y distribuir el build nuevo de Android a los
+TC22 (el bump de versión de la DB local dispara la migración sola en el
+primer arranque post-actualización).
