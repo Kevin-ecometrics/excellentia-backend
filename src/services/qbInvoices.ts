@@ -59,7 +59,7 @@ export async function findInvoiceByDocNumber(docNumber: number | string): Promis
 interface DamageItem { barcode: string; product_name: string; qty: number; unit_price?: number; amount?: number; qb_item_id?: string | null; unit?: string | null }
 
 export async function createBatchInvoice(
-  items: { qb_item_id: string; product_name: string; price: number; quantity: number; total: number; is_courtesy?: boolean }[],
+  items: { qb_item_id: string; product_name: string; price: number; quantity: number; total: number; is_courtesy?: boolean; unit?: string | null; case_qty?: number | null }[],
   customerId?: string | null,
   damageItems: DamageItem[] = [],
   paymentMethod?: string | null,
@@ -83,9 +83,12 @@ export async function createBatchInvoice(
   // cambió entre filas no se mezclan, igual que en el carrito. is_courtesy
   // entra en la key (Fase 115.5) para que una línea regalada nunca se mezcle
   // con una pagada del mismo producto/precio — cada una factura distinto.
-  const grouped = new Map<string, { qb_item_id: string; product_name: string; price: number; quantity: number; total: number; is_courtesy?: boolean }>();
+  // `case_qty` también entra en la key (Fase 122): el Qty de la línea se deriva
+  // de él (ver abajo), así que dos filas del mismo producto con distinto tamaño
+  // de caja NO pueden mezclarse — darían un Qty y un Amount inconsistentes.
+  const grouped = new Map<string, { qb_item_id: string; product_name: string; price: number; quantity: number; total: number; is_courtesy?: boolean; unit?: string | null; case_qty?: number | null }>();
   for (const item of items) {
-    const key = `${item.qb_item_id}::${item.price}::${item.is_courtesy ? 1 : 0}`;
+    const key = `${item.qb_item_id}::${item.price}::${item.is_courtesy ? 1 : 0}::${item.case_qty ?? 0}`;
     const existing = grouped.get(key);
     if (existing) {
       existing.quantity += Number(item.quantity);
@@ -104,16 +107,33 @@ export async function createBatchInvoice(
     const isCourtesy = !!item.is_courtesy;
     const unitPrice = isCourtesy ? 0 : Number(item.price);
     const amount = isCourtesy ? 0 : Number(item.total);
+    // Fase 122 — Qty tiene que ser el número de UNIDADES, no de cajas.
+    // `orders.price` es el precio de una unidad y `orders.quantity` viene en
+    // cajas, así que Qty = quantity × case_qty. Sin esto QBO recibe
+    // Qty 2 × UnitPrice 1.50 = 3.00 contra un Amount de 72.00, y rechaza la
+    // factura (valida Amount == Qty × UnitPrice). Lbs y Bucket no cambian: su
+    // `quantity` ya está en la misma escala que su `price`.
+    const isCaseUnit = item.unit === 'Case' || item.unit === 'Unit' || item.unit === 'Case/Unit';
+    const caseSize = isCaseUnit ? (Number(item.case_qty) || 1) : 1;
     const salesItemLineDetail: Record<string, any> = {
       ItemRef: { value: item.qb_item_id },
-      Qty: item.quantity,
+      Qty: item.quantity * caseSize,
       UnitPrice: unitPrice,
     };
     if (classId) salesItemLineDetail.ClassRef = { value: classId };
+    // La Description antes decía "<n> lb a $<price>/lb" para TODO tipo de venta
+    // — un Case/Unit se facturaba como "2 lb a $36.00/lb". Fase 122: el precio
+    // ya es por unidad, así que el desglose se arma por tipo.
+    const qtyShown = Number(item.quantity) * (isCaseUnit ? caseSize : 1);
+    const description = isLbsUnit(item.unit)
+      ? `${item.product_name} - ${qtyShown} lb a $${Number(item.price).toFixed(2)}/lb${isCourtesy ? ' · Cortesía' : ''}`
+      : isCaseUnit && caseSize > 1
+        ? `${item.product_name} - ${qtyShown} units a $${Number(item.price).toFixed(2)}/unit${isCourtesy ? ' · Cortesía' : ''}`
+        : `${item.product_name} - ${qtyShown} a $${Number(item.price).toFixed(2)}${isCourtesy ? ' · Cortesía' : ''}`;
     return {
       DetailType: 'SalesItemLineDetail' as const,
       Amount: amount,
-      Description: `${item.product_name} - ${item.quantity} lb a $${Number(item.price).toFixed(2)}/lb${isCourtesy ? ' · Cortesía' : ''}`,
+      Description: description,
       SalesItemLineDetail: salesItemLineDetail,
     };
   });

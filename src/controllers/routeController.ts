@@ -11,7 +11,7 @@ import {
   recordMovement,
   InsufficientStockError,
 } from './warehouseController.ts';
-import { computeDamageCredit } from '../services/creditCalculator.ts';
+import { computeDamageCredit, lineTotal } from '../services/creditCalculator.ts';
 import { reserveInvoiceNumber } from '../services/invoiceCounter.ts';
 
 // Orden forward-only: PLANNED -> IN_PROGRESS -> COMPLETED, sin poder retroceder.
@@ -1504,10 +1504,16 @@ export async function settleConsignment(req: Request, res: Response): Promise<vo
         ) as any[];
         if (product) {
           const price = Number(product.price) || 0;
+          // Fase 122 — `price` es el precio de una UNIDAD y la cantidad vendida
+          // viene en cajas para Case/Unit, así que el total tiene que multiplicar
+          // por `case_qty` (lineTotal). Con `price * quantity` a secas, 2 cajas
+          // de un producto de $1.50/un liquidaban $3.00 en vez de $72.00.
+          const lineUnit = consignmentRow.unit ?? null;
+          const lineCaseQty = consignmentRow.case_qty ?? null;
           soldLines.push({
             productId: product_id, barcode: product.barcode ?? '', product_name: product.name,
-            price, quantity: quantitySold, total: Math.round(price * quantitySold * 100) / 100,
-            unit: consignmentRow.unit ?? null, case_qty: consignmentRow.case_qty ?? null,
+            price, quantity: quantitySold, total: Math.round(lineTotal(price, quantitySold, lineUnit, lineCaseQty) * 100) / 100,
+            unit: lineUnit, case_qty: lineCaseQty,
           });
         }
       }

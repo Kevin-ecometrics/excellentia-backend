@@ -1,7 +1,7 @@
 import type { Request, Response } from 'express';
 import pool from '../db/connection.ts';
 import logger from '../services/logger.ts';
-import { computeDamageCredit } from '../services/creditCalculator.ts';
+import { computeDamageCredit, lineTotal } from '../services/creditCalculator.ts';
 import { getCustomerBalance, applyCustomerCredit } from '../services/creditController.ts';
 import { reserveInvoiceNumber } from '../services/invoiceCounter.ts';
 
@@ -66,7 +66,7 @@ export async function createPreOrder(req: Request, res: Response): Promise<void>
     for (const item of items) {
       const { barcode, product_name, price, quantity, unit, case_qty } = item;
       const hasPricing = price != null && quantity != null;
-      const total = hasPricing ? (item.total ?? price * quantity) : null;
+      const total = hasPricing ? (item.total ?? lineTotal(price, quantity, unit, case_qty)) : null;
       await pool.query(
         'INSERT INTO pre_order_items (pre_order_id, barcode, product_name, price, quantity, total, unit, case_qty) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         [preOrderId, barcode, product_name, hasPricing ? price : null, hasPricing ? quantity : null, total, unit ?? null, case_qty ?? null]
@@ -206,7 +206,7 @@ export async function updatePreOrder(req: Request, res: Response): Promise<void>
       for (const item of items) {
         const { barcode, product_name, price, quantity, unit, case_qty } = item;
         const hasPricing = price != null && quantity != null;
-        const total = hasPricing ? (item.total ?? price * quantity) : null;
+        const total = hasPricing ? (item.total ?? lineTotal(price, quantity, unit, case_qty)) : null;
         await pool.query(
           'INSERT INTO pre_order_items (pre_order_id, barcode, product_name, price, quantity, total, unit, case_qty) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
           [id, barcode, product_name, hasPricing ? price : null, hasPricing ? quantity : null, total, unit ?? null, case_qty ?? null]
@@ -321,7 +321,9 @@ export async function convertPreOrder(req: Request, res: Response): Promise<void
 
     for (const item of items as any[]) {
       const { barcode, product_name, price, quantity, total, unit, case_qty } = item;
-      const finalTotal = total ?? (price != null && quantity != null ? price * quantity : 0);
+      // Fase 122 — fallback case-aware (lineTotal): `price` es por unidad y
+      // `quantity` en cajas, así que sin `× case_qty` salía 24x más bajo.
+      const finalTotal = total ?? (price != null && quantity != null ? lineTotal(price, quantity, unit, case_qty) : 0);
       // product_id (2026-09-07) — ver comentario en orderController.ts (createOrder/createBatch).
       const [productRowsForId] = await pool.query('SELECT id FROM products WHERE barcode = ?', [barcode]) as any[];
       const productId = productRowsForId[0]?.id ?? null;
@@ -344,7 +346,8 @@ export async function convertPreOrder(req: Request, res: Response): Promise<void
     await pool.query('DELETE FROM pre_order_items WHERE pre_order_id = ?', [id]);
     for (const item of items as any[]) {
       const { barcode, product_name, price, quantity, total, unit, case_qty } = item;
-      const finalTotal = total ?? (price != null && quantity != null ? price * quantity : null);
+      // Fase 122 — mismo fallback case-aware que el INSERT de orders de arriba.
+      const finalTotal = total ?? (price != null && quantity != null ? lineTotal(price, quantity, unit, case_qty) : null);
       await pool.query(
         'INSERT INTO pre_order_items (pre_order_id, barcode, product_name, price, quantity, total, unit, case_qty) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         [id, barcode, product_name, price ?? null, quantity ?? null, finalTotal, unit ?? null, case_qty ?? null]

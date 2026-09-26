@@ -976,6 +976,81 @@ esto: el backend no está desplegado a `app.excellentiafoods.com`, la webapp
 de producción no tiene el build nuevo, y no se generó/distribuyó un APK
 nuevo a los TC22.
 
+## Fase 122 — `products.price` es el precio de UNA UNIDAD (no de la caja)
+
+**Regla vigente para todo el dinero. Supersede la lógica anterior de Case/Unit
+(antes `products.price` era el precio del paquete/caja y había que dividir por
+`products.qty`/`case_qty` para valuar una unidad).**
+
+| Tipo | `price` significa | `quantity` significa | Total |
+|---|---|---|---|
+| Case/Unit | 1 unidad | CAJAS | `price × case_qty × quantity` |
+| Lbs | 1 lb | peso real (lb) | `price × quantity` |
+| Bucket | 1 balde | baldes | `price × quantity` |
+
+Ejemplo: case de 24 a `$1.50`/unidad en 2 cajas → `$72.00`, no `$3.00`. El
+usuario recargó el catálogo a la escala unitaria a mano — **no hay migración de
+datos en el código y no debe agregarse una**.
+
+**Helper único: `lineTotal(price, quantity, unit, caseQty)` en
+`src/services/creditCalculator.ts`** (exportado, junto a `isLbsUnit()`/
+`formatDamageQty()`). Espeja el `lineTotal()` de la app Android
+(`data/Models.kt`) — **los dos tienen que dar el mismo número** o la pantalla y
+la factura no cierran. `Case`/`Unit` legacy se tratan igual que `Case/Unit`.
+
+Dónde se aplicó:
+
+- **`creditCalculator.unitValueOf()`** — ya **no** divide por `caseSize`:
+  devuelve `price` directo. Con el precio unitario, dividir sub-valuaba el
+  crédito por daño 24x ($1.50/un se acreditaba como $0.0625). Reexportado en
+  Android como `unitValueOf()`/`estimatedUnitValueOf()`.
+- **`qbInvoices.createBatchInvoice()`** — el `Qty` de la línea pasó a
+  `quantity × case_qty` para Case/Unit, **y `case_qty` entró en la key de
+  agrupación** (dos filas del mismo producto con distinto tamaño de caja ya no
+  se mezclan, darían un `Qty`/`Amount` inconsistentes). El `Amount` **nunca** se
+  recalcula — sigue viniendo de `orders.total`, que la app ya calculó bien con
+  `lineTotal()`. La `Description` dejó de hardcodear `"N lb a $X/lb"` para
+  todo tipo: ahora se arma por tipo (`"... 48 units a $1.50/unit"` para
+  Case/Unit, `"... 2.35 lb a $3.10/lb"` para Lbs).
+  **Por qué el Qty importa:** QBO valida `Amount == Qty × UnitPrice`. Con el
+  precio unitario, mandar `Qty` en cajas (2) contra un `Amount` de $72 da
+  $3.00 ≠ $72 y **QBO rechaza la factura entera**.
+- **Propagación de `unit`/`case_qty`** — los mapas que arman `items` para QBO
+  en `approveBatch()` y `retryBatchSync()` (`orderController.ts`) ahora reenvían
+  `unit`/`case_qty`; sin eso el `Qty` salía en cajas. `syncEngine.ts` **no
+  necesitó cambios**: su `processPendingOrders()` va por `createInvoice()` (el
+  endpoint de un solo item), que manda `Qty: 1, UnitPrice: total` — escala
+  agnóstica, no le importa el `case_qty`.
+- **Fallbacks `total ?? price * quantity`** → `total ?? lineTotal(...)` en
+  `orderController.createOrder`/`createBatch`/`editBatch` y
+  `preOrderController.createPreOrder`/`updatePreOrder`/`convertPreOrder`. El
+  `routeController` de liquidación de consignación
+  (`total: price * quantitySold`) también pasa por `lineTotal()`.
+  Ninguno de estos se dispara en el flujo normal (la app siempre manda `total`),
+  pero si se disparaban dejaban una venta 24x más barata de lo que corresponde.
+- **`productController`** (precio promedio ponderado por cliente/producto) se
+  dejó como está a propósito: el factor caja se cancela en
+  `SUM(price×quantity)/SUM(quantity)` para un mismo producto, así que ahora
+  devuelve el promedio **unitario**, que es lo coherente con el catálogo.
+
+### Lo que NO se tocó
+
+- **La webapp/dashboard no se modificó** (decisión explícita del usuario) —
+  `ProductModal.tsx` no hacía esta matemática.
+- **`min_price` no se modificó** — no se confirmó si fue recargado en la escala
+  unitaria. Las 3 validaciones (`orderController` `createBatch`/`createOrder`/
+  `editBatch` y `preOrderController.convertPreOrder`) comparan
+  `price × weightPerUnit` contra `min_price`; para Case/Unit `weightPerUnit` es
+  1, así que comparan el `price` **unitario** contra `min_price`. Es la lectura
+  más permisiva: si `min_price` quedó con el piso viejo (por lb), igual casi
+  nunca dispara. **Pendiente de confirmar con el usuario.**
+- **Datos históricos no se tocan.** `orders`/`pre_order_items` viejos tienen su
+  `total` ya calculado con la fórmula de caja — se siguen leyendo tal cual (el
+  ticket y los reportes priorizan el `total` persistido, nunca lo recalculan).
+  Solo afecta a la app Android en carritos **pendientes** en SQLite creados
+  antes del deploy, que guardan `price` por línea y pueden dar totales 24x
+  inflados: hay que recargar el producto desde la pantalla de productos.
+
 ## Notas de diseño
 
 - `signature` se guarda en **cada fila** del batch (redundante pero consistente con `customer_id`/`customer_name` que también se repiten por fila). No hay tabla separada de batches.

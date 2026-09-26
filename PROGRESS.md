@@ -7309,3 +7309,203 @@ existiera en `orders` — mismo patrón que ya funcionaba para una parada
 
 Verificado por compilación (`tsc --noEmit` en webapp, `:app:assembleDebug`
 en Android) — sin probar contra una base real ni un TC22 físico.
+
+## Fase 138: El seed de cantidad del stepper de venta + dos desvíos de Case/Unit (Android, 2026-09-25)
+
+Sesión 100% Android — **cero cambios de backend, webapp y schema**. Endurecimiento
+del trabajo de `products.price` como precio de UNA UNIDAD (documentado como "Fase
+122/123" en los `CLAUDE.md`, ver nota de numeración al final): la matemática ya
+estaba correcta en casi todo, pero quedaban 4 puntos vivos donde la aritmética o
+el catálogo pre-cambio se colaban.
+
+> **Nota de numeración:** este trabajo está etiquetado **"Fase 123"** en
+> `AndroidStudioProjects/test/CLAUDE.md`, que es donde quedó la documentación
+> detallada de Android. Los `CLAUDE.md` y este `PROGRESS.md` comparten numeración
+> hasta la Fase 120 y después se bifurcaron: el "Fase 122" de los `CLAUDE.md`
+> (precio unitario) es el "Fase 122: #1, #3 y #6 del feedback del cliente" de
+> acá. Para esta sesión se usa la serie de `PROGRESS.md` (138). Si se busca
+> "Fase 123" esperando este trabajo, está en el `CLAUDE.md` de Android.
+
+### 1. El seed del stepper leía `products.qty` cuando no debía — Bucket y Lbs
+
+`products.qty` significa **una cosa distinta según el tipo**, y por eso no
+servía como "cantidad a la que abre el stepper" en los 5 lugares que arman el
+extra `QUANTITY` de `ProductDetailActivity`:
+
+| tipo | `products.qty` es… | arranque correcto |
+|---|---|---|
+| **Lbs** | puede ser un tamaño de caja o cualquier cosa que no es un peso | **`weight_per_unit`** (el peso nominal) |
+| Case/Unit | **unidades por caja** (24) | 24, es un atributo del producto |
+| **Bucket** | **las LIBRAS del balde** (un "32# Bucket" tiene 32) | **1** |
+
+Los call sites hacían `if (product.qty > 0) product.qty else weightPerUnit` a
+secas — o sea, **`qty` le ganaba a `weight_per_unit` en los tres tipos**. Dos
+síntomas distintos:
+
+- **Bucket:** abría la pantalla de venta con **"32 Bucket"** y un total 32x
+  (`recalcTotal()` multiplicaba `pricePerLb × units`). Los 7 productos con
+  `unit = "Bucket"` del catálogo: MIS020/021/022 (32#), CAM001 (28#), MEJ001
+  (35#), MEJ004/005 (50#). Contradecía al propio `MyRouteDetailActivity.kt:586`
+  ("Case/Unit/Bucket arrancan en 1") y a `EditBatchActivity.showAddProductDialog()`,
+  que sí arrancaba en 1.
+- **Lbs (reportado por el usuario):** el extra `QUANTITY` es `defaultWeight`
+  (`ProductDetailActivity.kt:127`) → `resetWeights()` (`:290`) → **el peso de
+  cada bolsa** → `orders.quantity`/`total` → factura de QBO. Un "2.35 lb" con
+  `qty = 24` vendía y **facturaba 24.00 lb**, sin que nada en la pantalla lo
+  pidiera. Este era el más grave de los dos: no era cosmético, movía dinero.
+
+**Fix** — helper único `seedQuantityForStepper(qty, weightPerUnit, unit, fallback)`
+en `data/Models.kt:331` (con `isBucketUnit()` al lado de `isLbsUnit()`/
+`isCaseUnitType()`), aplicado en los **5** call sites:
+`MainActivity.openDetail()` (`:618`), **`MainActivity.openSuggestion()` (`:673`)**,
+`MyRouteDetailActivity.openProductForBarcode()` (`:512`),
+`CreatePreOrderActivity.openAddItemStepper()` (`:354`) y
+`PreOrderDetailActivity.finalizeItem()` (`:610`).
+
+```kotlin
+when {
+    isBucketUnit(unit) -> 1.0
+    isLbsUnit(unit) -> weightPerUnit?.takeIf { it > 0 }
+        ?: qty.takeIf { it > 0 }?.toDouble()      // último recurso
+        ?: fallback
+    qty > 0 -> qty.toDouble()                    // Case/Unit: unidades por caja
+    else -> weightPerUnit?.takeIf { it > 0 } ?: fallback  // unit legacy
+}
+```
+
+- **`weight_per_unit` primero para Lbs no es una preferencia nueva** — es el
+  criterio que la app **ya** aplicaba en todas las demás pantallas y que nunca
+  mira `qty` para el peso: `ReceivingActivity.expectedWeight` (`:252`), los
+  diálogos de carga de `WarehouseRouteDetailActivity` (`:685`, la Fase 128),
+  `InventoryMovementsActivity`/`WarehouseInventoryActivity` (`expectedBoxWeight`)
+  y `EditBatchActivity.showAddProductDialog()` (`:263`,
+  `if (isLbsUnit(p.unit)) (p.weightPerUnit ?: 1.0) else 1.0`). El seed era el
+  único que se había quedado con el orden viejo. La Fase 128 es el antecedente
+  directo: el mismo bug de "arranca en 1" ya se había arreglado una vez para el
+  diálogo de carga a ruta, pero no para el seed de venta.
+- **`qty` queda como último recurso en Lbs, no se descarta** (decisión del
+  usuario): un producto sin `weight_per_unit` cargado no tiene otro dato. Los 68
+  productos `ONLY_IN_QBO` del master sheet son justo los que nunca recibieron
+  `unit`/`qty` de la migración de SKU.
+- `isLbsUnit()` da `true` también con `unit` en blanco, así que esa rama cubre
+  los productos sin tipo cargado — que es donde más fácil coexisten los dos
+  campos.
+- El `else` final cubre `unit` fuera de Lbs/Case-Unit/Bucket (ej. un "Pounds"
+  legacy), donde no hay regla documentada: se conserva el `qty` primero.
+
+**`MainActivity.openSuggestion()` (`:673`) se había escapado del primer pase** y
+tenía el `if (item.qty > 0)` crudo — es el que abre productos desde el
+**BÚSQUEDA**, no del escaneo, así que por ahí seguían vivos los dos bugs y el
+mismo producto abría con semillas distintas según cómo se llegara a él. Revisados
+los 6 `putExtra("QUANTITY", ...)` de la app: el de `CurrentOrderActivity.kt:386`
+sigue pasando `order.quantity` **a propósito** (es el path de edición, donde el
+extra trae la cantidad real guardada, no una semilla).
+
+**Por qué el guard va en el emisor y NO en `ProductDetailActivity`:** el mismo
+extra `QUANTITY` significa dos cosas distintas según de dónde viene. Desde el
+catálogo es la semilla (Bucket → 1, Lbs → peso nominal), pero en **modo edición**
+(`EDIT_ORDER_ID`) y en el **"Cambiar" de pre-órdenes** (`prefillUnits`) trae la
+cantidad REAL que eligió el operador. Un `if (Bucket) units = 1` en
+`resetCount()` pisaría los 3 baldes recién guardados, y un
+`if (Lbs) weights = weightPerUnit` pisaría el peso real que salió de la báscula
+en la venta por ruta. El invariante quedó documentado en el comentario de
+`resetCount()` — **si se agrega un call site nuevo, tiene que pasar por
+`seedQuantityForStepper()`.**
+
+**La matemática no se tocó** (y no hay que tocarla): `lineTotal()` para Bucket
+sigue siendo `price × quantity` (el `qty` en libras nunca entra) y para Lbs sigue
+siendo `price × peso`. Solo cambió el número con el que se abre la pantalla.
+
+### 2. `EditBatchActivity` — la fila mostraba el total sin `caseQty`
+
+`refreshTotal()` (`:168`) hacía `tvTotal.text = "$%.2f" de (q * p)` mientras 140
+líneas más abajo `saveChanges()` armaba el `BatchItem` con
+`lineTotal(price, quantity, unit, caseQty)`. Para un case de 24 a $1.50 en 2
+cajas: **la pantalla de aprobación mostraba $3.00 y se guardaban $72.00**
+(`1.50 × 24 × 2`). Agrava que `EditBatchActivity` es justamente la pantalla donde
+el admin revisa antes de que la venta entre a QBO (Fases 113/117), y que el
+`tvRowUnitHint` de esa misma fila — que dice "2 pack(s) × 24 = 48 units" — sí
+mostraba el dato correcto: la línea de abajo estaba bien y el número grande de
+arriba 24x bajo.
+
+**Fix** — `lineTotal(p, q, unit, caseQty)` en esa línea. Lbs y Bucket no cambian
+(ahí `lineTotal()` ya es `price × quantity`). Se corrigió además el comentario de
+`addRow()`, que seguía codificando la regla vieja ("price es el precio de la caja
+COMPLETA… case_qty solo para desglose, **no se multiplica**") — era la razón
+escrita del bug: dejarlo así era garantizar que el mismo error volviera en la
+próxima edición del archivo.
+
+### 3. `ConsignmentActivity` — `case_qty` siempre `NULL` al registrar
+
+Mandar `caseQty = product.caseQty` crudo, pero `ProductDto.case_qty` **nunca**
+viene poblado: la tabla `products` no tiene columna `case_qty` (las únicas están
+en `orders` y `pre_order_items`, y el backend responde `SELECT * FROM products`).
+Es el único lugar de la app que no aplicaba el workaround. Cadena completa del
+bug: `routeController.registerConsignment` guardaba `case_qty = NULL` en
+`route_consignment_items` → al liquidar, `lineTotal(price, qty, unit, null)` =
+`price × qty` → **$3.00 en vez de $72.00** en la venta, y el `INSERT` en `orders`
+salía sin `case_qty` (ticket sin el desglose "× 24", `Qty` de QBO inconsistente).
+
+**Fix** — `caseQty = if (isCaseUnitType(product.unit)) product.qty else null` (`:371`),
+idéntico a `EditBatchActivity.showAddProductDialog()` y a
+`estimatedUnitValueOf()`.
+
+### Lo que NO se tocó
+
+- **Backend/webapp/schema:** nada. Los 4 fixes son de lectura de pantalla y armado
+  de requests.
+- **La matemática de la Fase 122:** ni `lineTotal()`, ni `creditCalculator.ts`,
+  ni `qbInvoices.ts`, ni el ticket. El punto 2 es el único que toca una cuenta,
+  y solo para que coincida con el cálculo que ya guardaba.
+- **Consignaciones ya registradas con `case_qty = NULL`:** el fix no las
+  arregla. Si hay alguna de Case/Unit, necesita un `UPDATE` manual sobre
+  `route_consignment_items` **y** sobre las `orders` de la liquidación antes de
+  liquidarlas. No se revisó si existen.
+- **Bug Case/Unit en pre-órdenes — encontrado, NO implementado**
+  (`PreOrderDetailActivity.kt:603`): `isCaseBasedProduct = isCaseUnitType(unit)
+  && (product.caseQty ?: 0) > 0` es **siempre `false`** por el mismo motivo del
+  punto 3. Consecuencia en un Case/Unit con "Cambiar" sobre una cantidad ya
+  guardada: `QUANTITY` lleva la cantidad elegida (3) →
+  `ProductDetailActivity.kt:131` la usa de fallback como `caseQty` = 3 →
+  `resetCount()` cae en `else -> 1`. El stepper abre en 1 caja mostrando
+  *"1 pack × 3 = 3 units"* cuando debería ser *"3 packs × 24 = 72 units"*.
+  Arreglarlo implica tocar `PreOrderDetailActivity` **y** el fallback de
+  `caseQty` en `ProductDetailActivity`, y roza el flujo de pre-órdenes — quedó
+  fuera del alcance, documentado en el `CLAUDE.md` de Android.
+
+### Verificación
+
+Solo por compilación: `:app:compileDebugKotlin` y `assembleDebug`, sin warnings
+nuevos (los 3 que salen son preexistentes, de `SOFT_INPUT_ADJUST_RESIZE`).
+**Sin probar contra una base de datos real ni en un TC22 físico** — y en el
+punto 1 menos todavía, porque el alcance en datos depende de cuántos productos
+tengan `weight_per_unit` **y** `qty` cargados a la vez, cosa que no se puede
+determinar desde el repo (MySQL de XAMPP no estaba corriendo, error 20061). Para
+medirlo:
+
+```sql
+SELECT unit, COUNT(*) AS n,
+       SUM(COALESCE(weight_per_unit,0) > 0 AND qty > 0) AS ambos_campos
+FROM products
+WHERE hidden = 0 AND (unit IS NULL OR unit = '' OR unit IN ('Lbs','Case/Unit','Bucket'))
+GROUP BY unit;
+```
+
+`ambos_campos > 0` en la fila `Lbs` (o en la de `unit` vacío) es exactamente la
+población que cambia el fix. `COALESCE` a propósito: el mismo `NULL`-unsafe de
+la Fase 107.
+
+**Confirmado con el usuario que el camino de escaneo quedó intacto** — escanear el
+código de barras sigue mostrando el producto (`onBarcode()` → `openDetail()` →
+`ProductRepository.findByBarcode()`); lo único que cambió es el número con el que
+se abre `ProductDetailActivity` después.
+
+### Pendiente para producción
+
+- **Ningún APK generado/distribuido a los TC22.** Antes de desplegar, probar una
+  venta Lbs de un producto que tenga las dos columnas cargadas: es el caso cuyo
+  peso visible cambia con este fix (de `qty` a `weight_per_unit`).
+- Si el peso que aparece se ve raro, el culpable probable no es el código sino que
+  le falta `weight_per_unit` en el catálogo — en ese caso cae al `qty` como
+  último recurso, igual que antes, y la solución es cargar el peso desde la
+  webapp.

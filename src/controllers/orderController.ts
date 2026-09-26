@@ -2,7 +2,7 @@ import type { Request, Response } from 'express';
 import pool from '../db/connection.ts';
 import { createBatchInvoice, findInvoiceByDocNumber } from '../services/qbInvoices.ts';
 import { updateItemQtyOnHand } from '../services/qbItems.ts';
-import { computeDamageCredit, isLbsUnit } from '../services/creditCalculator.ts';
+import { computeDamageCredit, isLbsUnit, lineTotal } from '../services/creditCalculator.ts';
 import { getCustomerBalance, applyCustomerCredit } from '../services/creditController.ts';
 import { withInvoiceNumber, reserveInvoiceNumber } from '../services/invoiceCounter.ts';
 import logger from '../services/logger.ts';
@@ -67,11 +67,13 @@ function courtesyRowsFor(item: {
 
   // `courtesy_qty` siempre viene en UNIDADES INDIVIDUALES sueltas (mismo
   // criterio que computeDamageCredit/unitValueOf en creditCalculator.ts) —
-  // nunca en la escala de `quantity`. Para Case, `quantity` es el número de
-  // CAJAS y `price`/`total` valen por la caja completa (case_qty unidades
-  // c/u); sin convertir acá, "regalar 3 unidades sueltas de un case de 24"
-  // se comparaba/clampaba directo contra `quantity` (ej. 1 caja) y terminaba
-  // regalando la caja ENTERA en vez de 3/24 de su valor.
+  // nunca en la escala de `quantity`. Para Case/Unit, `quantity` es el número
+  // de CAJAS ( Fase 122: `price` es por unidad y `total` es el total de las
+  // cajas × case_qty), así que sin convertir acá, "regalar 3 unidades sueltas
+  // de un case de 24" se comparaba/clampaba directo contra `quantity` (ej. 1
+  // caja) y terminaba regalando la caja ENTERA en vez de 3/24 de su valor.
+  // El reparto de `total` de abajo es proporcional (courtesyTotal = total ×
+  // cq/quantity), así que es independiente de la escala en que venga `total`.
   const caseSize = isLbsUnit(item.unit) ? 1 : (Number(item.case_qty) || 1);
 
   // Compat retro: filas mandadas con is_courtesy=true y sin courtesy_qty
@@ -102,7 +104,10 @@ export async function createOrder(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    const finalTotal = total !== undefined ? total : price * quantity;
+    // Fase 122 — el fallback tiene que ser case-aware: `price` es por unidad y
+    // `quantity` viene en cajas, así que sin `× case_qty` una venta sin `total`
+    // explícito se cobraría 24x más bajo (lineTotal(), ver creditCalculator.ts).
+    const finalTotal = total !== undefined ? total : lineTotal(price, quantity, unit, case_qty);
 
     // batch_id propio aunque sea un solo item — mismo generador que
     // createBatch — así esta orden se aprueba con el mismo
@@ -343,7 +348,7 @@ export async function createBatch(req: Request, res: Response): Promise<void> {
       // Cortesía parcial (backlog #2) — el ítem puede dividirse en dos filas;
       // el descuento de stock sigue siendo UNO por ítem original y se
       // atribuye solo a la fila pagada (carriesStock), ver courtesyRowsFor.
-      const rows = courtesyRowsFor({ quantity, total: total ?? price * quantity, unit, case_qty, is_courtesy: item.is_courtesy, courtesy_qty: item.courtesy_qty });
+      const rows = courtesyRowsFor({ quantity, total: total ?? lineTotal(price, quantity, unit, case_qty), unit, case_qty, is_courtesy: item.is_courtesy, courtesy_qty: item.courtesy_qty });
       for (const row of rows) {
         const [result] = await pool.query(
           "INSERT INTO orders (barcode, product_id, product_name, price, quantity, total, batch_id, user_id, customer_id, customer_name, unit, case_qty, payment_method, check_number, is_courtesy, status, stock_decremented) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)",
@@ -552,6 +557,11 @@ export async function approveBatch(req: Request, res: Response): Promise<void> {
       quantity: o.quantity,
       total: o.total,
       is_courtesy: !!o.is_courtesy,
+      // Fase 122 — ver el comentario del mismo map en approveBatch(): sin
+      // unit/case_qty el Qty de la línea de QBO queda en cajas y QBO rechaza
+      // la factura (Amount != Qty × UnitPrice con el precio por unidad).
+      unit: o.unit,
+      case_qty: o.case_qty,
     }));
 
     // Finaliza como SENT — reusado tanto si createBatchInvoice devuelve
@@ -920,6 +930,12 @@ export async function retryBatchSync(req: Request, res: Response): Promise<void>
       quantity: o.quantity,
       total: o.total,
       is_courtesy: !!o.is_courtesy,
+      // Fase 122 — `unit`/`case_qty` es lo que permite a createBatchInvoice
+      // armar el Qty de la línea en UNIDADES (quantity × case_qty) en vez de
+      // cajas. Ya están en la fila de `orders`; sin reenviarlos, Qty ×
+      // UnitPrice no daba el Amount y QBO rechazaba la factura.
+      unit: o.unit,
+      case_qty: o.case_qty,
     }));
 
     // Declarado ANTES del try (no adentro): el catch de abajo lo necesita
@@ -1292,7 +1308,7 @@ export async function editBatch(req: Request, res: Response): Promise<void> {
       // Mismo split de cortesía parcial que createBatch — el descuento de
       // stock es UNO por ítem (ver courtesyRowsFor) y la reversa de arriba
       // ya sumó el stock de las filas viejas con stock_decremented=1.
-      const rows = courtesyRowsFor({ quantity, total: total ?? price * quantity, unit, case_qty, is_courtesy: item.is_courtesy, courtesy_qty: item.courtesy_qty });
+      const rows = courtesyRowsFor({ quantity, total: total ?? lineTotal(price, quantity, unit, case_qty), unit, case_qty, is_courtesy: item.is_courtesy, courtesy_qty: item.courtesy_qty });
       for (const row of rows) {
         await pool.query(
           `INSERT INTO orders
