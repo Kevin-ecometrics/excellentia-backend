@@ -7509,3 +7509,554 @@ se abre `ProductDetailActivity` después.
   le falta `weight_per_unit` en el catálogo — en ese caso cae al `qty` como
   último recurso, igual que antes, y la solución es cargar el peso desde la
   webapp.
+
+## 🔴 URGENTE — Backlog cliente Almacén (2026-09-28) — diseño cerrado, SIN IMPLEMENTAR
+
+Pedido del cliente en 3 partes, levantado en sesión de análisis (sin código
+todavía) — documentado acá antes de arrancar la implementación. Alcance:
+backend + Android + webapp los 3.
+
+### #1 — Editar `barcode` de un producto desde el dashboard (rol `almacenista`)
+
+**Motivo:** un producto recién importado de QBO llega con `barcode = NULL`
+(no hay de dónde sacarlo, ver "SKU vs barcode — Fase 105" en `CLAUDE.md`) y
+hoy solo `admin` puede asignárselo — `PUT /api/products/:id` es
+`adminOnly`, y `/products` está oculto en el sidebar para `almacenista`
+(`Sidebar.tsx`, línea 17: `roles: ['admin', 'operator']`).
+
+**Alcance decidido con el cliente (2026-09-28): solo `barcode` por ahora.**
+Si más adelante pide habilitar otros campos del producto (precio, sku,
+stock), es un pedido nuevo — no dar por sentado que este backlog lo cubre.
+
+**Diseño:**
+- Backend — endpoint nuevo y angosto `PATCH /api/products/:id/barcode`,
+  middleware `warehouseOnly` (ya existe, permite `admin`+`almacenista`) en
+  vez de abrir `PUT /api/products/:id` completo (evita que `almacenista`
+  pueda tocar precio/stock/sku por un scope mal acotado). Controller nuevo
+  que solo hace `UPDATE products SET barcode = ?` — sin llamada a QBO
+  (barcode nunca sincronizó, ver Fase 105).
+- Webapp — `Sidebar.tsx` agrega `almacenista` a los roles de `/products`;
+  `ProductsClient.tsx`/`ProductRow.tsx` muestran la tabla en modo
+  solo-lectura para ese rol salvo un modal chico nuevo de solo-barcode
+  (no el `ProductModal` completo, que sigue admin-only).
+
+### #2 — Peso variable por caja, guardado en Sub-inventario, disponible al armar pre-orden y al cargar ruta
+
+**Pedido tal cual lo confirmó el cliente:** al escanear un producto de peso
+variable (ej. carne — cada caja pesa distinto), la app debe permitir decir
+cuántas cajas son y pedir el peso real de cada una individualmente — no un
+solo peso agregado para todas. Ese dato queda guardado en el sub-inventario
+(`product_lots`, ya es donde vive) y tiene que poder **elegirse** después
+— tanto al armar una pre-orden como al cargar una ruta — mostrando el peso
+real de cada caja disponible, no un peso genérico del catálogo.
+
+**Aplica a las dos pantallas de escaneo** (confirmado con el cliente
+2026-09-28): Recepción **y** Carga de ruta.
+
+**Estado real del código, por pantalla:**
+- **Recepción** (`ReceivingActivity`) — el modelo de datos YA soporta esto:
+  cada escaneo crea su propia fila en `product_lots` con su propio peso
+  (`askExpirationThenAdd`). Lo que falta es la UX: hoy hay que re-escanear
+  la misma caja N veces para cargar N cajas de peso distinto. Falta agregar
+  un loop "¿cuántas cajas?" → pedir el peso de cada una en secuencia (caja 1
+  de N, caja 2 de N...) en un solo escaneo, generando N líneas en vez de 1.
+  **No es cambio de schema.**
+- **Carga de ruta** (`WarehouseRouteDetailActivity`/`addRouteItem`) — HOY
+  ES DISTINTO Y ROMPE LA IDENTIDAD DE LA CAJA: se pide una cantidad
+  objetivo y el backend (`computeFifoAllocation`) arma la combinación de
+  lotes solo — si el primer lote no alcanza, **fracciona una caja entre
+  varios lotes** (ej. carga 30 lb de una caja completa + 15 lb sueltas de
+  otra caja de 32 lb). Para que el peso de caja se mantenga hasta el
+  camión, esta pantalla necesita el mismo flujo que Recepción: escanear,
+  decir cuántas cajas se suben, y elegir/confirmar el peso real de cada una
+  — moviendo cajas completas identificadas individualmente en vez de un
+  número de libras suelto. Esto SÍ es un cambio de comportamiento (ya no
+  "pedí X lb y que el sistema resuelva cómo", sino "elegí estas cajas
+  puntuales").
+- **Pre-orden** (`CreatePreOrderActivity`) — HOY NO EXISTE NINGÚN VÍNCULO:
+  `pre_order_items` es pura intención de compra (`barcode`/`product_name`,
+  sin lote ni peso) hasta que se convierte, el día de la entrega (Fase 87).
+  Para que se pueda "elegir la caja" al armar la pre-orden, hace falta que
+  esta pantalla consulte los lotes disponibles de ese producto (mismo
+  endpoint que ya usa Sub-inventario, `GET /api/warehouse/lots`) y muestre
+  el peso real de cada caja para elegir una — **requiere un campo nuevo**,
+  vínculo `pre_order_items` → `product_lots.id`, para que la caja elegida
+  quede identificada y la conversión reuse esa misma caja en vez de
+  recalcular FIFO desde cero.
+
+**Confirmado con el cliente (2026-09-28):** el dato vive en el
+sub-inventario (`product_lots`) como fuente única — ni la pre-orden ni la
+carga de ruta duplican el peso en otro lado, ambas leen/eligen de ahí.
+
+**Sin cerrar todavía (a definir durante la implementación, no bloquea
+empezar):** si elegir una caja en la pre-orden la reserva (nadie más la
+puede tomar hasta que se convierta o cancele) o es solo informativa —
+afecta si hace falta una regla de qué pasa si dos pre-órdenes compiten por
+la misma caja, o si se vende por otro lado antes de la conversión.
+
+### #3 — Crear ruta / cargar camión sin depender de un cliente
+
+**Motivo:** `createRoute` en sí no exige cliente (solo `name` +
+`scheduled_date`) — el bloqueo real está en `addRouteItem`
+(`routeController.ts`, ~línea 1004-1012): desde el 2026-09-18,
+`route_stop_id` es **obligatorio** para cargar cualquier ítem al camión.
+Eso obliga a que ya exista al menos una parada (cliente/pre-orden/batch)
+creada antes de poder cargar mercadería — no se puede cargar el camión de
+forma general para repartir después.
+
+**Confirmado con el cliente (2026-09-28):** que sea abierto — `route_stop_id`
+no debe ser obligatorio para cargar el camión.
+
+**Diseño:**
+- Backend — sacar el `if (!route_stop_id) → 400` en `addRouteItem`; queda
+  opcional, y una línea de `route_items` sin parada queda con
+  `route_stop_id = NULL` ("carga general", reasignable después). **Pendiente
+  de chequear antes de tocar el controller:** si la columna
+  `route_items.route_stop_id` admite `NULL` en el schema actual o hace
+  falta un `ALTER TABLE`.
+- Backend — revisar que los endpoints que leen `route_items` agrupando por
+  parada (`getRoute`, `getExpectedReturns`, reconciliación de devoluciones)
+  no rompan con `route_stop_id = NULL` — deben mostrar esas líneas como
+  "Sin asignar" en vez de que desaparezcan.
+- Android (`WarehouseRouteDetailActivity`) — hoy autocompleta
+  `route_stop_id` cuando hay una sola parada o la ruta es `DIRECT`. Con
+  parada opcional, debe poder cargar igual cuando no hay ninguna parada
+  todavía (mandar sin `route_stop_id`). Reasignación posterior de una carga
+  general a una parada específica queda a definir durante la
+  implementación — no hay pantalla para eso hoy.
+- Webapp (`WarehouseClient.tsx`/detalle de ruta) — mostrar "Sin asignar" en
+  vez de un nombre de cliente para esas líneas.
+
+### Estado: diseño cerrado con el cliente para #1 y #3; #2 con reglas
+confirmadas pero un detalle de reserva de caja en pre-orden a resolver
+durante la implementación.
+
+### #1 — IMPLEMENTADO (2026-09-28)
+
+Backend: `PATCH /api/products/:id/barcode` (`warehouseOnly`), controller
+`updateProductBarcode` (`productController.ts`) — solo `UPDATE products SET
+barcode = ?`, sin llamada a QBO. Ruta agregada en `products.ts` antes del
+`delete '/:id'`.
+
+Webapp: `Sidebar.tsx` agrega `almacenista` a los roles de `/products`.
+`ProductsClient.tsx`/`ProductRow.tsx` — `almacenista` ve la tabla
+solo-lectura salvo un ícono de editar que abre `BarcodeModal.tsx` (nuevo,
+componente separado del `ProductModal` completo que sigue siendo admin-only)
+— pega contra el endpoint nuevo, no contra `PUT /api/products/:id`. Clave
+i18n nueva `modal_editBarcode` en `i18n.ts` (EN/ES).
+
+Verificado con `bun x tsc --noEmit` en los dos backends (`excellentia` y
+`excellentia-webapp`) — sin errores. **Sin probar en un browser real ni
+contra una base de datos real** — falta correr `bun run dev` en los dos y
+verificar en el navegador con un usuario `almacenista` de verdad, y
+desplegar a producción cuando se confirme.
+
+### #3 — IMPLEMENTADO (2026-09-28)
+
+**Backend** (`routeController.ts`, `addRouteItem`):
+- Se sacó el `if (!route_stop_id) → 400`. `route_stop_id` pasa a ser
+  opcional — la columna ya admitía `NULL` en el schema (`route_items`,
+  Fase 112), no hizo falta ningún `ALTER TABLE`.
+- El chequeo "la parada existe en esta ruta" ahora solo corre si vino
+  `route_stop_id` (envuelto en `if (routeStopId)`).
+- **Gotcha encontrado al revisar:** el `UNIQUE KEY (route_id, product_id,
+  route_stop_id)` de MySQL trata cada `NULL` como distinto entre sí — el
+  `INSERT ... ON DUPLICATE KEY UPDATE` que ya existía nunca iba a fusionar
+  dos cargas "sin asignar" del mismo producto (cada escaneo hubiera creado
+  una fila nueva en vez de sumar cantidad, a diferencia de las cargas con
+  parada, que sí fusionan). Reemplazado por un `SELECT` + `UPDATE`/`INSERT`
+  explícito usando `route_stop_id <=> ?` (null-safe equal), para que sumar
+  cantidad funcione igual con o sin parada. Los dos `SELECT` posteriores
+  que buscaban la fila recién insertada por `route_stop_id = ?` tenían el
+  mismo problema (`= NULL` nunca matchea en SQL) — cambiados al mismo
+  operador `<=>`.
+
+**Webapp** (`WarehouseClient.tsx`): la línea de manifiesto muestra
+"Sin asignar" (`wh_unassignedLoad`, i18n nuevo EN/ES) en vez de omitir el
+dato cuando `route_stop_id` es `NULL`.
+
+**Android** (`WarehouseRouteDetailActivity.kt`):
+- `AddRouteItemRequest.routeStopId` (`Models.kt`) pasó de `Int` a `Int?`.
+- Nuevo estado `loadingStopDecided: Boolean` junto a `currentLoadingStopId`
+  — distingue "todavía no se decidió" (bloquea escanear) de "se decidió:
+  carga general" (`currentLoadingStopId = null`, ya se puede escanear).
+  Antes, `stopId == null` significaba únicamente "no elegido todavía"; con
+  parada opcional, `null` pasa a ser también un valor válido y legítimo.
+- Con 0 paradas, se decide sola "sin asignar" (antes bloqueaba
+  completamente `btnManualEntry`/`btnFromReceiving`/`btnLoadingForStop` con
+  el mensaje "agregá una parada antes de cargar productos").
+- `showLoadingStopPicker()` — nueva opción "Sin asignar (carga general)"
+  siempre disponible en el listado, primera posición, incluso habiendo
+  paradas (para poder elegir cargar en general aunque ya existan clientes).
+- `renderItems()` — cada línea del manifiesto muestra "Sin asignar" en vez
+  de omitir el dato cuando `routeStopId` es `null`.
+- String nuevo `wh_unassigned_load` (`values/strings.xml` EN,
+  `values-es/strings.xml` ES). `wh_no_stops_to_load` quedó sin uso (no se
+  borró — mismo criterio del resto del proyecto de no dropear recursos).
+
+**Verificado:** `bun x tsc --noEmit` limpio en los dos backends
+(`excellentia`, `excellentia-webapp`). **Android sin compilar en este
+entorno** (sin Java/Gradle instalado, mismo problema recurrente en el
+proyecto) — revisado a mano. **Nada probado contra una base de datos real,
+un TC22 físico, ni la webapp en un browser real.**
+
+**Pendiente para producción:** desplegar backend + webapp, generar/
+distribuir APK nuevo, y probar el caso real (crear ruta sin ninguna parada
+→ cargar productos → confirmar que quedan "Sin asignar" → agregar una
+parada después y reasignar — **reasignar una carga general a una parada
+puntual no tiene pantalla todavía**, queda fuera de esta implementación,
+ver nota de diseño original más arriba).
+
+### #2 — pausado a pedido del usuario (2026-09-28), retomar más tarde
+
+Arrancado el análisis de implementación (revisado `preOrderController.ts` —
+`pre_order_items` hoy no tiene ningún vínculo a `product_lots`, confirma lo
+ya documentado más arriba) pero **sin tocar código todavía**. Retomar desde
+el diseño ya cerrado más arriba en esta misma sección cuando el usuario lo
+pida.
+
+### Fix (2026-09-28) — `getExpectedReturns` con cargas "sin asignar" (hueco del #3)
+
+`getExpectedReturns` atribuía lo vendido con la clave `route_stop_id|barcode`, que
+nunca matchea con `route_stop_id = NULL`: las cargas sin asignar mostraban
+`sold = 0` (esperado a devolver inflado, discrepancia falsa) y, como MySQL ordena
+`NULL` primero, el reparto `allocate()` de devoluciones las llenaba antes que a
+las paradas reales. Fix (`routeController.ts`): `ORDER BY ... (rs.position IS
+NULL), rs.position` para dejarlas al final, y a las filas sin asignar se les
+atribuye lo vendido del producto en la ruta que las líneas asignadas no cubren
+(ventas en paradas sin línea propia + excedente de líneas asignadas), con tope en
+lo cargado. `tsc --noEmit` limpio; sin probar contra base real.
+
+### #2 — IMPLEMENTADO (2026-09-28): peso variable por caja
+
+Decisión de reserva (confirmada con el usuario): elegir una caja en la
+pre-orden es **solo informativo**, no la reserva.
+
+**Backend** (`tsc --noEmit` limpio):
+- `pre_order_items.lot_id INT NULL` (sin FK a propósito), creada con
+  `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` en `ensureTables()` de
+  `preOrderController.ts`. Los 3 INSERT (create/update/convert) pasaron a un
+  helper único `insertPreOrderItem()` que persiste `lot_id`.
+- `getPreOrder` hace LEFT JOIN a `product_lots` y devuelve por ítem
+  `lot_weight`, `lot_remaining_qty`, `lot_number`, `lot_expiration_date` y
+  `lot_available` (false si la caja ya se consumió/dio de baja/borró).
+- `addRouteItem` acepta `whole_box: true` junto con `lot_id`: carga la caja
+  entera con el `remaining_qty` leído en el servidor (no fracciona).
+- Recepción: sin cambios de backend — ya creaba un lote por línea con su peso.
+
+**Android** (sin compilar, no hay Java/Gradle acá — revisado a mano):
+- `ReceivingActivity`: para Lbs, "¿cuántas cajas?" → peso de cada caja (1 de N…)
+  → un solo diálogo de proveedor/lote/vencimiento → N líneas (N lotes).
+- `WarehouseRouteDetailActivity`: para Lbs, al cargar se eligen cajas puntuales
+  (multi-selección con peso/vencimiento/lote) y se cargan completas, en serie
+  (evita la carrera del UNIQUE de `route_items`). "Otra cantidad" o sin lotes
+  → diálogo manual de siempre.
+- `CreatePreOrderActivity`: para Lbs, elegir una caja (o "Sin caja puntual");
+  precarga su peso real y guarda `lot_id` en el ítem.
+- `Models.kt`: `AddRouteItemRequest.wholeBox`, `PreOrderItem.lotId`; strings
+  es/en nuevos.
+
+**Pendiente:** compilar Android; mostrar la caja elegida (peso/aviso
+`lot_available`) en `PreOrderDetailActivity` y usarla al convertir (hoy
+`lot_id` se guarda y se devuelve, pero la conversión no la consume ni
+avisa); sin probar contra base real ni TC22; desplegar backend y APK.
+
+### #2 — cierre del pendiente (2026-09-28): detalle de pre-orden y conversión
+
+`PreOrderDetailActivity` (Android, sin compilar): cada ítem con caja elegida
+muestra "Caja: X lb · lote Y", o en rojo "La caja elegida ya no está
+disponible" cuando `lot_available` es false. El `lot_id` viaja de punta a
+punta: se conserva al finalizar por el stepper y por "Confirmar" rápido, y
+`convertPreOrder` lo persiste en `pre_order_items`. Sigue siendo solo
+informativo — la conversión no consume ni bloquea la caja. `PreOrderItem`
+ganó `lotWeight`/`lotNumber`/`lotAvailable` (solo lectura); strings es/en
+nuevos. Pendiente: compilar Android, probar en TC22, desplegar backend + APK.
+
+## ✅ Estado consolidado — Backlog cliente Almacén (2026-09-28)
+
+Los 3 pasos del backlog urgente están **implementados** (backend + webapp +
+Android):
+
+- [x] **#1 — Editar `barcode` (rol `almacenista`):** implementado. Backend
+      `PATCH /api/products/:id/barcode` (`warehouseOnly`), webapp con
+      `BarcodeModal.tsx` y `/products` visible para `almacenista`. El
+      almacenista ya puede editar el barcode desde el dashboard.
+- [x] **#2 — Peso variable por caja:** implementado (Recepción por caja,
+      carga de ruta por caja completa, elección informativa de caja en
+      pre-orden y su visualización/aviso en el detalle). Ver secciones
+      "#2 — IMPLEMENTADO" y "cierre del pendiente" más arriba.
+- [x] **#3 — Ruta/carga sin cliente:** implementado, incluido el fix de
+      `getExpectedReturns` para cargas "sin asignar".
+
+### 🔲 Pendiente — testing en Android (nada probado todavía)
+
+- [ ] Compilar Android (`:app:assembleDebug`) — no se pudo en este entorno
+      (sin Java/Gradle); todo el código de Android de estos 3 pasos se
+      revisó solo a mano.
+- [x] **#1 y #2 probados OK por el usuario (2026-09-29)** — quedan solo #3 y el deploy.
+- [ ] **#1** — probar en la webapp con un usuario `almacenista` real: ver
+      `/products`, editar barcode con el modal, confirmar que no puede tocar
+      precio/stock/sku.
+- [ ] **#2** — en un TC22, con un producto Lbs: Recepción (N cajas con
+      pesos distintos → N lotes), carga de ruta (elegir cajas, se cargan
+      completas), crear pre-orden con caja elegida y verla en el detalle
+      (incluido el aviso cuando la caja ya no está disponible).
+- [ ] **#3** — crear una ruta sin paradas, cargar productos ("Sin
+      asignar"), agregar paradas después y revisar devoluciones.
+- [ ] Desplegar backend + webapp y generar/distribuir APK a los TC22.
+      (La migración `products.stock` a `DECIMAL(10,2)`, Fase 136, ya está
+      aplicada en producción — confirmado por el usuario 2026-09-28.)
+
+## 🚨 URGENTE — Plan: conflictos pre-orden → ruta → venta con cajas de peso variable (2026-09-28)
+
+Revisión del flujo completo (pre-orden → Warehouse la agrega como parada
+`PRE_ORDER` de una ruta → carga del camión → `convertPreOrder` el día de la
+entrega) tras implementar el backlog #2 (peso variable por caja). **Nada de
+esto está implementado todavía.** Detectados 4 conflictos; se confirmaron leyendo
+backend y Android.
+
+### Hallazgos confirmados
+
+**1. La caja elegida en la pre-orden no llega a Warehouse al cargar la ruta.**
+`getExpectedStopItems` (`routeController.ts`, ~1217) devuelve solo
+`barcode`/`product_name`/`quantity`/`unit`/`case_qty` de `pre_order_items`;
+`ExpectedStopItemDto` (`Models.kt`) tampoco tiene campo de lote. Warehouse no ve
+qué caja se prometió y puede cargar otra sin aviso. Además `quantity` es `NULL`
+en pre-órdenes sin caja elegida → el diálogo de referencia
+(`showExpectedItemsReference`, `WarehouseRouteDetailActivity.kt`) lo lee como
+`0.0` ("0 lb"). Es solo un diálogo informativo, no preselecciona nada.
+
+**2. Falsa alarma "la caja ya no está disponible".** `getPreOrder`
+(`preOrderController.ts`, ~171) calcula `lot_available = ACTIVE AND
+remaining_qty > 0`. Al cargar esa misma caja a la ruta con `whole_box`, el lote
+queda en 0 → el detalle de la pre-orden muestra el aviso rojo aunque la caja va
+en el camión de esa misma parada. Si Warehouse carga una caja distinta, la
+pre-orden sigue apuntando a la original (peso/ticket no coinciden con lo cargado).
+`route_item_lots (route_item_id, lot_id)` permite saber qué lote fue a qué ruta.
+
+**3. Dos pre-órdenes pueden elegir la misma caja.** Ni `createPreOrder` ni
+`updatePreOrder` validan nada; al cargar una a una ruta, la otra cae en la
+alarma roja del punto 2.
+
+**4. BUG DE DATOS: `convertPreOrder` resta `1` fijo en Lbs**
+(`preOrderController.ts`, ~371: `stock - 1`). `createBatch`/`editBatch` ya restan
+`isLbsUnit ? quantity : 1`. Como se guarda `stock_decremented = 1`,
+`cancelBatch`/`editBatch` luego **suman el peso real** → una pre-orden Lbs de
+31.4 lb sin ruta resta 1 y, si se cancela, suma 31.4 (stock inflado en 30.4 lb).
+Solo ocurre si el producto NO estaba cargado a la ruta. Las conversiones ya
+hechas quedaron restadas con `-1`: ese stock histórico **no se corrige solo**.
+
+**Descartado tras revisar:** sospecha de hueco en devoluciones. En línea,
+`markRouteStopDeliveredIfAny` (`PreOrderDetailActivity.kt`) ya manda `batch_id`
+a `updateStopStatus` (fix 2026-09-23), así que `getExpectedReturns` sí cuenta lo
+vendido. Defecto aparte, fuera de este plan: en conversión **offline**
+(`OFFLINE_PENDING`) la parada nunca se marca entregada ni se enlaza el
+`batch_id` real al sincronizar.
+
+### Plan (orden de ejecución)
+
+**Paso 1 — Arreglar el descuento Lbs en `convertPreOrder` (backend, 2 líneas).**
+Usar `isLbsUnit(unit) ? Number(quantity) : 1` (importar `isLbsUnit` de
+`creditCalculator`). Verificar: `tsc --noEmit`; convertir una pre-orden Lbs sin
+ruta y comprobar que el stock baja el peso completo, y que cancelarla lo
+devuelve exacto. Avisar al usuario del stock histórico ya restado con `-1`.
+
+**Paso 2 — Mostrar la caja prometida al cargar la ruta (backend + Android).**
+- Backend: `getExpectedStopItems` suma `lot_id`, `lot_weight`, `lot_number`,
+  `lot_expiration_date`, `lot_available` (`LEFT JOIN product_lots`) y devuelve
+  `quantity` en `0` cuando es `NULL`.
+- Android: `ExpectedStopItemDto` gana esos campos; el diálogo dice "Caja
+  prometida: X lb · lote Y"; botón "Cargar caja prometida" que llama
+  `addRouteItem(product, lotWeight, lotId, wholeBox = true)` si sigue disponible.
+  Warehouse conserva la opción de elegir otra.
+
+**Paso 3 — Quitar la falsa alarma (backend + Android).**
+- `getPreOrder` agrega `lot_on_route` (existe fila en `route_item_lots` de ese
+  lote cuya ruta sigue activa; afinable por parada vía `route_item_id`).
+- `PreOrderDetailActivity`: si `lot_on_route` → "Caja cargada en la ruta"
+  (verde); el rojo queda solo para lotes consumidos/dados de baja/borrados. Si
+  Warehouse cargó una caja distinta a la de la pre-orden, mostrarlo. **A definir:**
+  si actualizar `pre_order_items.lot_id` automáticamente en ese caso.
+
+**Paso 4 — Dos pre-órdenes sobre la misma caja (DECISIÓN PENDIENTE del usuario).**
+- **Opción A (recomendada):** solo avisar ("esta caja ya está elegida en la
+  pre-orden #N"), sin bloquear — coherente con que la elección es informativa.
+- **Opción B:** reservar de verdad (excluir del selector las cajas elegidas por
+  otra pre-orden `DRAFT`/`CONFIRMED`; liberar al cancelar/convertir/borrar).
+  Probablemente requiere columna o tabla nueva.
+
+### Base de datos
+Pasos 1-3 y la opción A del 4 **no requieren cambios de schema ni SQL manual**
+(solo consultas con `LEFT JOIN`/`SELECT` y una fórmula). `pre_order_items.lot_id`
+ya se crea sola en `ensureTables()`. Solo la opción B podría necesitarlo.
+`products.stock` ya es `DECIMAL(10,2)` en producción (Fase 136, confirmado por el
+usuario 2026-09-28), así que el stock en Lbs no se trunca y no hay migración
+pendiente de ese lado.
+
+### Estado
+- [x] Paso 1 — fix `convertPreOrder` Lbs (2026-09-28): resta `isLbsUnit(unit) ? quantity : 1`. `tsc --noEmit` limpio; sin probar contra base real. El stock histórico ya restado con -1 no se corrige solo.
+- [x] Paso 2 — caja prometida en carga de ruta (2026-09-28): `getExpectedStopItems` (PRE_ORDER) devuelve `lot_id`/`lot_remaining_qty`/`lot_weight`/`lot_number`/`lot_available` y `quantity` 0 si era NULL (fallback a la consulta básica si `pre_order_items.lot_id` no existe). Android: `ExpectedStopItemDto` con esos campos; el diálogo de referencia muestra "caja prometida X lb · lote Y" y botón "Cargar cajas prometidas" (`loadPromisedBoxes`, whole_box en serie).
+- [x] Paso 3 — `lot_on_route` (2026-09-28): `getPreOrder` marca `lot_on_route`/`lot_route_id` vía `route_item_lots` (rutas no CANCELLED; query aparte con try/catch). Android: `PreOrderItem.lotOnRoute`; detalle de pre-orden muestra "Caja cargada en la ruta" en verde y deja el rojo solo para lotes realmente consumidos/dados de baja. NO se actualiza `lot_id` automáticamente si Warehouse carga otra caja (solo se muestra). `tsc --noEmit` limpio; Android sin compilar/probar.
+- [x] Paso 4 — opción A implementada (2026-09-28): `listLots` con `?product_id=` devuelve `claimed_by` [{pre_order_id, customer_name}] (pre-órdenes DRAFT/CONFIRMED que eligieron la caja; try/catch propio para no romper el Sub-inventario si `pre_order_items.lot_id` aún no existe). Android: `ProductLotDto.claimedBy` + sufijo "ya elegida en pre-orden #N (Cliente)" en el selector de `CreatePreOrderActivity` y en el de carga de `WarehouseRouteDetailActivity`. Solo avisa, no bloquea. `tsc --noEmit` limpio; Android sin compilar/probar.
+- [ ] Compilar Android (no hay Java/Gradle en este entorno; solo revisado a mano)
+- [ ] Desplegar backend + generar APK; probar en TC22
+
+### Auditoría del día (2026-09-28) — bugs encontrados y corregidos
+
+Revisión de todo lo generado hoy (backlog #1/#2/#3 + pasos 1-4). `tsc --noEmit`
+limpio en el backend; Android y webapp revisados a mano (sin compilar/probar).
+
+- **`applyFifoAllocation` (`warehouseController.ts`) — DEPLETED erróneo.** El
+  UPDATE asignaba `remaining_qty` antes que `status`; MySQL evalúa de izquierda a
+  derecha, así que el CASE restaba `qty` dos veces: cargar a una ruta la mitad o
+  más de un lote (ej. 20 de 30) lo marcaba `DEPLETED` con stock disponible y
+  desaparecía de FIFO/"Disponible". Reordenado (`status` primero). Bug previo a
+  hoy, afectaba cargas parciales (no las de caja completa).
+- **Misma función — carrera.** Ahora `WHERE status='ACTIVE' AND remaining_qty >= ?`;
+  si no afecta ninguna fila deshace lo ya aplicado y lanza `LotChangedError` →
+  `addRouteItem` responde 409. Evita que dos cargas simultáneas de la misma caja
+  (`whole_box`) dejen `remaining_qty` negativo.
+- **`updateProductBarcode`.** `products.barcode` es UNIQUE: un duplicado daba 500;
+  ahora 409 con el nombre del producto que ya lo tiene. Coerción a string (un
+  número tiraba 500), tope de 50 caracteres, y se mantienen alineadas las copias
+  de `barcode` en `product_lots` y `route_items`. **Limitación conocida:** `orders`
+  históricas conservan el barcode viejo (a propósito); `cancelBatch`/`editBatch`
+  revierten stock por barcode, así que cambiar un barcode ya existente (no
+  asignar uno a un producto sin barcode) puede dejar sin revertir stock de una
+  venta `AWAITING_APPROVAL` previa al cambio.
+- **`ReceivingActivity.askBoxWeight` (Android).** Peso vacío sin peso de catálogo
+  registraba la caja con 0.01 lb inventado; ahora vuelve a pedir el peso.
+
+**Limitaciones conocidas (no son bugs nuevos):** una pre-orden no admite dos
+cajas del mismo producto (`error_already_in_preorder`, una fila por barcode);
+elegir caja en pre-orden no reserva; el aviso de "caja ya elegida" solo se ve al
+elegir; conversión offline no marca la parada entregada.
+
+## ✅ CERRADO 2026-09-30 — Módulo Warehouse confirmado por el cliente (deploy + mensaje al cliente, 2026-09-29)
+
+Hoy (2026-09-28) se implementó y se auditó todo el backlog del cliente (#1, #2,
+#3) más los pasos 1-4 del plan de conflictos pre-orden → ruta → venta. Ver
+"Auditoría del día" más arriba para los bugs encontrados y corregidos. **Nada
+está desplegado ni probado en un TC22 todavía.**
+
+### Checklist (en este orden)
+
+- [x] **1. Verificar antes de subir:** `bun x tsc --noEmit` en `excellentia` y en
+      `excellentia-webapp`; compilar Android (`:app:assembleDebug`) — es lo único
+      que nunca se compiló.
+- [x] **2. Desplegar backend** (`excellentia`) a cPanel. Sin dependencias nuevas
+      (no hace falta `npm install`). Sin SQL manual: `pre_order_items.lot_id` se
+      crea sola; `products.stock` ya es `DECIMAL(10,2)` en producción.
+- [x] **3. Desplegar webapp** (`excellentia-webapp`): `BarcodeModal`, `Sidebar`,
+      `ProductRow`, `ProductsClient`, `WarehouseClient`, `i18n`.
+- [x] **4. Generar y distribuir APK** a los TC22 (después de backend: el APK nuevo
+      espera campos que el backend viejo no devuelve).
+- [x] **5. Chequeos post-deploy en la base:**
+      - `SELECT id, product_id, remaining_qty FROM product_lots WHERE
+        status='DEPLETED' AND remaining_qty > 0;` → los que aparezcan quedaron
+        mal marcados por el bug previo de `applyFifoAllocation`; volverlos a
+        `ACTIVE`.
+      - Revisar el stock de productos Lbs convertidos desde pre-orden **sin
+        ruta** antes del fix (restaron `-1` en vez del peso): no se corrige solo.
+- [x] **6. Enviar el mensaje al cliente** (borrador abajo).
+- [x] **7. Esperar la confirmación del cliente:** si falta algo, se anota como
+      backlog nuevo; si no, el cliente hace un test y **se da por finalizado el
+      módulo Warehouse**.
+
+**Cierre (2026-09-30):** el cliente confirmó el módulo Warehouse. Módulo finalizado; en espera de nuevos features (cualquier pedido nuevo se anota como backlog aparte).
+
+### Borrador del mensaje al cliente
+
+> Hola, ya están aplicados los 3 cambios que pediste para el módulo de Almacén:
+>
+> **#1 — Editar el barcode desde el dashboard**
+> Se agregó el permiso para que los usuarios con rol Warehouse (almacenista)
+> puedan editar el barcode de un producto dentro de la sección **Products** del
+> dashboard. Ahora ven esa sección y, en cada producto, un ícono de edición que
+> abre un formulario solo con el campo barcode. Precio, stock y SKU siguen siendo
+> exclusivos del administrador. El sistema no permite guardar un barcode que ya
+> tiene otro producto.
+>
+> **#2 — Peso variable por caja**
+> Cada caja de un producto por libras se guarda con su peso real y se puede elegir
+> después:
+> - *Recepción:* al escanear el producto, la app pregunta cuántas cajas llegaron y
+>   pide el peso de cada una (caja 1 de N, caja 2 de N…). Cada caja queda como un
+>   lote propio en el Sub-inventario.
+> - *Carga de ruta:* al cargar el producto se muestra la lista de cajas
+>   disponibles, con peso, vencimiento y lote; se marcan las que van al camión y
+>   se cargan completas, sin partirlas. Funciona al escanear, en la búsqueda
+>   manual y en el botón "Cargar desde Recepción".
+> - *Pre-orden:* al agregar el producto se puede elegir una caja puntual y la
+>   cantidad toma su peso real. El detalle de la pre-orden muestra la caja elegida
+>   ("Caja: 31.4 lb · lote X") y, cuando ya se cargó a una ruta, "Caja cargada en
+>   la ruta". La elección es informativa: no reserva la caja.
+> - *Armado de la ruta:* al elegir la parada de una pre-orden, el almacenista ve
+>   la caja prometida y puede cargarla con un botón ("Cargar cajas prometidas") o
+>   elegir otra. Si otra pre-orden ya eligió esa caja, la lista lo indica ("ya
+>   elegida en pre-orden #N") sin bloquear.
+>
+> **#3 — Cargar el camión sin depender de un cliente**
+> Ya no es obligatorio tener una parada creada para cargar mercadería a una ruta.
+> En la app, al cargar aparece la opción "Sin asignar (carga general)"; esas
+> líneas se ven marcadas como "Sin asignar" en la app y en el dashboard. Si la ruta
+> todavía no tiene paradas, se puede cargar directamente. La revisión de
+> devoluciones también toma en cuenta las cargas sin asignar.
+>
+> Por favor confirmá si falta algún cambio por aplicar. Si está todo, hacé una
+> prueba completa (recibir cajas con pesos distintos → crear pre-orden con caja →
+> armar la ruta y cargar → entregar → revisar devoluciones) y avisanos para dar el
+> módulo de Almacén por finalizado.
+
+## Fase 139: Ruta sin paradas — el operador suma clientes sobre la marcha y termina la ruta a mano (2026-09-29)
+
+**Problema (encontrado al probar #3):** una ruta cargada "sin asignar" y sin paradas dejaba al operador sin salida — la venta solo arrancaba desde el "Vender" de una parada CUSTOMER, `addStop` era `warehouseOnly`, y `maybeAutoCloseRoute` no cierra con 0 paradas. Además, si el operador hubiera podido crear paradas, la ruta se habría cerrado sola (`COMPLETED`) tras la primera entrega y no habría podido sumar el siguiente cliente.
+
+**Backend (`routeController.ts`, `deliveryRoutes.ts`, `schema.sql`):**
+- Columna nueva `routes.manual_close TINYINT(1) DEFAULT 0` (se crea sola vía `ALTER ... ADD COLUMN IF NOT EXISTS` en `ensureTables()`, también en `schema.sql`). `getRoute` la expone como boolean.
+- `POST /api/routes/:id/stops` ya no es `warehouseOnly`: el operador dueño de la ruta puede crear solo paradas `CUSTOMER`, con la ruta `IN_PROGRESS`, sin pasar por la planificación del día (`route_day_stops`; si el cliente sí estaba planificado se enlaza igual). Al crearla la ruta pasa a `manual_close = 1`. BATCH/PRE_ORDER/CONSIGNMENT siguen siendo del almacén.
+- `maybeAutoCloseRoute` no hace nada si `manual_close = 1`.
+- `updateRoute` (operator, `status = COMPLETED`): 400 si quedan paradas `PENDING`; si hay paradas y todas se saltearon queda `CANCELLED` (mismo criterio que el auto-cierre); sin paradas o con ≥1 entrega, `COMPLETED`. Devuelve `routeStatus`. Admin/almacenista sin cambios.
+
+**Android (`MyRouteDetailActivity`, sin compilar):** botón "Agregar cliente / Nueva venta" (ruta `IN_PROGRESS` y sin venta en curso) → `CustomerPickerActivity` → `addRouteStop(CUSTOMER)` → arranca la venta. Botón "Terminar ruta" solo si `manual_close` o sin paradas. Al vender desde una parada se incluyen también los ítems "Sin asignar" (`routeStopId == null`). Los errores del backend se muestran con su motivo real.
+
+**Pendiente:** compilar Android; probar en TC22 (ruta sin paradas → iniciar → vender a 2 clientes sin que se cierre → Terminar ruta → devoluciones); desplegar backend + APK. `tsc --noEmit` backend limpio. Una ruta no vuelve de `manual_close` a cierre automático.
+
+### Fase 139 — addendum (2026-09-29): se elimina el auto-cierre de ruta por completo
+
+Al probar, una ruta con parada creada por el almacén (o cualquiera con `manual_close = 0`) seguía pasando a `COMPLETED` al entregar la última parada — el viejo `maybeAutoCloseRoute` (2026-09-23). Pedido del usuario: completar una orden nunca debe completar la ruta. **`maybeAutoCloseRoute` eliminada**; `updateStopStatus` ya no cierra rutas (responde `routeStatus: null`). Toda ruta se termina a mano: `updateRoute` con `status=COMPLETED` (operator: 400 si quedan paradas PENDING; todas saltadas → CANCELLED). Android: "Terminar ruta" visible siempre que la ruta esté `IN_PROGRESS`. `routes.manual_close` queda en la tabla pero ya no decide nada (redundante). `tsc --noEmit` limpio; Android sin compilar. **Requiere redeploy de backend + APK.**
+
+### Fase 139 — addendum 2 (2026-09-29): "Quedan X" por producto, bloqueo de agotados y auditoría
+
+**Vendido/restante en "Loaded on truck".** `getRoute` suma por ítem `sold_qty` y `total_loaded_qty` (a nivel ruta, por barcode; mismo criterio que `getExpectedReturns`: ventas de batches enlazados a una parada, sin `CANCELLED`). Android (`MyRouteDetailActivity.renderItems`): junto al SKU muestra "Quedan X" o "Vendido" si se agotó; el punto rojo/ámbar/verde compara el carrito contra lo que **queda** (no lo cargado total). Un producto agotado se ve apagado (50 %), no se puede abrir desde la lista (Snackbar `msg_route_item_sold_out`) y, para Lbs, se precarga lo que queda. Solo bloqueo de pantalla: el backend no valida que la venta no supere lo cargado y "Escanear otro producto" sigue abriendo cualquier producto.
+
+**Auditoría de los archivos tocados (sin impacto en otros módulos):** la webapp de Almacén ignora los campos nuevos y ya permite pasar `IN_PROGRESS → COMPLETED` (`WarehouseClient.tsx`), así que admin/almacenista pueden cerrar una ruta que el operador olvidó terminar; las otras pantallas de Android (`WarehouseRouteDetailActivity`, `ConsignmentActivity`, `PreOrderDetailActivity`, `CurrentOrderActivity`) no dependen de `routeStatus` ni construyen `RouteItemDto` a mano. Tres arreglos: (1) el `ALTER ... manual_close` de `ensureTables()` va en try/catch para no tumbar todos los endpoints de rutas si el motor no soporta `IF NOT EXISTS`; (2) el operador solo puede finalizar una ruta `IN_PROGRESS` (antes también `PLANNED`); (3) `CLAUDE.md` y comentarios ya no mencionan `maybeAutoCloseRoute`.
+
+**Estado:** probado por el usuario (flujo completo con operator: ruta sin paradas → agregar clientes → vender → "Quedan X"/agotado → Terminar ruta). SQL `routes.manual_close` ya aplicado en producción. `tsc --noEmit` limpio. **Pendiente:** redeploy del backend (los 3 arreglos de la auditoría); el APK no cambió desde la última prueba.
+
+**Limitaciones conocidas (no bloquean):** una venta offline no queda enlazada a la parada y no descuenta de "Quedan X" hasta enlazarse; `routes.manual_close` ya no decide nada (informativa, se puede quitar); en `MyRouteDetailActivity` queda un aviso de "completada automáticamente" que ya no se dispara (código muerto inofensivo); el resto de los archivos sin commitear de ayer (`preOrderController`, `productController`, `warehouseController`, `products.ts`) no entró en esta auditoría.
+
+## Fase 140: Escanear la etiqueta de peso en vez de escribir el peso a mano (2026-09-29)
+
+**Pedido del cliente:** en Warehouse, tras escanear el código del producto y (si es peso variable) el número de cajas, el peso en lbs se escribía a mano. Las cajas de Tío Francisco traen un código de barras pequeño y vertical con el peso — que el almacenista pueda escanear ese en vez de teclear.
+
+**Qué trae cada etiqueta** (decodificado desde 5 fotos de cajas reales con `zxing-cpp`, sin TC22):
+- Code128 **pequeño vertical**: contenido = solo el peso como texto (`14.45`, `15.08`, `24.20`). **Es el que se lee.**
+- Code128 largo: `350/1A-26239/14.45` (producto/lote/peso; el peso va después de la última `/`).
+- EAN-13/UPC-A: código del producto (el que ya tiene asignado cada producto), sin peso.
+- Cotija: DataMatrix GS1 con `(3202)001215` = 12.15 lb, más GTIN, fecha y lote.
+
+**Solo Android — el backend no cambia** (`quantity` ya es `DECIMAL(10,2)` desde la Fase 118 y le da igual si el peso se tecleó o se escaneó):
+- `data/scan/WeightLabel.kt` (nuevo) — `parse(raw)`: acepta solo `^\d{1,4}\.\d{1,2}$` y > 0. El punto decimal es obligatorio a propósito: un UPC/EAN nunca se confunde con un peso. `WeightLabelTest` (5 tests, pasan).
+- `DataWedgeScanner.createReceiver` — parámetro opcional `onEmpty` para avisar de un escaneo vacío (antes se ignoraba en silencio; el resto de pantallas conserva ese comportamiento). `onBarcode` quedó como último parámetro para no romper los call sites con lambda final.
+- Mientras hay un diálogo de peso en **Lbs** abierto, el escaneo va a ese campo (`weightTarget`) en vez de buscar un producto. Aplica en `ReceivingActivity.askBoxWeight` y en `WarehouseRouteDetailActivity.showQuantityDialogManual` / `showQuantityDialogForAvailable` (solo Lbs). El escaneo rellena el campo; el almacenista sigue confirmando con Continuar/Confirmar.
+- **Errores** (rojo en el propio campo): escaneo con otro contenido → `No es una etiqueta de peso: "…"`; escaneo vacío → `El escaneo no trajo datos`. Strings es/en (`hint_scan_weight_label`, `error_weight_scan_empty`, `error_weight_scan_invalid`).
+- **DataWedge sin cambios:** el perfil ya activa `decoder_code128` y entrega por intent (sin teclado), así que el texto llega limpio.
+
+**Fuera de alcance de v1:** el Code128 largo (`…/14.45`) y el GS1 de Cotija (necesitaría `decoder_datamatrix` en el perfil, y no se sabe si el equipo lo lee con la config actual). Si el pequeño funciona, se pueden sumar después reusando el mismo punto de enganche.
+
+**Limitación conocida:** si el láser no logra decodificar, DataWedge no manda ningún intent, así que no hay error posible — el almacenista lo nota por la falta del beep.
+
+**Estado:** compila (`:app:compileDebugKotlin`) y los tests unitarios pasan. Probado por el cliente en un TC22 real con cajas reales y aprobado (2026-09-30, ver abajo). Los cambios de las activities quedaron mezclados en el árbol de trabajo con otros cambios sin commitear de las mismas activities.
+
+**✅ Aprobado por el cliente (2026-09-30):** el cliente probó el escaneo de la etiqueta de peso y lo aprobó — la feature queda **cerrada**, ya no hay pendiente de validación. (Si en el futuro se quiere sumar el Code128 largo o el GS1 de Cotija, sería backlog nuevo, reusando el mismo punto de enganche.) Requiere APK nuevo (sin cambios de backend) para quien todavía no lo tenga.

@@ -56,7 +56,7 @@ router.get('/',                       auth, listRoutes);
 router.get('/:id',                    auth, getRoute);
 router.put('/:id',                    auth, updateRoute);
 router.delete('/:id',                 auth, warehouseOnly, deleteRoute);
-router.post('/:id/stops',             auth, warehouseOnly, addStop);
+router.post('/:id/stops',             auth, addStop); // warehouseOnly salvo operator: addStop valida (solo CUSTOMER, su ruta IN_PROGRESS)
 router.put('/:id/stops/reorder',      auth, warehouseOnly, reorderStops);
 router.delete('/:id/stops/:stopId',   auth, warehouseOnly, removeStop);
 router.put('/:id/stops/:stopId/status', auth, updateStopStatus);

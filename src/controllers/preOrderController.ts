@@ -1,9 +1,10 @@
 import type { Request, Response } from 'express';
 import pool from '../db/connection.ts';
 import logger from '../services/logger.ts';
-import { computeDamageCredit, lineTotal } from '../services/creditCalculator.ts';
+import { computeDamageCredit, lineTotal, isLbsUnit } from '../services/creditCalculator.ts';
 import { getCustomerBalance, applyCustomerCredit } from '../services/creditController.ts';
 import { reserveInvoiceNumber } from '../services/invoiceCounter.ts';
+import { ensureWarehouseTables } from './warehouseController.ts';
 
 async function ensureTables() {
   await pool.query("CREATE TABLE IF NOT EXISTS pre_orders (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, assigned_user_id INT DEFAULT NULL, customer_id VARCHAR(100) NOT NULL, customer_name VARCHAR(255) NOT NULL, salesperson_name VARCHAR(255) DEFAULT NULL, scheduled_date DATE, notes TEXT, status ENUM('DRAFT','CONFIRMED','CONVERTED','CANCELLED') DEFAULT 'DRAFT', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
@@ -25,6 +26,28 @@ async function ensureTables() {
       FOREIGN KEY (pre_order_id) REFERENCES pre_orders(id) ON DELETE CASCADE
     )
   `);
+  // lot_id (backlog cliente #2, 2026-09-28) — caja puntual (product_lots.id)
+  // elegida al armar la pre-orden, para productos de peso variable. Solo
+  // informativa, NO reserva: sin FK a propósito (un lote borrado por
+  // deleteBackfillLot no debe bloquear nada) y `getPreOrder` la resuelve
+  // contra product_lots al leer, avisando si ya no está disponible.
+  await pool.query('ALTER TABLE pre_order_items ADD COLUMN IF NOT EXISTS lot_id INT DEFAULT NULL');
+}
+
+// Inserta una línea de pre_order_items — el mismo INSERT vivía copiado en
+// createPreOrder/updatePreOrder/convertPreOrder; ahora que hay una columna
+// más (lot_id) se centraliza acá para que las 3 rutas no se desalineen.
+async function insertPreOrderItem(
+  preOrderId: string | string[] | number | undefined,
+  item: { barcode: string; product_name: string; unit?: string | null; case_qty?: number | null; lot_id?: number | null },
+  price: number | null,
+  quantity: number | null,
+  total: number | null,
+): Promise<void> {
+  await pool.query(
+    'INSERT INTO pre_order_items (pre_order_id, barcode, product_name, price, quantity, total, unit, case_qty, lot_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [preOrderId, item.barcode, item.product_name, price, quantity, total, item.unit ?? null, item.case_qty ?? null, item.lot_id ?? null]
+  );
 }
 
 // Solo admin y quien creó/está asignado a la pre-orden pueden verla o actuar sobre
@@ -67,10 +90,7 @@ export async function createPreOrder(req: Request, res: Response): Promise<void>
       const { barcode, product_name, price, quantity, unit, case_qty } = item;
       const hasPricing = price != null && quantity != null;
       const total = hasPricing ? (item.total ?? lineTotal(price, quantity, unit, case_qty)) : null;
-      await pool.query(
-        'INSERT INTO pre_order_items (pre_order_id, barcode, product_name, price, quantity, total, unit, case_qty) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        [preOrderId, barcode, product_name, hasPricing ? price : null, hasPricing ? quantity : null, total, unit ?? null, case_qty ?? null]
-      );
+      await insertPreOrderItem(preOrderId, item, hasPricing ? price : null, hasPricing ? quantity : null, total);
 
       const [[product]] = await pool.query('SELECT stock FROM products WHERE barcode = ?', [barcode]) as any[];
       if (product && Number(product.stock) <= 5) {
@@ -140,10 +160,58 @@ export async function getPreOrder(req: Request, res: Response): Promise<void> {
       res.status(403).json({ error: 'No tienes permiso para ver esta pre-orden' });
       return;
     }
+    await ensureWarehouseTables(); // product_lots para el LEFT JOIN de abajo
+    // lot_* (backlog #2): datos vivos de la caja elegida. `lot_available` es
+    // false si la caja ya se consumió/dio de baja/borró desde que se armó la
+    // pre-orden — la elección es informativa, el cliente decide qué hacer.
     const [items] = await pool.query(
-      'SELECT * FROM pre_order_items WHERE pre_order_id = ? ORDER BY id',
+      `SELECT pi.*,
+              pl.received_qty AS lot_weight, pl.remaining_qty AS lot_remaining_qty,
+              pl.lot_number AS lot_number, pl.expiration_date AS lot_expiration_date,
+              (pl.id IS NOT NULL AND pl.status = 'ACTIVE' AND pl.remaining_qty > 0) AS lot_available
+       FROM pre_order_items pi
+       LEFT JOIN product_lots pl ON pl.id = pi.lot_id
+       WHERE pi.pre_order_id = ? ORDER BY pi.id`,
       [id]
     ) as any[];
+    for (const it of items as any[]) {
+      if (it.lot_id != null) {
+        it.lot_weight = it.lot_weight != null ? Number(it.lot_weight) : null;
+        it.lot_remaining_qty = it.lot_remaining_qty != null ? Number(it.lot_remaining_qty) : null;
+        it.lot_available = !!it.lot_available;
+        it.lot_on_route = false;
+      }
+    }
+    // lot_on_route (backlog #2, paso 3, 2026-09-28) — la caja elegida ya no
+    // está "disponible" (remaining_qty = 0) pero eso puede ser justamente
+    // porque Warehouse la cargó a una ruta (route_item_lots). Sin esto el
+    // detalle mostraba el aviso rojo de "caja no disponible" para una caja que
+    // sí va en el camión. Rutas CANCELLED no cuentan (la carga se revierte).
+    // Query aparte con try/catch: route_items/routes se crean de forma
+    // perezosa en routeController y no deben poder romper getPreOrder.
+    const lotIds = (items as any[]).filter(it => it.lot_id != null).map(it => it.lot_id);
+    if (lotIds.length > 0) {
+      try {
+        const [onRoute] = await pool.query(
+          `SELECT DISTINCT ril.lot_id, r.id AS route_id
+           FROM route_item_lots ril
+           JOIN route_items ri ON ri.id = ril.route_item_id
+           JOIN routes r ON r.id = ri.route_id
+           WHERE ril.lot_id IN (?) AND r.status != 'CANCELLED'`,
+          [lotIds]
+        ) as any[];
+        const routeByLot = new Map<number, number>();
+        for (const row of onRoute as any[]) routeByLot.set(row.lot_id, row.route_id);
+        for (const it of items as any[]) {
+          if (it.lot_id != null && routeByLot.has(it.lot_id)) {
+            it.lot_on_route = true;
+            it.lot_route_id = routeByLot.get(it.lot_id);
+          }
+        }
+      } catch (routeErr) {
+        logger.warn('getPreOrder: no se pudo calcular lot_on_route:', routeErr);
+      }
+    }
     res.json({ data: { ...preOrder, items } });
   } catch (err) {
     logger.error('getPreOrder error:', err);
@@ -207,10 +275,7 @@ export async function updatePreOrder(req: Request, res: Response): Promise<void>
         const { barcode, product_name, price, quantity, unit, case_qty } = item;
         const hasPricing = price != null && quantity != null;
         const total = hasPricing ? (item.total ?? lineTotal(price, quantity, unit, case_qty)) : null;
-        await pool.query(
-          'INSERT INTO pre_order_items (pre_order_id, barcode, product_name, price, quantity, total, unit, case_qty) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-          [id, barcode, product_name, hasPricing ? price : null, hasPricing ? quantity : null, total, unit ?? null, case_qty ?? null]
-        );
+        await insertPreOrderItem(id, item, hasPricing ? price : null, hasPricing ? quantity : null, total);
       }
     }
 
@@ -334,7 +399,13 @@ export async function convertPreOrder(req: Request, res: Response): Promise<void
          batchId, req.user?.id ?? null, preOrder.customer_id, preOrder.customer_name, unit ?? null, case_qty ?? null, payment_method ?? null, check_number ?? null, null, decremented ? 1 : 0]
       ) as any;
       if (decremented) {
-        await pool.query('UPDATE products SET stock = GREATEST(stock - 1, 0) WHERE barcode = ?', [barcode]);
+        // Fix (2026-09-28) — antes restaba -1 fijo también para Lbs. Para un
+        // producto de peso variable el stock va en libras (mismo criterio que
+        // createBatch/editBatch): se resta el peso real. Además cancelBatch/
+        // editBatch revierten `quantity` para Lbs (stock_decremented=1), así
+        // que con -1 acá la reversa inflaba el stock en (peso - 1).
+        const stockDelta = isLbsUnit(unit) ? Number(quantity) || 0 : 1;
+        await pool.query('UPDATE products SET stock = GREATEST(stock - ?, 0) WHERE barcode = ?', [stockDelta, barcode]);
       }
       inserted.push({ id: result.insertId, barcode, product_name, price: price ?? 0, quantity: quantity ?? 0, total: finalTotal });
     }
@@ -348,10 +419,7 @@ export async function convertPreOrder(req: Request, res: Response): Promise<void
       const { barcode, product_name, price, quantity, total, unit, case_qty } = item;
       // Fase 122 — mismo fallback case-aware que el INSERT de orders de arriba.
       const finalTotal = total ?? (price != null && quantity != null ? lineTotal(price, quantity, unit, case_qty) : null);
-      await pool.query(
-        'INSERT INTO pre_order_items (pre_order_id, barcode, product_name, price, quantity, total, unit, case_qty) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        [id, barcode, product_name, price ?? null, quantity ?? null, finalTotal, unit ?? null, case_qty ?? null]
-      );
+      await insertPreOrderItem(id, item, price ?? null, quantity ?? null, finalTotal);
     }
 
     // Guardar firma una sola vez por batch

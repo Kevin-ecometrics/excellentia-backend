@@ -747,3 +747,5 @@ ALTER TABLE products MODIFY COLUMN stock DECIMAL(10,2) NOT NULL DEFAULT 0;
 -- =============================================================================
 SET FOREIGN_KEY_CHECKS = 1;
 SET FOREIGN_KEY_CHECKS = 1;
+-- 2026-09-29 — routes.manual_close: la ruta no se cierra sola (operador suma clientes sobre la marcha).
+ALTER TABLE routes ADD COLUMN IF NOT EXISTS manual_close TINYINT(1) NOT NULL DEFAULT 0;

@@ -7,6 +7,7 @@ import {
   getDefaultWarehouseId,
   computeFifoAllocation,
   applyFifoAllocation,
+  LotChangedError,
   restoreLotQuantity,
   recordMovement,
   InsufficientStockError,
@@ -47,6 +48,7 @@ async function ensureTables() {
       created_by      INT DEFAULT NULL,
       returns_reviewed_at TIMESTAMP DEFAULT NULL,
       returns_reviewed_by INT DEFAULT NULL,
+      manual_close    TINYINT(1) NOT NULL DEFAULT 0,
       created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       FOREIGN KEY (warehouse_id) REFERENCES warehouses(id)
@@ -92,7 +94,22 @@ async function ensureTables() {
       FOREIGN KEY (route_stop_id) REFERENCES route_stops(id) ON DELETE SET NULL
     )
   `);
+  // manual_close (2026-09-29) — el operador agregó clientes sobre la marcha
+  // (ver addStop). Hoy es informativa: ninguna ruta se cierra sola ya (se
+  // eliminó el auto-cierre); todas se terminan a mano con "Terminar ruta".
+  // try/catch: si el motor no soporta ADD COLUMN IF NOT EXISTS (MySQL 8 puro)
+  // no debe tumbar TODOS los endpoints de rutas — la columna ya viene del
+  // CREATE TABLE / migración manual de schema.sql.
+  if (!manualCloseColumnEnsured) {
+    manualCloseColumnEnsured = true;
+    try {
+      await pool.query('ALTER TABLE routes ADD COLUMN IF NOT EXISTS manual_close TINYINT(1) NOT NULL DEFAULT 0');
+    } catch (err) {
+      logger.warn('ensureTables: no se pudo asegurar routes.manual_close (¿ya existe?):', err);
+    }
+  }
 }
+let manualCloseColumnEnsured = false;
 
 export async function createRoute(req: Request, res: Response): Promise<void> {
   await ensureWarehouseTables();
@@ -273,9 +290,34 @@ export async function getRoute(req: Request, res: Response): Promise<void> {
     // "3.00" entre comillas donde su tipo (`quantity: number`) espera un
     // número real — se ve como "3.00" en vez de "3" en la UI en lugares que
     // no hacen `Number(...)` antes de mostrarlo (ver WarehouseClient.tsx).
-    const items = (itemRows as any[]).map(r => ({ ...r, quantity: Number(r.quantity) }));
+    // 2026-09-29 — vendido de esta ruta por producto (mismo criterio que
+    // getExpectedReturns: ventas de batches ya enlazados a una parada, sin
+    // CANCELLED). Va por barcode y a nivel ruta — no por parada — porque las
+    // cargas "Sin asignar" no tienen parada. `sold_qty` y `total_loaded_qty`
+    // son el vendido y el cargado del producto en TODA la ruta (repetidos en
+    // cada línea del mismo producto), para que el operador vea "quedan =
+    // cargado − vendido" sin depender de si la línea tenía parada.
+    const [soldRows] = await pool.query(
+      `SELECT o.barcode, SUM(o.quantity) AS sold_qty
+       FROM orders o JOIN route_stops rs ON rs.batch_id = o.batch_id
+       WHERE rs.route_id = ? AND o.status != 'CANCELLED'
+       GROUP BY o.barcode`, [id]
+    ) as any[];
+    const soldByBarcode = new Map<string, number>((soldRows as any[]).map(r => [r.barcode, Number(r.sold_qty) || 0]));
+    const loadedByBarcode = new Map<string, number>();
+    for (const r of itemRows as any[]) {
+      if (r.barcode) loadedByBarcode.set(r.barcode, (loadedByBarcode.get(r.barcode) ?? 0) + Number(r.quantity));
+    }
+    const items = (itemRows as any[]).map(r => ({
+      ...r,
+      quantity: Number(r.quantity),
+      sold_qty: r.barcode ? (soldByBarcode.get(r.barcode) ?? 0) : 0,
+      total_loaded_qty: r.barcode ? (loadedByBarcode.get(r.barcode) ?? Number(r.quantity)) : Number(r.quantity),
+    }));
 
-    res.json({ data: { ...route, stops, items } });
+    // TINYINT(1) llega como 0/1 vía mysql2 — Gson (Boolean estricto) rompe con
+    // un número; se convierte a boolean real (ver normalizeQbActive).
+    res.json({ data: { ...route, manual_close: !!route.manual_close, stops, items } });
   } catch (err) {
     logger.error('getRoute error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
@@ -332,9 +374,32 @@ export async function updateRoute(req: Request, res: Response): Promise<void> {
       return;
     }
 
+    // Cierre manual del operador ("Finalizar ruta" al volver): nunca con
+    // paradas PENDING (deben entregarse o saltearse con motivo — era el riesgo
+    // que motivó quitar el botón el 2026-09-23). Con paradas y todas
+    // saltadas queda CANCELLED, igual que el viejo auto-cierre; sin paradas o
+    // con al menos una entrega, COMPLETED.
+    if (req.user?.role === 'operator' && status === 'COMPLETED' && currentStatus !== 'COMPLETED') {
+      if (currentStatus !== 'IN_PROGRESS') {
+        res.status(400).json({ error: 'Solo se puede finalizar una ruta que ya salió a reparto' });
+        return;
+      }
+      const [[stats]] = await pool.query(
+        `SELECT COUNT(*) AS total, SUM(status = 'PENDING') AS pending, SUM(status = 'DELIVERED') AS delivered
+         FROM route_stops WHERE route_id = ?`, [id]
+      ) as any[];
+      if ((Number(stats.pending) || 0) > 0) {
+        res.status(400).json({ error: 'Hay paradas pendientes: entregalas o saltealas antes de finalizar la ruta' });
+        return;
+      }
+      if ((Number(stats.total) || 0) > 0 && (Number(stats.delivered) || 0) === 0) {
+        status = 'CANCELLED';
+      }
+    }
+
     const updates: string[] = ['updated_at = NOW()'];
     const params: any[] = [];
-    if (name            !== undefined) { updates.push('name = ?');            params.push(name); }
+    if (name          !== undefined) { updates.push('name = ?');            params.push(name); }
     if (scheduled_date   !== undefined) { updates.push('scheduled_date = ?');  params.push(scheduled_date); }
     if (driver_user_id   !== undefined) { updates.push('driver_user_id = ?');  params.push(driver_user_id === null ? null : Number(driver_user_id)); }
     if (status           !== undefined) { updates.push('status = ?');          params.push(status); }
@@ -342,7 +407,7 @@ export async function updateRoute(req: Request, res: Response): Promise<void> {
     params.push(id);
 
     await pool.query(`UPDATE routes SET ${updates.join(', ')} WHERE id = ?`, params);
-    res.json({ message: 'Ruta actualizada' });
+    res.json({ message: 'Ruta actualizada', routeStatus: status ?? currentStatus });
   } catch (err) {
     logger.error('updateRoute error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
@@ -655,7 +720,7 @@ export async function addStop(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    const [routeRows] = await pool.query('SELECT id, status, route_type, returns_reviewed_at, scheduled_date FROM routes WHERE id = ?', [id]) as any[];
+    const [routeRows] = await pool.query('SELECT id, status, route_type, returns_reviewed_at, scheduled_date, driver_user_id FROM routes WHERE id = ?', [id]) as any[];
     if ((routeRows as any[]).length === 0) {
       res.status(404).json({ error: 'Ruta no encontrada' });
       return;
@@ -667,6 +732,25 @@ export async function addStop(req: Request, res: Response): Promise<void> {
     if ((routeRows as any[])[0].status === 'COMPLETED') {
       res.status(400).json({ error: 'Ruta completada: no se puede modificar' });
       return;
+    }
+    // 2026-09-29 — el operador (repartidor) puede sumar clientes sobre la
+    // marcha a SU ruta, ya en reparto: no sabe de antemano cuántos visitará.
+    // Solo paradas CUSTOMER; BATCH/PRE_ORDER/CONSIGNMENT siguen siendo del
+    // almacén. Una parada creada así pasa la ruta a cierre manual.
+    const isOperator = req.user?.role === 'operator';
+    if (isOperator) {
+      if ((routeRows as any[])[0].driver_user_id !== req.user?.id) {
+        res.status(403).json({ error: 'Acceso denegado: esta ruta no está asignada a vos' });
+        return;
+      }
+      if ((routeRows as any[])[0].status !== 'IN_PROGRESS') {
+        res.status(400).json({ error: 'Iniciá la ruta antes de agregar clientes' });
+        return;
+      }
+      if (stop_type !== 'CUSTOMER') {
+        res.status(403).json({ error: 'Solo podés agregar paradas de tipo cliente' });
+        return;
+      }
     }
     if ((routeRows as any[])[0].returns_reviewed_at) {
       res.status(400).json({ error: 'Devoluciones ya revisadas: no se puede modificar esta ruta' });
@@ -750,13 +834,16 @@ export async function addStop(req: Request, res: Response): Promise<void> {
          WHERE scheduled_date = ? AND customer_id = ? AND assigned_route_id IS NULL`,
         [routeDate, customer_id]
       ) as any[];
-      if (!dayStop) {
+      // El operador agrega clientes sobre la marcha, sin planificación previa
+      // del admin: si el cliente sí estaba planificado se enlaza igual, si no
+      // se permite igual.
+      if (!dayStop && !isOperator) {
         res.status(400).json({
           error: 'Este cliente no fue asignado a este día por el admin — pedile que lo agregue primero en Rutas del día.',
         });
         return;
       }
-      dayStopId = dayStop.id;
+      dayStopId = dayStop?.id ?? null;
     }
 
     const [[posRow]] = await pool.query(
@@ -775,6 +862,9 @@ export async function addStop(req: Request, res: Response): Promise<void> {
 
     if (dayStopId) {
       await pool.query('UPDATE route_day_stops SET assigned_route_id = ? WHERE id = ?', [id, dayStopId]);
+    }
+    if (isOperator) {
+      await pool.query('UPDATE routes SET manual_close = 1 WHERE id = ?', [id]);
     }
 
     res.status(201).json({ id: result.insertId, position: posRow.pos });
@@ -936,41 +1026,15 @@ export async function updateStopStatus(req: Request, res: Response): Promise<voi
       );
     }
 
-    const routeStatus = await maybeAutoCloseRoute(id);
-
-    res.json({ message: 'Estado de parada actualizado', routeStatus });
+    // 2026-09-29 — ya NO se cierra la ruta sola al resolver la última parada
+    // (antes maybeAutoCloseRoute): el operador no sabe cuántos clientes van a
+    // ser y una entrega no debe completar la ruta. La termina él a mano con
+    // "Terminar ruta" (updateRoute, status=COMPLETED).
+    res.json({ message: 'Estado de parada actualizado', routeStatus: null });
   } catch (err) {
     logger.error('updateStopStatus error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
-}
-
-// Si esta era la última parada pendiente, la ruta ya no tiene nada más que
-// hacer — se cierra sola en vez de quedar en PLANNED/IN_PROGRESS para
-// siempre: COMPLETED si hubo al menos una entrega real, CANCELLED si se
-// saltearon todas (no sirvió para nada). Una ruta sin paradas no dispara
-// nada (no hay de dónde inferir un resultado). Devuelve el status final de
-// la ruta para que el cliente actualice sin pedir loadDetail() aparte.
-async function maybeAutoCloseRoute(routeId: string): Promise<string | null> {
-  const [[stats]] = await pool.query(
-    `SELECT COUNT(*) AS total,
-            SUM(status = 'PENDING') AS pending,
-            SUM(status = 'DELIVERED') AS delivered
-     FROM route_stops WHERE route_id = ?`, [routeId]
-  ) as any[];
-  // SUM()/COUNT() pueden volver como string vía mysql2 sin decimalNumbers —
-  // mismo gotcha ya documentado en el proyecto (ver batch_damage.qty).
-  const total = Number(stats.total) || 0;
-  const pending = Number(stats.pending) || 0;
-  const delivered = Number(stats.delivered) || 0;
-  if (total === 0 || pending > 0) return null;
-
-  const newStatus = delivered > 0 ? 'COMPLETED' : 'CANCELLED';
-  await pool.query(
-    `UPDATE routes SET status = ?, updated_at = NOW() WHERE id = ? AND status IN ('PLANNED','IN_PROGRESS')`,
-    [newStatus, routeId]
-  );
-  return newStatus;
 }
 
 // El stock local (products.stock/product_lots) se actualiza en el momento —
@@ -985,7 +1049,13 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
   try {
     const { id } = req.params;
     const { barcode, product_id, lot_id, source, route_stop_id } = req.body;
-    const quantity = req.body.quantity === undefined ? 1 : Number(req.body.quantity);
+    // whole_box (backlog #2, 2026-09-28) — carga la caja `lot_id` completa
+    // (quantity = remaining_qty leído acá mismo) para productos de peso
+    // variable: mantiene la identidad de la caja hasta el camión en vez de
+    // pedir libras sueltas y fraccionar. Se resuelve server-side para no
+    // depender de un remaining_qty viejo en el cliente.
+    const wholeBox = req.body.whole_box === true && !!lot_id && source !== 'STOCK';
+    let quantity = req.body.quantity === undefined ? 1 : Number(req.body.quantity);
     // 'STOCK' salta el FIFO por completo y descuenta products.stock directo —
     // para stock real que todavía no pasó por Recepción (sin lote). Default
     // 'LOT' preserva el comportamiento de siempre.
@@ -997,19 +1067,18 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
       res.status(400).json({ error: 'barcode o product_id es requerido' });
       return;
     }
-    if (!Number.isFinite(quantity) || quantity <= 0) {
+    if (!wholeBox && (!Number.isFinite(quantity) || quantity <= 0)) {
       res.status(400).json({ error: 'quantity debe ser un número mayor a 0' });
       return;
     }
-    // route_stop_id (2026-09-18) — obligatorio: cada carga tiene que decir
-    // para qué cliente/parada va, para que el operador sepa en la ruta qué
-    // es de quién (pedido explícito del usuario). Android lo autocompleta
-    // sola cuando la ruta tiene una sola parada (o es DIRECT) — acá se
-    // valida siempre igual, sin excepción por route_type.
-    if (!route_stop_id) {
-      res.status(400).json({ error: 'route_stop_id es requerido — hay que elegir para qué parada es este producto' });
-      return;
-    }
+    // route_stop_id (2026-09-18 → opcional de nuevo desde 2026-09-28, backlog
+    // cliente #3): antes era obligatorio para cargar cualquier ítem al camión
+    // — obligaba a crear la parada/cliente ANTES de poder cargar mercadería.
+    // El cliente pidió poder cargar el camión "en general" (como armar el
+    // camión sin depender de a quién va) y repartirlo por parada después.
+    // route_stop_id = NULL en route_items significa "carga sin asignar" —
+    // Android/webapp la muestran como tal en vez de un nombre de cliente.
+    const routeStopId = route_stop_id ?? null;
 
     const [[routeRow]] = await pool.query('SELECT status, warehouse_id, returns_reviewed_at FROM routes WHERE id = ?', [id]) as any[];
     if (!routeRow) {
@@ -1028,12 +1097,14 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
       res.status(400).json({ error: 'Devoluciones ya revisadas: no se puede modificar esta ruta' });
       return;
     }
-    const [[stopRow]] = await pool.query(
-      'SELECT id FROM route_stops WHERE id = ? AND route_id = ?', [route_stop_id, id]
-    ) as any[];
-    if (!stopRow) {
-      res.status(404).json({ error: 'Parada no encontrada en esta ruta' });
-      return;
+    if (routeStopId) {
+      const [[stopRow]] = await pool.query(
+        'SELECT id FROM route_stops WHERE id = ? AND route_id = ?', [routeStopId, id]
+      ) as any[];
+      if (!stopRow) {
+        res.status(404).json({ error: 'Parada no encontrada en esta ruta' });
+        return;
+      }
     }
     const warehouseId = routeRow.warehouse_id ?? await getDefaultWarehouseId();
 
@@ -1090,6 +1161,11 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
         res.status(404).json({ error: 'Lote no encontrado o no disponible en este almacén' });
         return;
       }
+      if (wholeBox) quantity = Number(lot.remaining_qty);
+      if (!Number.isFinite(quantity) || quantity <= 0) {
+        res.status(409).json({ error: 'El lote elegido ya no tiene stock disponible' });
+        return;
+      }
       if (Number(lot.remaining_qty) < quantity) {
         res.status(409).json({ error: `El lote elegido solo tiene ${lot.remaining_qty} disponible` });
         return;
@@ -1108,18 +1184,44 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
       }
     }
 
-    if (!useStock) await applyFifoAllocation(allocations);
+    if (!useStock) {
+      try {
+        await applyFifoAllocation(allocations);
+      } catch (applyErr: any) {
+        if (applyErr instanceof LotChangedError) {
+          res.status(409).json({ error: applyErr.message });
+          return;
+        }
+        throw applyErr;
+      }
+    }
 
-    await pool.query(
-      `INSERT INTO route_items (route_id, product_id, route_stop_id, barcode, quantity, scanned_by)
-       VALUES (?, ?, ?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE quantity = quantity + VALUES(quantity), updated_at = NOW()`,
-      [id, product.id, route_stop_id, product.barcode ?? null, quantity, req.user?.id ?? null]
-    );
+    // route_stop_id puede ser NULL ("carga sin asignar") — el UNIQUE KEY
+    // (route_id, product_id, route_stop_id) trata cada NULL como distinto en
+    // MySQL, así que ON DUPLICATE KEY UPDATE nunca fusiona dos cargas sin
+    // asignar del mismo producto. Se resuelve a mano (buscar con `<=>`,
+    // null-safe, en vez de `=`) para que sumar cantidad funcione igual con o
+    // sin parada.
+    const [[existingItem]] = await pool.query(
+      'SELECT id FROM route_items WHERE route_id = ? AND product_id = ? AND route_stop_id <=> ?',
+      [id, product.id, routeStopId]
+    ) as any[];
+    if (existingItem) {
+      await pool.query(
+        'UPDATE route_items SET quantity = quantity + ?, updated_at = NOW() WHERE id = ?',
+        [quantity, existingItem.id]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO route_items (route_id, product_id, route_stop_id, barcode, quantity, scanned_by)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [id, product.id, routeStopId, product.barcode ?? null, quantity, req.user?.id ?? null]
+      );
+    }
     await pool.query('UPDATE products SET stock = GREATEST(stock - ?, 0) WHERE id = ?', [quantity, product.id]);
 
     const [[routeItem]] = await pool.query(
-      'SELECT id FROM route_items WHERE route_id = ? AND product_id = ? AND route_stop_id = ?', [id, product.id, route_stop_id]
+      'SELECT id FROM route_items WHERE route_id = ? AND product_id = ? AND route_stop_id <=> ?', [id, product.id, routeStopId]
     ) as any[];
     if (useStock) {
       await recordMovement({
@@ -1143,7 +1245,7 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
     const [[itemRow]] = await pool.query(
       `SELECT ri.id, ri.route_id, ri.product_id, ri.route_stop_id, ri.barcode, ri.quantity, p.name, p.sku, p.unit
        FROM route_items ri JOIN products p ON p.id = ri.product_id
-       WHERE ri.route_id = ? AND ri.product_id = ? AND ri.route_stop_id = ?`, [id, product.id, route_stop_id]
+       WHERE ri.route_id = ? AND ri.product_id = ? AND ri.route_stop_id <=> ?`, [id, product.id, routeStopId]
     ) as any[];
     // Mismo cast que getRoute — route_items.quantity es DECIMAL (Fase 118).
     const item = { ...itemRow, quantity: Number(itemRow.quantity) };
@@ -1187,6 +1289,36 @@ export async function getExpectedStopItems(req: Request, res: Response): Promise
       return;
     }
     if (stop.stop_type === 'PRE_ORDER' && stop.pre_order_id) {
+      // Backlog #2 paso 2 (2026-09-28) — además de barcode/cantidad, la caja
+      // puntual que la pre-orden prometió (pre_order_items.lot_id) con su peso
+      // y disponibilidad vivos, para que Warehouse la vea/cargue al armar la
+      // parada. `quantity` NULL (pre-orden sin detalle) sale como 0. Si
+      // pre_order_items.lot_id todavía no existe (se crea perezosa en
+      // preOrderController), cae a la consulta de siempre.
+      try {
+        const [rows] = await pool.query(
+          `SELECT pi.barcode, pi.product_name, COALESCE(pi.quantity, 0) AS quantity, pi.unit, pi.case_qty,
+                  pi.lot_id, pl.remaining_qty AS lot_remaining_qty, pl.received_qty AS lot_weight,
+                  pl.lot_number AS lot_number, pl.expiration_date AS lot_expiration_date,
+                  (pl.id IS NOT NULL AND pl.status = 'ACTIVE' AND pl.remaining_qty > 0) AS lot_available
+           FROM pre_order_items pi
+           LEFT JOIN product_lots pl ON pl.id = pi.lot_id
+           WHERE pi.pre_order_id = ?`,
+          [stop.pre_order_id]
+        ) as any[];
+        res.json({
+          data: (rows as any[]).map(r => ({
+            ...r,
+            quantity: Number(r.quantity) || 0,
+            lot_remaining_qty: r.lot_remaining_qty != null ? Number(r.lot_remaining_qty) : null,
+            lot_weight: r.lot_weight != null ? Number(r.lot_weight) : null,
+            lot_available: r.lot_id != null ? !!r.lot_available : null,
+          })),
+        });
+        return;
+      } catch (lotErr) {
+        logger.warn('getExpectedStopItems: sin datos de caja, uso consulta básica:', lotErr);
+      }
       const [rows] = await pool.query(
         `SELECT barcode, product_name, quantity, unit, case_qty
          FROM pre_order_items WHERE pre_order_id = ?`,
@@ -1663,7 +1795,7 @@ export async function getExpectedReturns(req: Request, res: Response): Promise<v
        LEFT JOIN users u ON u.id = ri.scanned_by
        LEFT JOIN route_stops rs ON rs.id = ri.route_stop_id
        WHERE ri.route_id = ?
-       ORDER BY p.id, rs.position`, [id]
+       ORDER BY p.id, (rs.position IS NULL), rs.position`, [id]
     ) as any[];
 
     // rs.batch_id ya cubre las 2 formas en que una parada llega a tener un
@@ -1681,6 +1813,11 @@ export async function getExpectedReturns(req: Request, res: Response): Promise<v
     ) as any[];
     const soldByStopBarcode = new Map<string, number>();
     for (const r of soldRows as any[]) soldByStopBarcode.set(`${r.route_stop_id}|${r.barcode}`, Number(r.sold_qty) || 0);
+    // Total vendido por barcode en toda la ruta — se usa para atribuir a las
+    // cargas "sin asignar" (route_stop_id NULL) lo vendido en paradas que no
+    // tienen su propia línea de carga de ese producto.
+    const soldByBarcode = new Map<string, number>();
+    for (const r of soldRows as any[]) soldByBarcode.set(r.barcode, (soldByBarcode.get(r.barcode) ?? 0) + (Number(r.sold_qty) || 0));
 
     // Fase 115.2 — desglosado por condition_status. Sigue a nivel de RUTA
     // (route_returns nunca supo de qué parada volvió cada unidad — es
@@ -1738,7 +1875,25 @@ export async function getExpectedReturns(req: Request, res: Response): Promise<v
       const returned = returnedByProduct.get(productId) ?? { good: 0, damaged: 0, expired: 0, transporterDamage: 0 };
       const consignmentSettled = consignmentSettledByProduct.get(productId) ?? 0;
 
-      const sold: any[] = rows.map((row: any) => row.barcode ? (soldByStopBarcode.get(`${row.route_stop_id}|${row.barcode}`) ?? 0) : 0);
+      const sold: any[] = rows.map((row: any) => row.route_stop_id != null && row.barcode ? (soldByStopBarcode.get(`${row.route_stop_id}|${row.barcode}`) ?? 0) : 0);
+      // Cargas sin asignar (route_stop_id NULL, backlog #3): la clave por
+      // parada nunca matchea, así que se les atribuye lo vendido del producto
+      // que las líneas asignadas no cubren (ventas en paradas sin línea propia
+      // + excedente de líneas asignadas). Las filas sin asignar van al final
+      // del ORDER BY, así el reparto de devoluciones llena primero las
+      // paradas reales.
+      const barcode = rows.find((r: any) => r.barcode)?.barcode;
+      let unassignedPool = barcode ? (soldByBarcode.get(barcode) ?? 0) : 0;
+      rows.forEach((row: any, i: number) => {
+        if (row.route_stop_id != null) unassignedPool -= Math.min(sold[i], Number(row.loaded_qty));
+      });
+      rows.forEach((row: any, i: number) => {
+        if (row.route_stop_id == null) {
+          const take = Math.max(Math.min(unassignedPool, Number(row.loaded_qty)), 0);
+          sold[i] = take;
+          unassignedPool -= take;
+        }
+      });
       const remaining: any[] = rows.map((row: any, i: number) => Math.max(Number(row.loaded_qty) - sold[i], 0));
 
       function allocate(total: number): any[] {

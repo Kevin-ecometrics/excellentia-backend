@@ -692,9 +692,15 @@ suelta). `route_items` es el manifiesto de carga del camión completo (no por
 parada) — lo arma el almacenista escaneando en la app Android
 (`WarehouseRouteDetailActivity`). Transiciones de estado forward-only
 (`PLANNED → IN_PROGRESS → COMPLETED`, `CANCELLED` terminal alcanzable desde
-cualquiera de los dos primeros); `maybeAutoCloseRoute` cierra sola la ruta
-(`COMPLETED` si hubo ≥1 entrega, `CANCELLED` si se saltearon todas) cuando ya
-no queda ninguna parada `PENDING`.
+cualquiera de los dos primeros). **Ninguna ruta se cierra sola** (2026-09-29,
+Fase 139: se eliminó `maybeAutoCloseRoute`): entregar/saltear la última parada no
+la completa. El operador la termina con "Terminar ruta" (`PUT /api/routes/:id`
+`status=COMPLETED`; 400 si quedan paradas `PENDING`, y si todas se saltearon
+queda `CANCELLED`). El operador dueño de la ruta puede sumar paradas `CUSTOMER`
+sobre la marcha (`POST /api/routes/:id/stops`, solo con la ruta `IN_PROGRESS`,
+sin planificación previa del admin); `routes.manual_close` se marca en ese caso
+pero hoy es solo informativa. `GET /api/routes/:id` expone por ítem `sold_qty` y
+`total_loaded_qty` (a nivel ruta, por barcode) para mostrar cuánto queda en el camión.
 
 **Recepción y FIFO (Fase 112) — `warehouses`/`product_lots`/`route_item_lots`.**
 Recibir mercadería (`POST /api/warehouse/receipts`) crea un `product_lots` por

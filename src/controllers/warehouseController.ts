@@ -230,15 +230,35 @@ export async function computeFifoAllocation(
   return allocations;
 }
 
+export class LotChangedError extends Error {
+  constructor() { super('El lote cambió mientras se cargaba (otra carga lo consumió) — reintentá'); }
+}
+
 export async function applyFifoAllocation(allocations: { lot_id: number; qty: number }[]): Promise<void> {
+  const applied: { lot_id: number; qty: number }[] = [];
   for (const a of allocations) {
-    await pool.query(
+    // Auditoría 2026-09-28 — dos fixes en este UPDATE:
+    // 1) `status` va ANTES de `remaining_qty`: MySQL evalúa las asignaciones de
+    //    un UPDATE de izquierda a derecha, así que con el orden viejo el CASE
+    //    veía el remaining_qty ya restado y volvía a restar `qty` — una carga
+    //    parcial de la mitad o más del lote (ej. 20 de 30) lo marcaba DEPLETED
+    //    con stock todavía disponible, y desaparecía de FIFO/"Disponible".
+    // 2) `remaining_qty >= ?` en el WHERE: la lectura del lote y este UPDATE no
+    //    eran atómicos, dos cargas simultáneas de la misma caja (whole_box)
+    //    dejaban remaining_qty negativo. Si no afectó ninguna fila, se deshace
+    //    lo ya aplicado de esta asignación y se avisa.
+    const [result] = await pool.query(
       `UPDATE product_lots
-       SET remaining_qty = remaining_qty - ?,
-           status = CASE WHEN remaining_qty - ? <= 0 THEN 'DEPLETED' ELSE status END
-       WHERE id = ?`,
-      [a.qty, a.qty, a.lot_id]
-    );
+       SET status = CASE WHEN remaining_qty - ? <= 0 THEN 'DEPLETED' ELSE status END,
+           remaining_qty = remaining_qty - ?
+       WHERE id = ? AND status = 'ACTIVE' AND remaining_qty >= ?`,
+      [a.qty, a.qty, a.lot_id, a.qty]
+    ) as any;
+    if ((result as any).affectedRows === 0) {
+      for (const done of applied) await restoreLotQuantity(done.lot_id, done.qty);
+      throw new LotChangedError();
+    }
+    applied.push(a);
   }
 }
 
@@ -534,6 +554,36 @@ export async function listLots(req: Request, res: Response): Promise<void> {
     else              { query += " AND pl.status = 'ACTIVE'"; }
     query += ' ORDER BY (pl.expiration_date IS NULL), pl.expiration_date ASC, pl.received_at ASC';
     const [rows] = await pool.query(query, params) as any[];
+
+    // claimed_by (backlog #2, paso 4 opción A, 2026-09-28) — pre-órdenes
+    // activas que ya eligieron cada caja. Solo INFORMATIVO (elegir una caja en
+    // una pre-orden no la reserva): permite avisar en el selector de cajas
+    // "ya elegida en pre-orden #N" sin bloquear. Solo se calcula cuando se
+    // pide por producto (selector de cajas). Va en su propio try/catch porque
+    // pre_order_items.lot_id lo crea preOrderController.ensureTables() de forma
+    // perezosa — si todavía no existe, esto NO debe romper el listado del
+    // Sub-inventario.
+    if (product_id && (rows as any[]).length > 0) {
+      try {
+        const lotIds = (rows as any[]).map(r => r.id);
+        const [claims] = await pool.query(
+          `SELECT pi.lot_id, pi.pre_order_id, po.customer_name
+           FROM pre_order_items pi JOIN pre_orders po ON po.id = pi.pre_order_id
+           WHERE pi.lot_id IN (?) AND po.status IN ('DRAFT','CONFIRMED')
+           ORDER BY pi.pre_order_id`,
+          [lotIds]
+        ) as any[];
+        const byLot = new Map<number, { pre_order_id: number; customer_name: string | null }[]>();
+        for (const c of claims as any[]) {
+          const list = byLot.get(c.lot_id) ?? [];
+          list.push({ pre_order_id: c.pre_order_id, customer_name: c.customer_name ?? null });
+          byLot.set(c.lot_id, list);
+        }
+        for (const r of rows as any[]) r.claimed_by = byLot.get(r.id) ?? [];
+      } catch (claimErr) {
+        logger.warn('listLots: no se pudo calcular claimed_by:', claimErr);
+      }
+    }
     res.json({ data: rows });
   } catch (err) {
     logger.error('listLots error:', err);

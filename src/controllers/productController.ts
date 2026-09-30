@@ -252,6 +252,52 @@ export async function updateProduct(req: Request, res: Response): Promise<void> 
   }
 }
 
+// Backlog cliente (2026-09-28) — endpoint angosto para que `almacenista`
+// pueda asignar/corregir el barcode de un producto (ej. uno recién
+// importado de QBO, que llega con barcode = NULL, ver "SKU vs barcode —
+// Fase 105" en CLAUDE.md) sin abrirle el resto de updateProduct (precio,
+// stock, sku), que sigue adminOnly. Sin llamada a QBO — barcode es
+// puramente interno, nunca sincroniza (mismo criterio que updateProduct).
+export async function updateProductBarcode(req: Request, res: Response): Promise<void> {
+  try {
+    const { id } = req.params;
+    // String() por si llega un número: `.trim` sobre un no-string tiraba 500.
+    const barcode = String(req.body?.barcode ?? '').trim() || null;
+    if (barcode && barcode.length > 50) {
+      res.status(400).json({ error: 'El barcode no puede pasar de 50 caracteres' });
+      return;
+    }
+
+    const [existing] = await pool.query('SELECT id FROM products WHERE id = ?', [id]) as any[];
+    if (existing.length === 0) {
+      res.status(404).json({ error: 'Producto no encontrado' });
+      return;
+    }
+
+    // products.barcode es UNIQUE: un duplicado se avisa claro (409) en vez de
+    // un 500 genérico, con el nombre del producto que ya lo tiene.
+    if (barcode) {
+      const [dup] = await pool.query('SELECT name FROM products WHERE barcode = ? AND id <> ?', [barcode, id]) as any[];
+      if (dup.length > 0) {
+        res.status(409).json({ error: `Ese barcode ya está asignado a "${dup[0].name}"` });
+        return;
+      }
+    }
+
+    await pool.query('UPDATE products SET barcode = ? WHERE id = ?', [barcode, id]);
+    // product_lots y route_items guardan una copia del barcode al momento de
+    // crearse: se mantienen alineadas para que la lógica route-aware de ventas
+    // (routeLoadedBarcodes, compara por barcode) no deje de reconocer lo ya
+    // cargado. Las filas históricas de `orders` no se tocan a propósito.
+    await pool.query('UPDATE product_lots SET barcode = ? WHERE product_id = ?', [barcode, id]).catch(() => {});
+    await pool.query('UPDATE route_items SET barcode = ? WHERE product_id = ?', [barcode, id]).catch(() => {});
+    res.json({ message: 'Barcode actualizado' });
+  } catch (err) {
+    logger.error('updateProductBarcode error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
 export async function getProductPriceHistory(req: Request, res: Response): Promise<void> {
   try {
     const { barcode } = req.params;
