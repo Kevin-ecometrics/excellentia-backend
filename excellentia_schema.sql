@@ -305,6 +305,8 @@ CREATE TABLE IF NOT EXISTS `routes` (
     `created_by`      INT DEFAULT NULL,
     `returns_reviewed_at` TIMESTAMP DEFAULT NULL,
     `returns_reviewed_by` INT DEFAULT NULL,
+    `ready_at`        TIMESTAMP NULL DEFAULT NULL,
+    `ready_by`        INT DEFAULT NULL,
     `created_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     `updated_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (`warehouse_id`) REFERENCES `warehouses`(`id`)
@@ -347,7 +349,7 @@ CREATE TABLE IF NOT EXISTS `route_items` (
     `scanned_by`   INT DEFAULT NULL,
     `created_at`   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     `updated_at`   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY `route_product` (`route_id`, `product_id`),
+    KEY `route_items_route` (`route_id`, `product_id`),
     FOREIGN KEY (`route_id`) REFERENCES `routes`(`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -543,6 +545,12 @@ UPDATE routes SET warehouse_id = (SELECT id FROM warehouses ORDER BY id LIMIT 1)
 ALTER TABLE routes ADD COLUMN IF NOT EXISTS returns_reviewed_at TIMESTAMP DEFAULT NULL AFTER created_by;
 ALTER TABLE routes ADD COLUMN IF NOT EXISTS returns_reviewed_by INT DEFAULT NULL AFTER returns_reviewed_at;
 
+-- "Ruta terminada" (2026-10-01) — ver nota en src/db/schema.sql
+ALTER TABLE routes ADD COLUMN IF NOT EXISTS ready_at TIMESTAMP NULL DEFAULT NULL AFTER returns_reviewed_by;
+ALTER TABLE routes ADD COLUMN IF NOT EXISTS ready_by INT NULL DEFAULT NULL AFTER ready_at;
+-- SOLO UNA VEZ, justo antes de desplegar (no re-correr):
+-- UPDATE routes SET ready_at = NOW() WHERE ready_at IS NULL;
+
 -- =============================================================================
 -- Migración (2026-09-01): aprobación de admin antes de enviar una venta a QBO
 -- Para bases existentes (ejecutar una sola vez)
@@ -674,3 +682,14 @@ ALTER TABLE products MODIFY COLUMN stock DECIMAL(10,2) NOT NULL DEFAULT 0;
 
 -- Fin del schema — 23 tablas + migraciones Fase 48, 111, 112, 115, 116, 117, 118, 2026-08-31, 2026-09-01, 2026-09-07, 2026-09-10 y 2026-09-23
 -- =============================================================================
+
+-- =============================================================================
+-- Migración — Fase 130 (2026-09-30): route_items sin UNIQUE — una línea por carga.
+-- Cada caja/lote cargado a una ruta es su propia línea (antes se sumaban por
+-- producto+parada). El backend lo aplica solo al arrancar (ensureTables); este
+-- es el equivalente manual. Verificar el nombre con: SHOW INDEX FROM route_items;
+-- (puede llamarse route_product o route_product_stop). Orden obligatorio: la FK
+-- a routes necesita un índice sobre route_id antes de soltar el UNIQUE.
+-- =============================================================================
+ALTER TABLE route_items ADD KEY route_items_route (route_id, product_id);
+-- ALTER TABLE route_items DROP INDEX route_product_stop;  -- o: DROP INDEX route_product;

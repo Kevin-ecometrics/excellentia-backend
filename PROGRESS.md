@@ -8060,3 +8060,128 @@ Al probar, una ruta con parada creada por el almacén (o cualquiera con `manual_
 **Estado:** compila (`:app:compileDebugKotlin`) y los tests unitarios pasan. Probado por el cliente en un TC22 real con cajas reales y aprobado (2026-09-30, ver abajo). Los cambios de las activities quedaron mezclados en el árbol de trabajo con otros cambios sin commitear de las mismas activities.
 
 **✅ Aprobado por el cliente (2026-09-30):** el cliente probó el escaneo de la etiqueta de peso y lo aprobó — la feature queda **cerrada**, ya no hay pendiente de validación. (Si en el futuro se quiere sumar el Code128 largo o el GS1 de Cotija, sería backlog nuevo, reusando el mismo punto de enganche.) Requiere APK nuevo (sin cambios de backend) para quien todavía no lo tenga.
+
+## Fase 141: Warehouse — líneas individuales por lote/peso en rutas y aviso de cantidad vs tipo (2026-09-30)
+
+**Pedido del cliente (2 features para cerrar el módulo Warehouse):** (1) al cargar a una ruta varios productos iguales con distinto lote o peso, que la ruta (al cargar y al regresar) muestre cada caja con su peso y lote — antes se sumaban en una sola línea y el operador solo veía "nombre + lbs totales"; (2) un warning cuando la cantidad capturada no cuadra con el tipo del producto (Lbs / Case-Unit / Bucket).
+
+### Feature 1 — una línea por carga + desglose por lote
+- **`addRouteItem`:** cada carga es su propia línea de `route_items` (una por lote asignado por FIFO, o una para `source: 'STOCK'`). Respuesta: `item` (primera línea, compat) + `items[]`. Antes fusionaba por (ruta, producto, parada) sumando `quantity`.
+- **Desglose:** `src/services/routeLots.ts` (+ tests). `GET /api/routes/:id` y `GET /api/routes/:id/returns/expected` suman por línea `lots[{ lot_id, lot_number, supplier, expiration_date, quantity, received_qty }]` y `unlotted_qty` (parte cargada desde stock general, sin lote). Solo referencia: `route_returns` sigue sin lote, la devolución se captura por producto (decisión explícita).
+- **`registerConsignment`:** dependía de `ON DUPLICATE KEY` — ahora fusiona a mano (una línea por parada/producto).
+- **`getExpectedReturns`:** lo vendido por parada se reparte entre las líneas del mismo producto (antes se contaba completo en cada línea).
+- **Base de datos:** se quita el UNIQUE de `route_items` (`route_product_stop` / `route_product`) y se crea `KEY route_items_route (route_id, product_id)` (la FK a `routes` necesita un índice sobre `route_id` antes de soltar el UNIQUE). `ensureTables()` lo aplica solo al primer request de rutas (idempotente, try/catch); equivalente manual al final de `schema.sql`/`excellentia_schema.sql`.
+- **✅ Confirmado (2026-09-30):** `SHOW INDEX FROM route_items` muestra `PRIMARY`, `fk_route_items_stop` y `route_items_route`, sin ningún índice único viejo — la migración ya está aplicada, no hace falta correr el `ALTER` a mano.
+- **Limitación:** las líneas viejas ya sumadas no se separan; solo las cargas nuevas salen individuales.
+
+### Feature 2 — validación de cantidad vs tipo de producto
+- `src/services/quantityWarnings.ts` (+ tests): **solo** Case/Unit/Bucket con decimales (ej. 6.5) son inválidos. **Lbs (o `unit` vacío) nunca se valida** — se descartó la regla inicial "entero exacto en Lbs" (falsos positivos con productos de 5 lb exactas).
+- **Rechaza y no guarda:** `400 { error, invalid_quantities[] }` con el mensaje listo ("Producto: Este tipo de producto (Case) no puede ser 6.5 — solo admite cantidades enteras."), validado antes de escribir nada en `createReceipt`, `addRouteItem` (salvo `whole_box`), `updateLot` y `createReturns`. Sin variable de entorno. Historial de decisiones: 409 + confirmación (el Android viejo lo veía como error del servidor y bloqueó una recepción) → "guardar y avisar" → finalmente rechazo con mensaje claro, a pedido del usuario.
+- **Android (hecho):** muestra el `error` del backend tal cual (Snackbar) en `ReceivingActivity` (vía `WarehouseRepository`), `WarehouseRouteDetailActivity`, `InventoryMovementsActivity` (ya parseaba `error`) y `RouteReturnsActivity`. Con el Android viejo igual no guarda, pero muestra un error genérico ("Error del servidor: 400").
+
+### Android — desglose por lote (Feature 1)
+`RouteItemDto`/`RouteReturnExpectedDto` suman `lots` (nullable: Gson deja null un campo de lista ausente con un backend viejo) y `unlottedQty`; `RouteLotsFormat.kt` arma el texto ("Lote X · vence Y", con el peso si la carga se partió). Se muestra en `MyRouteDetailActivity` (operador), `WarehouseRouteDetailActivity` (almacenista, vía `item_route_item.xml` → `tvItemLots`) y `RouteReturnsActivity` (fusiona los lotes de las líneas del mismo producto). `addRouteItem` aplica todas las líneas de `items[]`. `:app:compileDebugKotlin` OK.
+
+### Estado
+Backend, Android y webapp (modal informativo del botón "Sync QB" en `/products`) **desplegados y verificados por el usuario (2026-09-30)**: funciona, sin problemas por el momento. Migración de `route_items` ya aplicada en producción. Backend: `tsc --noEmit` limpio, build OK, `bun test` 22 tests pasan. Android: `:app:compileDebugKotlin` OK.
+
+**Auditoría (2026-09-30):** dos ajustes menores en backend (reintento de la migración si falla, orden determinístico en `getExpectedReturns`). Riesgos conocidos sin corregir: (1) una recepción offline con decimales en un Case/Unit/Bucket queda reintentándose en `SyncWorker` sin avisar (el backend la rechaza con 400); (2) con varias líneas del mismo producto, cada una repite el mismo "Quedan X" a nivel producto; (3) el mensaje de varios productos inválidos puede cortarse en el Snackbar; (4) la webapp lista las líneas por separado pero no muestra lote/peso por caja.
+
+**Pendiente:** commits (backend `warehouse-module`, Android `version-1.6.1-warehouse`, webapp `warehouse-module`); sin verificar cómo queda `QtyOnHand` en QBO para productos Lbs (el backend manda libras; las facturas descuentan `Qty: 1` por línea).
+
+## Fase 142: Warehouse — botón "Ruta terminada": el operador no inicia una ruta que el almacén no cerró (2026-10-01)
+
+**Pedido del cliente:** mientras el almacén arma la ruta (cargar productos), el operador no puede usarla. Cuando el almacenista aprieta **"Ruta terminada"** (botón al final de la carga) la ruta queda configurada para ese día y recién ahí el operador puede iniciarla. Si la ruta no fue marcada, no puede iniciarse. Decisión del usuario sobre correcciones: **opción A — botón "Reabrir carga"** (se puede deshacer mientras la ruta no haya salido).
+
+**Clasificación:** cambio acotado sobre un flujo existente (`updateRoute` / detalle de ruta). No se agregó un estado nuevo al ENUM: `PLANNED → IN_PROGRESS → COMPLETED` sigue igual; la marca es una columna aparte.
+
+### Backend
+- **Base de datos:** `routes.ready_at TIMESTAMP NULL` y `routes.ready_by INT NULL`. `ensureTables()` las asegura (`ensureReadyColumns`, try/catch); equivalente manual en `schema.sql` / `excellentia_schema.sql`.
+- **`POST /api/routes/:id/ready`** (`markRouteReady`, `warehouseOnly`): solo ruta `PLANNED`, sin devoluciones revisadas, sin marca previa y **con al menos un producto cargado** (`route_items`); si no, 400. El `UPDATE` repite las condiciones en el `WHERE` (409 si la ruta cambió en medio).
+- **`POST /api/routes/:id/reopen`** (`reopenRoute`, `warehouseOnly`): borra la marca. Solo con la ruta `PLANNED`; con `IN_PROGRESS` da 400.
+- **Guard en `updateRoute`:** `PLANNED → IN_PROGRESS` sin `ready_at` da 400 para **cualquier rol**, admin incluido (no solo operator).
+- **Candado de edición:** con `PLANNED` + `ready_at`, `addRouteItem`, `removeRouteItem`, `addStop`, `removeStop` y `reorderStops` rechazan con "Reabrí la carga para modificarla". Con `IN_PROGRESS` **no** se bloquea (ahí `ready_at` siempre existe y el comportamiento previo no cambia). `deleteRoute` (cancelar) no se ve afectado.
+- `listRoutes` / `getRoute` exponen `ready_at` / `ready_by`.
+- Reglas puras en `src/services/routeReadiness.ts` + `routeReadiness.test.ts` (12 tests).
+
+### Webapp (`/warehouse`, `WarehouseClient.tsx`)
+Badge "Lista" / "En preparación" en rutas `PLANNED`; botón "Ruta terminada" / "Reabrir carga" debajo de lo cargado (con `ConfirmModal`); la opción "En ruta" del selector de estado se deshabilita sin la marca. Textos es/en en `app/lib/i18n.ts` (`wh_markReady`, `wh_reopenLoad`, …).
+
+### Android
+- `WarehouseRouteDetailActivity`: `btnMarkReady` (nuevo en `activity_warehouse_route_detail.xml`), banner "Ruta lista…" y `isLocked()` bloquea la edición con la ruta lista.
+- `MyRouteDetailActivity`: "Salir a reparto" queda deshabilitado con el texto "Esperando al almacén" mientras `readyAt == null`.
+- `RouteDto` / `RouteDetailDto` suman `readyAt`; `ApiService` suma `markRouteReady` / `reopenRoute`; strings es/en.
+
+### Fix posterior (mismo día)
+El usuario vio el botón "Ruta terminada" en una ruta **sin productos**. Android lo mostraba siempre (habilitado, con un aviso al tocarlo) y la webapp solo lo deshabilitaba. Ahora **se oculta** en ambas si la ruta no tiene productos y no está marcada; una ruta ya marcada muestra siempre "Reabrir carga". El backend sigue rechazando con 400 el caso sin productos.
+
+### Migración / despliegue
+`ALTER` aplicado por el usuario en producción (2026-10-01). **Backfill ejecutado y verificado (2026-10-01):** `UPDATE routes SET ready_at = NOW() WHERE ready_at IS NULL;` y la consulta de verificación (`WHERE ready_at IS NULL`) devolvió 0 filas — **no volver a correrlo** (marcaría como listas las rutas nuevas en preparación). Desde el backfill, las rutas nuevas nacen en preparación: con el backend viejo todavía en producción el operador las inicia sin problema, y con el backend nuevo ya no puede hasta que el almacén las marque. Las tres partes deben salir juntas; con el APK viejo el operador recibe el 400 al iniciar una ruta no marcada y no tiene el botón del almacén.
+
+### Estado
+Backend: `tsc --noEmit` limpio, `bun run build` OK, `bun test` 34 tests pasan. Webapp: `tsc --noEmit` limpio. Android: `:app:compileDebugKotlin` OK (con el JDK de Android Studio, `JAVA_HOME` no está configurado en el entorno). **Sin probar contra una base real ni en el TC22.**
+
+**Pendiente:** desplegar backend + webapp y generar/distribuir el APK nuevo a los TC22; commits por repo (separar de otros cambios sin commitear que no son de esta fase, p. ej. `RouteReturnsActivity.kt` y `ProductsClient.tsx`); validación del cliente.
+
+## Fase 143: Warehouse — rutas "desde cero" sin apartado de Paradas (2026-10-01)
+
+**Pedido del cliente:** en una ruta de scratch (creada "Desde cero", sin pre-órdenes) el apartado de Paradas no hace falta: el almacén no sabe a qué clientes irán los choferes/operadores. Aclaración del usuario: el cambio es **solo en las apps (Android y webapp), no en el backend**.
+
+**Clasificación:** cambio de UI acotado. **Sin cambios de backend ni de schema.**
+
+### Regla
+No existe un flag "scratch" en la ruta. Se detecta por `route_type != 'DIRECT'` **y** `stops.length == 0`. Cuando se cumple:
+- Se oculta el apartado de Paradas (tarjeta con "Agregar parada" en Android; sección "Paradas" en la webapp).
+- Android: también se oculta el selector "Cargando para…" (`btnLoadingForStop`); la carga queda como "sin asignar" (ya se decidía sola con 0 paradas).
+- Webapp: se oculta la etiqueta "Sin asignar" en cada producto cargado.
+- Si el chofer suma paradas en campo (Fase 139), el apartado reaparece solo.
+- **DIRECT no cambia** (necesita su único destino) y las rutas desde pre-órdenes tampoco (nacen con paradas).
+
+### Archivos
+- Android (`AndroidStudioProjects/test`): `WarehouseRouteDetailActivity.kt` (`cardStops`, `scratchRoute` en `renderRoute()`) y `activity_warehouse_route_detail.xml` (`android:id="@+id/cardStops"` en la tarjeta de Paradas).
+- Webapp: `app/warehouse/_components/WarehouseClient.tsx`.
+
+### Limitación conocida
+Como no hay flag explícito, una ruta desde cero ya no permite agregar paradas desde el almacén (solo desde el chofer en campo). Si hace falta un marcador explícito (`SCRATCH` en `route_type` o columna booleana), requiere cambio de backend.
+
+### Estado
+Android: `:app:compileDebugKotlin` OK (con el JDK de Android Studio). Webapp: `tsc --noEmit` limpio. **Sin probar en el TC22 ni en el navegador.**
+
+**Pendiente:** desplegar webapp y generar APK nuevo; commits por repo; validación del cliente.
+
+## Fase 144: Warehouse — se retira "Rutas por día" y escanear producto + peso carga la caja directo (2026-10-01)
+
+Últimos 2 pedidos del cliente para el módulo Warehouse.
+
+### 1. Se deshace la planificación por días (`route_day_stops`, sesión 2026-09-18)
+**Motivo:** con el flujo actual (rutas "desde cero", Fase 143, y el operador sumando clientes en campo, Fase 139) la lista de clientes aprobados por día ya no sirve. **Decisión del usuario:** quitar la validación y quitar `/routes` del dashboard.
+- **Backend (`routeController.ts`, `deliveryRoutes.ts`):** `addStop` ya no exige que el cliente esté en la lista del día (CUSTOMER se agrega libre, como BATCH/PRE_ORDER/CONSIGNMENT); `removeStop` ya no libera cupo. Se eliminaron `createDayStop`, `copyDayStops`, `listDayStops`, `deleteDayStop`, `ensureDayStopsTable` y las 4 rutas `/api/routes/day-stops*`. **La tabla `route_day_stops` queda en la base sin uso (no se hace DROP, criterio del proyecto).**
+- **Webapp:** se borró `app/routes/` (página, `RoutesClient`, `AddDayStopModal`, `CopyDayModal`, `weekdays.ts`), el link "Routes" del sidebar y las claves i18n `routes_*` / `weekday_*` / `nav_routes`.
+- **Android (`WarehouseRouteDetailActivity`):** "Agregar parada → Cliente" vuelve a abrir `CustomerPickerActivity` (búsqueda libre en QBO) en vez del picker del día; se eliminó `showDayStopPicker`/`addDayStops`, `listDayStops` (`ApiService`), `DayStopDto`/`DayStopsResponse` y los strings `label_no_day_stops`/`msg_stops_added`.
+
+### 2. Escanear producto + etiqueta de peso carga esa caja directo (solo Android)
+- **Antes:** escanear un producto Lbs abre la lista de cajas (lotes); se tildaba la caja y Confirmar.
+- **Ahora:** con esa lista abierta, escanear la etiqueta de peso (Code128 `^\d{1,4}\.\d{1,2}$`, mismo `WeightLabel` de la Fase 140) busca el lote del producto cuyo `remaining_qty` coincide (±0.005) y lo carga **entero** (`wholeBox`) a la ruta sin más toques. La caja se identifica por producto + peso, no por un código nuevo.
+- **Fallback al flujo de siempre:** sin coincidencia → aviso "No hay una caja de X lb de <producto>" y la lista sigue abierta; coincide solo con una caja ya prometida a una pre-orden → no se carga a ciegas, aviso y lista abierta; un escaneo que no es etiqueta de peso (otro producto) cierra la lista y sigue el flujo normal; producto sin lotes o no-Lbs → diálogo de cantidad como antes.
+- **Límites:** hay que escanear primero el producto y luego el peso (peso solo, sin producto, sigue sin hacer nada útil). Tras cargar una caja hay que volver a escanear el producto para la siguiente. Se puede cambiar si el cliente lo pide.
+- Archivos: `WarehouseRouteDetailActivity.kt` (`BoxScan`, `onBoxWeightScanned`, `onBarcodeScanned`) y strings es/en (`wh_scan_box_no_match`, `wh_scan_box_claimed`; el título de la lista ahora menciona el escaneo).
+
+### Estado
+Backend `tsc --noEmit` limpio; webapp sin errores salvo tipos generados viejos en `.next` (se regeneran al compilar); Android `:app:compileDebugKotlin` OK. **Sin probar en el TC22 ni en el navegador.**
+
+**Pendiente:** desplegar backend + webapp y generar APK nuevo (el APK viejo seguiría llamando a `/day-stops`, que ya no existe → el picker de Cliente fallaría; los tres deben salir juntos); commits por repo; validación del cliente.
+
+### Nota de build (2026-10-01) — webapp
+Tras borrar `app/routes/`, `npm run build` falló con `Cannot find module '../../../app/routes/page.js'` en `.next/dev/types/validator.ts`: es un archivo **generado** (carpeta `.next`, ignorada por git) que seguía apuntando a la página eliminada. Se resolvió borrando `.next` y recompilando (build OK, `/routes` ya no figura). **Si el deploy sube un `.next` viejo, borrarlo antes de compilar.**
+
+## Estado del módulo Warehouse y siguiente módulo (2026-10-01)
+
+**Warehouse: en espera de revisión final del cliente.** Con las Fases 142 ("Ruta terminada"), 143 (rutas "desde cero" sin Paradas) y 144 (se retira "Rutas por día" + carga de caja con producto + peso) quedan cubiertos los últimos ajustes pedidos. Si el cliente los aprueba, el módulo se da por **finalizado** y se registra el cierre (mismo criterio que el cierre del 2026-09-30).
+
+**Pendiente antes del cierre:**
+- Desplegar backend + webapp y generar/distribuir el APK nuevo a los TC22 (las tres partes salen juntas: el APK viejo llamaría a `/day-stops`, que ya no existe).
+- Probar en TC22 y navegador: "Ruta terminada", ocultar Paradas en rutas desde cero, escaneo producto + peso.
+- Commits por repo (backend y webapp en `warehouse-module`, Android en `version-1.6.1-warehouse`).
+- Riesgos conocidos sin corregir de la auditoría del 2026-09-30 (ver Fase 141).
+
+**Siguiente módulo: Ventas / Operador** (flujo del operador en Android: ventas, rutas asignadas, cobro y aprobación). Alcance, pedidos del cliente y diseño por definir; se documentará como nueva fase al arrancar. Mientras tanto no se abre trabajo nuevo de Warehouse salvo correcciones que salgan de la revisión del cliente.

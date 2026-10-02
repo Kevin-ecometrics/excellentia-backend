@@ -3,6 +3,7 @@ import pool from '../db/connection.ts';
 import logger from '../services/logger.ts';
 import { updateItemQtyOnHand } from '../services/qbItems.ts';
 import { normalizeQbActive } from './productController.ts';
+import { collectQuantityWarnings, respondIfInvalidQuantities } from '../services/quantityWarnings.ts';
 
 export type MovementType = 'RECEIPT' | 'ROUTE_LOAD' | 'RETURN' | 'DAMAGE' | 'ADJUSTMENT';
 
@@ -280,8 +281,12 @@ export async function recordMovement(params: {
   quantity: number;
   routeId?: number | null;
   createdBy?: number | null;
+  // Si viene `conn`, el INSERT corre dentro de esa transacción y NO se
+  // sincroniza QBO acá — el caller debe llamar syncMovementsToQbo() después
+  // del commit (así QBO nunca recibe un stock que un rollback deshizo).
+  conn?: { query: (sql: string, values?: any[]) => Promise<any> };
 }): Promise<{ movementId: number; qbSynced: boolean | null }> {
-  const [result] = await pool.query(
+  const [result] = await (params.conn ?? pool).query(
     `INSERT INTO inventory_movements (warehouse_id, product_id, lot_id, movement_type, quantity, route_id, created_by)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
     [
@@ -295,6 +300,7 @@ export async function recordMovement(params: {
     ]
   ) as any;
   const movementId = result.insertId;
+  if (params.conn) return { movementId, qbSynced: null };
   // Fix (2026-09-22, backlog #3) — antes se esperaba (`await`) la llamada a
   // QBO acá mismo antes de responder. Una recepción con varias líneas hace
   // un `recordMovement` por línea (cada uno con su propia llamada HTTP a
@@ -308,13 +314,21 @@ export async function recordMovement(params: {
   // cuando termine. Si falla, sigue siendo reintentable desde el Historial
   // (`retryMovementSync`), mismo criterio "silencioso" que el resto del
   // proyecto: nada local se revierte por un fallo de QBO.
-  syncProductStockToQbo(params.productId)
-    .then(qbSynced => pool.query(
-      'UPDATE inventory_movements SET qb_synced = ? WHERE id = ?',
-      [qbSyncedToDb(qbSynced), movementId]
-    ))
-    .catch(err => logger.warn(`recordMovement: fallo al actualizar qb_synced en segundo plano (movimiento ${movementId}):`, err));
+  syncMovementsToQbo(params.productId, [movementId]);
   return { movementId, qbSynced: null };
+}
+
+// Sincroniza el stock actual del producto a QBO en segundo plano (fire and
+// forget) y guarda el resultado en qb_synced de los movimientos indicados.
+// Una sola llamada a QBO aunque haya varios movimientos del mismo producto.
+export function syncMovementsToQbo(productId: number, movementIds: number[]): void {
+  if (movementIds.length === 0) return;
+  syncProductStockToQbo(productId)
+    .then(qbSynced => pool.query(
+      'UPDATE inventory_movements SET qb_synced = ? WHERE id IN (?)',
+      [qbSyncedToDb(qbSynced), movementIds]
+    ))
+    .catch(err => logger.warn(`syncMovementsToQbo: fallo al actualizar qb_synced en segundo plano (movimientos ${movementIds.join(',')}):`, err));
 }
 
 // recordMovement() es el único punto de paso de todo cambio de stock del
@@ -386,6 +400,13 @@ export async function createReceipt(req: Request, res: Response): Promise<void> 
       return;
     }
     warehouseId = warehouseId ?? await getDefaultWarehouseId();
+
+    // Cantidad vs tipo: Case/Unit/Bucket no admiten decimales — rechaza todo
+    // el recibo (400) antes de escribir nada.
+    const invalid = await collectQuantityWarnings(
+      items.map((l: any) => ({ product_id: l.product_id, barcode: l.barcode, quantity: Number(l.quantity) }))
+    );
+    if (respondIfInvalidQuantities(res, invalid)) return;
 
     const receiptBatchId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
     const results: any[] = [];
@@ -833,6 +854,14 @@ export async function updateLot(req: Request, res: Response): Promise<void> {
       if (newQty < consumed) {
         res.status(409).json({ error: `No se puede bajar de ${consumed} — ya se asignó esa cantidad a una ruta` });
         return;
+      }
+      // No se valida si newQty no cambia nada que el usuario haya tipeado:
+      // igual a la cantidad actual, o igual a lo ya consumido ("Devolver" lo
+      // calcula solo). Un lote viejo con decimales (o de un producto cuyo tipo
+      // cambió a Case) quedaba imposible de devolver con un error confuso.
+      if (newQty !== Number(lot.received_qty) && newQty !== consumed) {
+        const invalid = await collectQuantityWarnings([{ product_id: lot.product_id, quantity: newQty }]);
+        if (respondIfInvalidQuantities(res, invalid)) return;
       }
       deltaQty = newQty - Number(lot.received_qty);
       updates.push('received_qty = ?', 'remaining_qty = ?');

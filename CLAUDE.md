@@ -801,6 +801,96 @@ código muerto) y el flujo se reconstruyó en `/warehouse/settlement`
 módulo (recepción, FIFO, sub-inventario, devoluciones) sigue siendo tarea
 del almacenista en Android, sin cambios.
 
+## Validación de cantidad vs tipo de producto (2026-09-30)
+
+`src/services/quantityWarnings.ts` — `checkQuantityForUnit(qty, unit)` usa
+`isLbsUnit()`: **solo** Case/Unit/Bucket con decimales (ej. 6.5) son inválidos.
+Lbs (o `unit` vacío) nunca se valida — cajas de 5 lb exactas son normales.
+**Rechaza, no guarda:** `400 { error, invalid_quantities[] }`, con `error` listo
+para mostrar ("Chicharron 10#: Este tipo de producto (Case) no puede ser 6.5 —
+solo admite cantidades enteras."). Se valida ANTES de escribir nada, así que un
+recibo/revisión con una línea inválida no guarda ninguna. Aplica en
+`createReceipt`, `addRouteItem` (salvo `whole_box`), `updateLot` (cuando viene
+`quantity`) y `createReturns`. Android muestra el `error` tal cual en un
+Snackbar (Recepción vía `WarehouseRepository`, carga a ruta, editar lote,
+devoluciones). Sin variable de entorno ni confirmación (se descartaron el 409
+con `acknowledge_warnings` y "guardar y avisar"). Tests: `bun test`.
+
+## Desglose por lote/peso en ruta y devoluciones (2026-09-30)
+
+**Fase 130 — una línea por carga.** Antes `addRouteItem` fusionaba en UNA fila
+de `route_items` todas las cargas del mismo producto+parada (sumaba
+`quantity`) por el UNIQUE `route_product_stop`/`route_product`; el operador
+veía "nombre + lbs totales". Ahora cada carga es su propia línea (una por lote
+asignado por FIFO, o una para `source: 'STOCK'`), con su lote y peso. La
+respuesta de `addRouteItem` mantiene `item` (primera línea) y suma `items[]`.
+**Migración:** se quita el UNIQUE (primero un `KEY route_items_route` porque la
+FK a `routes` lo necesita); `ensureTables()` lo hace solo al primer request de
+rutas (idempotente, try/catch), equivalente manual en `schema.sql` (Fase 130).
+**Verificado en producción (2026-09-30):** `SHOW INDEX FROM route_items` muestra
+solo `PRIMARY` como índice único (sin `route_product_stop`/`route_product`) más
+`route_items_route (route_id, product_id)` y `fk_route_items_stop` — la migración
+ya corrió, así que el error de clave duplicada al cargar el mismo producto/parada
+dos veces ya no ocurre. Para re-verificar: `SHOW INDEX FROM route_items;` y
+comprobar que no haya `Non_unique = 0` salvo `PRIMARY`.
+`registerConsignment` ya no puede usar `ON DUPLICATE KEY` — fusiona a mano (una
+línea por parada/producto), y solo sobre una línea SIN lotes (`route_item_lots`);
+si la línea de esa parada/producto viene de una carga con lote, crea una nueva.
+`addRouteItem` corre en una transacción (stock, líneas, lotes y movimientos) y
+sincroniza QBO recién después del commit (`recordMovement({ conn })` +
+`syncMovementsToQbo()`). `getExpectedReturns` reparte lo vendido de una
+parada entre sus líneas del mismo producto. Las líneas viejas ya sumadas no se
+separan (solo aplica a cargas nuevas).
+
+`route_item_lots` siempre guardó qué lote(s) y cuánto de cada uno. Se expone
+(`src/services/routeLots.ts`):
+- `GET /api/routes/:id` → cada `items[]` suma `lots: [{ lot_id, lot_number,
+  supplier, expiration_date, quantity, received_qty }]` (`quantity` = lo cargado
+  a la ruta desde ese lote, o sea el peso de esa caja; orden expiración ASC,
+  sin fecha al final) y `unlotted_qty` (parte cargada con `source: 'STOCK'`,
+  sin lote — así el desglose siempre suma al total de la línea).
+- `GET /api/routes/:id/returns/expected` → cada fila suma los mismos `lots`/
+  `unlotted_qty` de lo CARGADO en esa línea. Es **solo referencia**:
+  `route_returns` sigue sin lote, la cantidad devuelta se captura por
+  producto (decisión explícita, registrar devolución por lote quedó fuera).
+- El peso de cada caja sale de `product_lots.received_qty` (el scanner del
+  código de barras llena ese mismo campo que antes se tipeaba a mano).
+Tests: `bun test` (`routeLots.test.ts`).
+
+## "Ruta terminada" — el operador no inicia una ruta que el almacén no cerró (2026-10-01)
+
+Pedido del cliente: mientras el almacén arma la ruta (cargar productos), el
+operador no puede usarla; recién cuando el almacenista aprieta **"Ruta
+terminada"** queda configurada para ese día y se puede iniciar.
+
+- `routes.ready_at`/`ready_by` (nullable) — la marca. **No** es un estado nuevo
+  del ENUM: `PLANNED → IN_PROGRESS → COMPLETED` sigue igual.
+- `POST /api/routes/:id/ready` (`markRouteReady`, `warehouseOnly`) — solo
+  `PLANNED`, sin devoluciones revisadas, sin marca previa y **con al menos un
+  producto cargado** (`route_items`); si no, 400.
+- `POST /api/routes/:id/reopen` (`reopenRoute`, `warehouseOnly`) — "Reabrir
+  carga": borra la marca. Solo con la ruta `PLANNED`; con `IN_PROGRESS` da 400.
+- **Guard en `updateRoute`:** pasar `PLANNED → IN_PROGRESS` sin `ready_at` da
+  400 para **cualquier rol** (admin incluido), no solo operator.
+- **Candado de edición:** con `PLANNED` + `ready_at`, `addRouteItem`,
+  `removeRouteItem`, `addStop`, `removeStop` y `reorderStops` rechazan con
+  "Reabrí la carga para modificarla". Con `IN_PROGRESS` **no** se bloquea
+  (ahí `ready_at` siempre existe; el comportamiento previo no cambia).
+- `listRoutes`/`getRoute` exponen `ready_at`/`ready_by`.
+- Reglas puras y testeadas en `src/services/routeReadiness.ts`.
+- **Migración:** `ensureTables()` agrega las columnas, pero el backfill
+  (`UPDATE routes SET ready_at = NOW() WHERE ready_at IS NULL`) se corre **una
+  sola vez a mano, justo antes del deploy** — ver `schema.sql`. Re-correrlo
+  con rutas nuevas en preparación las marcaría como listas.
+- **Webapp** (`/warehouse`, `WarehouseClient.tsx`): badge Lista/En preparación,
+  botón "Ruta terminada"/"Reabrir carga" debajo de lo cargado, y la opción
+  "En ruta" del selector de estado queda deshabilitada sin la marca.
+- **Android:** `WarehouseRouteDetailActivity` (botón + banner + bloqueo de
+  edición) y `MyRouteDetailActivity` ("Salir a reparto" deshabilitado, texto
+  "Esperando al almacén", hasta que exista `ready_at`).
+- Verificado solo por compilación (`tsc`, `bun test`, `compileDebugKotlin`);
+  sin probar contra una base real ni en el TC22.
+
 ## Módulo Almacén — revisión de devoluciones 2.0, Sub-inventario, backfill y sync instantáneo a QBO (Fase 114)
 
 Pedido del usuario en varias vueltas seguidas sobre lo ya construido en las

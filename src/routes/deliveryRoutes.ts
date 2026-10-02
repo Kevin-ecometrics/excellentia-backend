@@ -4,6 +4,8 @@ import {
   listRoutes,
   getRoute,
   updateRoute,
+  markRouteReady,
+  reopenRoute,
   deleteRoute,
   addStop,
   reorderStops,
@@ -18,15 +20,10 @@ import {
   registerConsignment,
   getConsignment,
   settleConsignment,
-  createDayStop,
-  copyDayStops,
-  listDayStops,
-  deleteDayStop,
   getExpectedStopItems,
 } from '../controllers/routeController.ts';
 import { auth } from '../middleware/auth.ts';
 import { warehouseOnly } from '../middleware/warehouseOnly.ts';
-import { adminOnly } from '../middleware/adminOnly.ts';
 
 const router = Router();
 
@@ -35,26 +32,13 @@ const router = Router();
 // ownership vive dentro de cada controller, no acá (warehouseOnly seguiría
 // bloqueando a operator de raíz). El resto (crear/armar/cancelar rutas,
 // cargar productos) sigue exclusivo de admin/almacenista.
-//
-// route_day_stops (2026-09-18) — el admin arma en el dashboard, por día, la
-// lista de clientes/pedidos/pre-órdenes a visitar (antes de que exista
-// ninguna ruta/camión — puede haber varios camiones el mismo día). Rutas
-// registradas ANTES de "/:id" para que Express no confunda "day-stops" con
-// un :id. addStop vuelve a ser warehouseOnly (el almacenista sigue armando
-// la ruta exactamente igual que antes — nombre, repartidor, paradas, orden,
-// carga del camión) pero el controller ahora exige que el cliente/pedido
-// que intenta agregar ya esté en route_day_stops sin tomar, así que en la
-// práctica ya no puede elegir libremente a quién visita, solo a quién
-// asigna en qué camión y en qué orden.
-router.get('/day-stops',              auth, warehouseOnly, listDayStops);
-router.post('/day-stops',             auth, adminOnly, createDayStop);
-router.post('/day-stops/copy',        auth, adminOnly, copyDayStops);
-router.delete('/day-stops/:dayStopId', auth, adminOnly, deleteDayStop);
 router.get('/available',              auth, warehouseOnly, listAvailable);
 router.post('/',                      auth, warehouseOnly, createRoute);
 router.get('/',                       auth, listRoutes);
 router.get('/:id',                    auth, getRoute);
 router.put('/:id',                    auth, updateRoute);
+router.post('/:id/ready',             auth, warehouseOnly, markRouteReady);
+router.post('/:id/reopen',            auth, warehouseOnly, reopenRoute);
 router.delete('/:id',                 auth, warehouseOnly, deleteRoute);
 router.post('/:id/stops',             auth, addStop); // warehouseOnly salvo operator: addStop valida (solo CUSTOMER, su ruta IN_PROGRESS)
 router.put('/:id/stops/reorder',      auth, warehouseOnly, reorderStops);

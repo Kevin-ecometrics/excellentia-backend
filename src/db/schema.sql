@@ -332,6 +332,8 @@ CREATE TABLE IF NOT EXISTS `routes` (
     `created_by`      INT DEFAULT NULL,
     `returns_reviewed_at` TIMESTAMP DEFAULT NULL,
     `returns_reviewed_by` INT DEFAULT NULL,
+    `ready_at`        TIMESTAMP NULL DEFAULT NULL,
+    `ready_by`        INT DEFAULT NULL,
     `created_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     `updated_at`      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (`warehouse_id`) REFERENCES `warehouses`(`id`)
@@ -385,7 +387,7 @@ CREATE TABLE IF NOT EXISTS `route_items` (
     `scanned_by`   INT DEFAULT NULL,
     `created_at`   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     `updated_at`   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY `route_product` (`route_id`, `product_id`),
+    KEY `route_items_route` (`route_id`, `product_id`),
     FOREIGN KEY (`route_id`) REFERENCES `routes`(`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -602,6 +604,15 @@ UPDATE routes SET warehouse_id = (SELECT id FROM warehouses ORDER BY id LIMIT 1)
 ALTER TABLE routes ADD COLUMN IF NOT EXISTS returns_reviewed_at TIMESTAMP DEFAULT NULL AFTER created_by;
 ALTER TABLE routes ADD COLUMN IF NOT EXISTS returns_reviewed_by INT DEFAULT NULL AFTER returns_reviewed_at;
 
+-- "Ruta terminada" (2026-10-01) — el almacén marca la ruta como lista; hasta
+-- entonces el operador no puede iniciarla (updateRoute → IN_PROGRESS da 400).
+ALTER TABLE routes ADD COLUMN IF NOT EXISTS ready_at TIMESTAMP NULL DEFAULT NULL AFTER returns_reviewed_by;
+ALTER TABLE routes ADD COLUMN IF NOT EXISTS ready_by INT NULL DEFAULT NULL AFTER ready_at;
+-- SOLO UNA VEZ, justo antes de desplegar: marca como listas las rutas que ya
+-- existían para no bloquear a ningún operador. NO re-correr con rutas nuevas
+-- en preparación (las marcaría como listas y saltearía la revisión).
+-- UPDATE routes SET ready_at = NOW() WHERE ready_at IS NULL;
+
 -- =============================================================================
 -- Migración (2026-09-01): aprobación de admin antes de enviar una venta a QBO
 -- Para bases existentes (ejecutar una sola vez)
@@ -749,3 +760,14 @@ SET FOREIGN_KEY_CHECKS = 1;
 SET FOREIGN_KEY_CHECKS = 1;
 -- 2026-09-29 — routes.manual_close: la ruta no se cierra sola (operador suma clientes sobre la marcha).
 ALTER TABLE routes ADD COLUMN IF NOT EXISTS manual_close TINYINT(1) NOT NULL DEFAULT 0;
+
+-- =============================================================================
+-- Migración — Fase 130 (2026-09-30): route_items sin UNIQUE — una línea por carga.
+-- Cada caja/lote cargado a una ruta es su propia línea (antes se sumaban por
+-- producto+parada). El backend lo aplica solo al arrancar (ensureTables); este
+-- es el equivalente manual. Verificar el nombre con: SHOW INDEX FROM route_items;
+-- (puede llamarse route_product o route_product_stop). Orden obligatorio: la FK
+-- a routes necesita un índice sobre route_id antes de soltar el UNIQUE.
+-- =============================================================================
+ALTER TABLE route_items ADD KEY route_items_route (route_id, product_id);
+-- ALTER TABLE route_items DROP INDEX route_product_stop;  -- o: DROP INDEX route_product;

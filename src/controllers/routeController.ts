@@ -10,10 +10,14 @@ import {
   LotChangedError,
   restoreLotQuantity,
   recordMovement,
+  syncMovementsToQbo,
   InsufficientStockError,
 } from './warehouseController.ts';
 import { computeDamageCredit, lineTotal } from '../services/creditCalculator.ts';
 import { reserveInvoiceNumber } from '../services/invoiceCounter.ts';
+import { collectQuantityWarnings, respondIfInvalidQuantities } from '../services/quantityWarnings.ts';
+import { loadLotsForRouteItems, unlottedQty } from '../services/routeLots.ts';
+import { startBlockReason, readyBlockReason, reopenBlockReason, editLockedReason } from '../services/routeReadiness.ts';
 
 // Orden forward-only: PLANNED -> IN_PROGRESS -> COMPLETED, sin poder retroceder.
 // CANCELLED es terminal — se puede llegar desde PLANNED/IN_PROGRESS (no desde
@@ -48,7 +52,9 @@ async function ensureTables() {
       created_by      INT DEFAULT NULL,
       returns_reviewed_at TIMESTAMP DEFAULT NULL,
       returns_reviewed_by INT DEFAULT NULL,
-      manual_close    TINYINT(1) NOT NULL DEFAULT 0,
+      ready_at        TIMESTAMP NULL DEFAULT NULL,
+      ready_by        INT DEFAULT NULL,
+      manual_close   TINYINT(1) NOT NULL DEFAULT 0,
       created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       FOREIGN KEY (warehouse_id) REFERENCES warehouses(id)
@@ -89,7 +95,9 @@ async function ensureTables() {
       scanned_by    INT DEFAULT NULL,
       created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      UNIQUE KEY route_product_stop (route_id, product_id, route_stop_id),
+      -- Fase 130: sin UNIQUE (route_id, product_id, route_stop_id) — cada carga
+      -- (caja/lote) es su propia línea. KEY simple para las consultas por ruta.
+      KEY route_items_route (route_id, product_id),
       FOREIGN KEY (route_id) REFERENCES routes(id) ON DELETE CASCADE,
       FOREIGN KEY (route_stop_id) REFERENCES route_stops(id) ON DELETE SET NULL
     )
@@ -100,6 +108,8 @@ async function ensureTables() {
   // try/catch: si el motor no soporta ADD COLUMN IF NOT EXISTS (MySQL 8 puro)
   // no debe tumbar TODOS los endpoints de rutas — la columna ya viene del
   // CREATE TABLE / migración manual de schema.sql.
+  await ensureRouteItemsNotUnique();
+  await ensureReadyColumns();
   if (!manualCloseColumnEnsured) {
     manualCloseColumnEnsured = true;
     try {
@@ -110,6 +120,60 @@ async function ensureTables() {
   }
 }
 let manualCloseColumnEnsured = false;
+
+// ready_at/ready_by (2026-10-01) — "Ruta terminada" del almacén. Si faltan en
+// la base, las queries que las nombran tumban todos los endpoints de rutas:
+// por eso se aseguran acá (mismo criterio que manual_close). El backfill de
+// rutas existentes NO va acá a propósito (correría en cada arranque): se
+// aplica una sola vez a mano, ver schema.sql.
+let readyColumnsEnsured = false;
+async function ensureReadyColumns(): Promise<void> {
+  if (readyColumnsEnsured) return;
+  readyColumnsEnsured = true;
+  try {
+    await pool.query('ALTER TABLE routes ADD COLUMN IF NOT EXISTS ready_at TIMESTAMP NULL DEFAULT NULL');
+    await pool.query('ALTER TABLE routes ADD COLUMN IF NOT EXISTS ready_by INT NULL DEFAULT NULL');
+  } catch (err) {
+    logger.warn('ensureReadyColumns: no se pudo asegurar routes.ready_at/ready_by (¿ya existen?):', err);
+  }
+}
+
+// Fase 130 — quita el UNIQUE route_product_stop de route_items en bases que ya
+// existían (el CREATE TABLE de arriba solo aplica a bases nuevas). Orden
+// obligatorio: primero un KEY nuevo que cubra route_id (la FK a routes usaba
+// el UNIQUE como índice y MySQL no deja borrarlo sin reemplazo), después el
+// DROP. Idempotente y con try/catch — si falla no tumba los endpoints de
+// rutas; el SQL manual equivalente está en schema.sql (Fase 130).
+let routeItemsUniqueDropped = false;
+async function ensureRouteItemsNotUnique(): Promise<void> {
+  if (routeItemsUniqueDropped) return;
+  try {
+    // El nombre del índice varía según cuándo se creó la base (schema.sql
+    // histórico: route_product; migración 2026-09-18: route_product_stop), así
+    // que se buscan todos los UNIQUE que no sean la PK en vez de asumir uno.
+    const [idx] = await pool.query(
+      `SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'route_items'
+         AND NON_UNIQUE = 0 AND INDEX_NAME <> 'PRIMARY'`
+    ) as any[];
+    if ((idx as any[]).length === 0) { routeItemsUniqueDropped = true; return; }
+    const [[hasKey]] = await pool.query(
+      `SELECT COUNT(*) AS n FROM information_schema.STATISTICS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'route_items' AND INDEX_NAME = 'route_items_route'`
+    ) as any[];
+    if (!Number(hasKey.n)) await pool.query('ALTER TABLE route_items ADD KEY route_items_route (route_id, product_id)');
+    for (const row of idx as any[]) {
+      await pool.query(`ALTER TABLE route_items DROP INDEX \`${String(row.INDEX_NAME).replace(/`/g, '')}\``);
+      logger.info(`ensureTables: route_items.${row.INDEX_NAME} eliminado (Fase 130)`);
+    }
+    routeItemsUniqueDropped = true;
+  } catch (err) {
+    // No se marca como hecho: se reintenta en el próximo request (un fallo
+    // transitorio no debe dejar el UNIQUE puesto hasta reiniciar el backend).
+    // Mientras tanto, cargar el mismo producto dos veces a una ruta daría 500.
+    logger.warn('ensureTables: no se pudo quitar el UNIQUE de route_items — correr la migración manual de schema.sql (Fase 130):', err);
+  }
+}
 
 export async function createRoute(req: Request, res: Response): Promise<void> {
   await ensureWarehouseTables();
@@ -163,7 +227,7 @@ export async function listRoutes(req: Request, res: Response): Promise<void> {
     const driver_user_id = req.user?.role === 'operator' ? req.user.id : req.query.driver_user_id;
     let query = `
       SELECT r.id, r.name, r.scheduled_date, r.driver_user_id, u.name AS driver_name,
-             r.status, r.route_type, r.notes, r.created_by, r.returns_reviewed_at, r.returns_reviewed_by, r.created_at, r.updated_at,
+             r.status, r.route_type, r.notes, r.created_by, r.returns_reviewed_at, r.returns_reviewed_by, r.ready_at, r.ready_by, r.created_at, r.updated_at,
              COUNT(rs.id) AS stop_count
       FROM routes r
       LEFT JOIN users u ON u.id = r.driver_user_id
@@ -308,9 +372,13 @@ export async function getRoute(req: Request, res: Response): Promise<void> {
     for (const r of itemRows as any[]) {
       if (r.barcode) loadedByBarcode.set(r.barcode, (loadedByBarcode.get(r.barcode) ?? 0) + Number(r.quantity));
     }
+    // Desglose por lote (lote + peso de cada caja) — ver services/routeLots.ts.
+    const lotsByItem = await loadLotsForRouteItems((itemRows as any[]).map(r => r.id));
     const items = (itemRows as any[]).map(r => ({
       ...r,
       quantity: Number(r.quantity),
+      lots: lotsByItem.get(r.id) ?? [],
+      unlotted_qty: unlottedQty(Number(r.quantity), lotsByItem.get(r.id) ?? []),
       sold_qty: r.barcode ? (soldByBarcode.get(r.barcode) ?? 0) : 0,
       total_loaded_qty: r.barcode ? (loadedByBarcode.get(r.barcode) ?? Number(r.quantity)) : Number(r.quantity),
     }));
@@ -330,7 +398,7 @@ export async function updateRoute(req: Request, res: Response): Promise<void> {
     const { id } = req.params;
     let { name, scheduled_date, driver_user_id, status, notes } = req.body;
 
-    const [existing] = await pool.query('SELECT id, status, driver_user_id FROM routes WHERE id = ?', [id]) as any[];
+    const [existing] = await pool.query('SELECT id, status, driver_user_id, ready_at FROM routes WHERE id = ?', [id]) as any[];
     if ((existing as any[]).length === 0) {
       res.status(404).json({ error: 'Ruta no encontrada' });
       return;
@@ -373,6 +441,13 @@ export async function updateRoute(req: Request, res: Response): Promise<void> {
       res.status(400).json({ error: `No se puede pasar de '${currentStatus}' a '${status}'` });
       return;
     }
+    // "Ruta terminada": nadie (ni admin) inicia una ruta que el almacén no
+    // marcó como lista. Va en el backend, no solo en la UI.
+    const startBlock = status !== undefined ? startBlockReason(currentStatus, status, (existing as any[])[0].ready_at) : null;
+    if (startBlock) {
+      res.status(400).json({ error: startBlock });
+      return;
+    }
 
     // Cierre manual del operador ("Finalizar ruta" al volver): nunca con
     // paradas PENDING (deben entregarse o saltearse con motivo — era el riesgo
@@ -410,6 +485,76 @@ export async function updateRoute(req: Request, res: Response): Promise<void> {
     res.json({ message: 'Ruta actualizada', routeStatus: status ?? currentStatus });
   } catch (err) {
     logger.error('updateRoute error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
+// "Ruta terminada" (2026-10-01) — el almacén da por cargado el camión; recién
+// ahí el operador puede iniciar la ruta (guard en updateRoute). El UPDATE
+// repite las condiciones en el WHERE para que dos requests simultáneas no
+// pisen el estado.
+export async function markRouteReady(req: Request, res: Response): Promise<void> {
+  await ensureTables();
+  try {
+    const { id } = req.params;
+    const [[route]] = await pool.query(
+      'SELECT status, ready_at, returns_reviewed_at FROM routes WHERE id = ?', [id]
+    ) as any[];
+    if (!route) {
+      res.status(404).json({ error: 'Ruta no encontrada' });
+      return;
+    }
+    const [[items]] = await pool.query(
+      'SELECT COUNT(*) AS n FROM route_items WHERE route_id = ?', [id]
+    ) as any[];
+    const blocked = readyBlockReason(route, Number(items.n) || 0);
+    if (blocked) {
+      res.status(400).json({ error: blocked });
+      return;
+    }
+    const [result] = await pool.query(
+      `UPDATE routes SET ready_at = NOW(), ready_by = ?, updated_at = NOW()
+       WHERE id = ? AND status = 'PLANNED' AND ready_at IS NULL`,
+      [req.user?.id ?? null, id]
+    ) as any;
+    if (result.affectedRows === 0) {
+      res.status(409).json({ error: 'La ruta cambió mientras tanto, recargá e intentá de nuevo' });
+      return;
+    }
+    res.json({ message: 'Ruta marcada como terminada', ready: true });
+  } catch (err) {
+    logger.error('markRouteReady error:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+}
+
+// "Reabrir carga": deshace markRouteReady mientras la ruta no haya salido.
+export async function reopenRoute(req: Request, res: Response): Promise<void> {
+  await ensureTables();
+  try {
+    const { id } = req.params;
+    const [[route]] = await pool.query('SELECT status, ready_at FROM routes WHERE id = ?', [id]) as any[];
+    if (!route) {
+      res.status(404).json({ error: 'Ruta no encontrada' });
+      return;
+    }
+    const blocked = reopenBlockReason(route);
+    if (blocked) {
+      res.status(400).json({ error: blocked });
+      return;
+    }
+    const [result] = await pool.query(
+      `UPDATE routes SET ready_at = NULL, ready_by = NULL, updated_at = NOW()
+       WHERE id = ? AND status = 'PLANNED' AND ready_at IS NOT NULL`,
+      [id]
+    ) as any;
+    if (result.affectedRows === 0) {
+      res.status(409).json({ error: 'La ruta cambió mientras tanto, recargá e intentá de nuevo' });
+      return;
+    }
+    res.json({ message: 'Carga reabierta', ready: false });
+  } catch (err) {
+    logger.error('reopenRoute error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 }
@@ -535,182 +680,8 @@ export async function deleteRoute(req: Request, res: Response): Promise<void> {
   }
 }
 
-// route_day_stops (2026-09-18) — planificación del día, separada de
-// route_stops. El admin arma acá, desde el dashboard nuevo de Rutas, la
-// lista de clientes que hay que visitar un día determinado — ANTES de que
-// exista ninguna ruta/camión todavía (puede haber varios camiones/
-// operadores el mismo día, así que a esta altura todavía no se sabe cuál va
-// a llevar a cada uno). Solo clientes (pedido explícito del usuario,
-// 2026-09-18) — se sacó la posibilidad de pre-aprobar pedidos/pre-órdenes
-// ya existentes (BATCH/PRE_ORDER), que en la práctica nunca se usó: esos
-// stop_type siguen existiendo en route_stops y addStop los sigue aceptando
-// libremente (igual que CONSIGNMENT), sin pasar por esta lista.
-//
-// Cuando el almacenista arma su propia ruta (sin cambios, sigue siendo
-// warehouseOnly) y le agrega una parada de cliente, addStop exige que ese
-// cliente ya esté en la lista del día (assigned_route_id todavía NULL) —
-// así el almacenista sigue "armando la ruta" exactamente como antes, pero
-// ya no puede elegir un cliente que el admin no haya aprobado para ese día.
-async function ensureDayStopsTable() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS route_day_stops (
-      id                INT AUTO_INCREMENT PRIMARY KEY,
-      scheduled_date    DATE NOT NULL,
-      customer_id       VARCHAR(50) NOT NULL,
-      customer_name     VARCHAR(255) NOT NULL,
-      assigned_route_id INT DEFAULT NULL,
-      created_by        INT DEFAULT NULL,
-      created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_day_customer (scheduled_date, customer_id),
-      FOREIGN KEY (assigned_route_id) REFERENCES routes(id) ON DELETE SET NULL
-    )
-  `);
-}
-
-export async function createDayStop(req: Request, res: Response): Promise<void> {
-  await ensureDayStopsTable();
-  try {
-    const { scheduled_date, customer_id, customer_name } = req.body;
-    if (!scheduled_date) {
-      res.status(400).json({ error: 'scheduled_date es requerido' });
-      return;
-    }
-    if (!customer_id || !customer_name) {
-      res.status(400).json({ error: 'customer_id y customer_name son requeridos' });
-      return;
-    }
-
-    // Chequeo explícito antes del INSERT (mensaje claro) — el UNIQUE de la
-    // tabla queda como red de seguridad ante una carrera (dos admins
-    // agregando el mismo cliente al mismo día casi al mismo tiempo).
-    const [[existing]] = await pool.query(
-      'SELECT id FROM route_day_stops WHERE scheduled_date = ? AND customer_id = ?',
-      [scheduled_date, customer_id]
-    ) as any[];
-    if (existing) {
-      res.status(400).json({ error: 'Este cliente ya está asignado a este día' });
-      return;
-    }
-
-    const [result] = await pool.query(
-      'INSERT INTO route_day_stops (scheduled_date, customer_id, customer_name, created_by) VALUES (?, ?, ?, ?)',
-      [scheduled_date, customer_id, customer_name, req.user?.id ?? null]
-    ) as any;
-    res.status(201).json({ id: result.insertId });
-  } catch (err: any) {
-    if (err?.code === 'ER_DUP_ENTRY') {
-      res.status(400).json({ error: 'Este cliente ya está asignado a este día' });
-      return;
-    }
-    logger.error('createDayStop error:', err);
-    res.status(500).json({ error: 'Error interno del servidor' });
-  }
-}
-
-// Fase 121 — "Copiar a otra fecha" (pedido explícito del usuario, 2026-09-18):
-// un cliente que va todos los viernes obligaba a re-cargarlo a mano cada
-// semana. En vez de un motor de recurrencia (día de la semana fijo, qué
-// pasa si un cliente recurrente se cancela una semana puntual, etc.) se
-// eligió lo más simple: duplicar la lista de clientes de un día ya armado a
-// otra fecha, con un clic, cuando el admin decida hacerlo — nunca automático.
-// Nunca copia `assigned_route_id` — la fecha destino arranca sin ninguna
-// ruta armada todavía, igual que un día nuevo cualquiera. Clientes que ya
-// estén en la fecha destino se saltean (no son error — hace que el botón se
-// pueda apretar más de una vez sin romper nada, ej. si ya se había
-// agregado alguno a mano antes de copiar el resto).
-export async function copyDayStops(req: Request, res: Response): Promise<void> {
-  await ensureDayStopsTable();
-  try {
-    const { from_date, to_date } = req.body;
-    if (!from_date || !to_date) {
-      res.status(400).json({ error: 'from_date y to_date son requeridos' });
-      return;
-    }
-    if (from_date === to_date) {
-      res.status(400).json({ error: 'from_date y to_date no pueden ser el mismo día' });
-      return;
-    }
-
-    const [sourceRows] = await pool.query(
-      'SELECT customer_id, customer_name FROM route_day_stops WHERE scheduled_date = ?',
-      [from_date]
-    ) as any[];
-    if ((sourceRows as any[]).length === 0) {
-      res.status(404).json({ error: 'No hay clientes cargados en la fecha de origen' });
-      return;
-    }
-
-    const [existingRows] = await pool.query(
-      'SELECT customer_id FROM route_day_stops WHERE scheduled_date = ?',
-      [to_date]
-    ) as any[];
-    const existingIds = new Set((existingRows as any[]).map(r => r.customer_id));
-
-    let copied = 0;
-    let skipped = 0;
-    for (const row of sourceRows as any[]) {
-      if (existingIds.has(row.customer_id)) { skipped++; continue; }
-      await pool.query(
-        'INSERT INTO route_day_stops (scheduled_date, customer_id, customer_name, created_by) VALUES (?, ?, ?, ?)',
-        [to_date, row.customer_id, row.customer_name, req.user?.id ?? null]
-      );
-      copied++;
-    }
-
-    res.status(201).json({ copied, skipped });
-  } catch (err) {
-    logger.error('copyDayStops error:', err);
-    res.status(500).json({ error: 'Error interno del servidor' });
-  }
-}
-
-export async function listDayStops(req: Request, res: Response): Promise<void> {
-  await ensureDayStopsTable();
-  try {
-    const { date } = req.query;
-    if (!date) {
-      res.status(400).json({ error: 'date es requerido' });
-      return;
-    }
-    const [rows] = await pool.query(
-      `SELECT ds.*, r.name AS assigned_route_name
-       FROM route_day_stops ds
-       LEFT JOIN routes r ON r.id = ds.assigned_route_id
-       WHERE ds.scheduled_date = ?
-       ORDER BY ds.created_at`,
-      [date]
-    ) as any[];
-    res.json({ data: rows });
-  } catch (err) {
-    logger.error('listDayStops error:', err);
-    res.status(500).json({ error: 'Error interno del servidor' });
-  }
-}
-
-export async function deleteDayStop(req: Request, res: Response): Promise<void> {
-  await ensureDayStopsTable();
-  try {
-    const { dayStopId } = req.params;
-    const [[row]] = await pool.query('SELECT id, assigned_route_id FROM route_day_stops WHERE id = ?', [dayStopId]) as any[];
-    if (!row) {
-      res.status(404).json({ error: 'No encontrado' });
-      return;
-    }
-    if (row.assigned_route_id) {
-      res.status(400).json({ error: 'Ya está asignado a una ruta — quitalo de esa ruta primero' });
-      return;
-    }
-    await pool.query('DELETE FROM route_day_stops WHERE id = ?', [dayStopId]);
-    res.json({ message: 'Eliminado' });
-  } catch (err) {
-    logger.error('deleteDayStop error:', err);
-    res.status(500).json({ error: 'Error interno del servidor' });
-  }
-}
-
 export async function addStop(req: Request, res: Response): Promise<void> {
   await ensureTables();
-  await ensureDayStopsTable();
   try {
     const { id } = req.params;
     const { stop_type, batch_id, pre_order_id, customer_id, customer_name } = req.body;
@@ -720,7 +691,7 @@ export async function addStop(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    const [routeRows] = await pool.query('SELECT id, status, route_type, returns_reviewed_at, scheduled_date, driver_user_id FROM routes WHERE id = ?', [id]) as any[];
+    const [routeRows] = await pool.query('SELECT id, status, route_type, returns_reviewed_at, ready_at, scheduled_date, driver_user_id FROM routes WHERE id = ?', [id]) as any[];
     if ((routeRows as any[]).length === 0) {
       res.status(404).json({ error: 'Ruta no encontrada' });
       return;
@@ -754,6 +725,11 @@ export async function addStop(req: Request, res: Response): Promise<void> {
     }
     if ((routeRows as any[])[0].returns_reviewed_at) {
       res.status(400).json({ error: 'Devoluciones ya revisadas: no se puede modificar esta ruta' });
+      return;
+    }
+    const addStopLocked = editLockedReason((routeRows as any[])[0].status, (routeRows as any[])[0].ready_at);
+    if (addStopLocked) {
+      res.status(400).json({ error: addStopLocked });
       return;
     }
     // Fase 115 — una ruta DIRECT es un solo destino con la carga ya
@@ -823,29 +799,6 @@ export async function addStop(req: Request, res: Response): Promise<void> {
       customerName = (preOrderRows as any[])[0].customer_name;
     }
 
-    // Solo CUSTOMER pasa por la planificación del día (ver comentario en
-    // ensureDayStopsTable) — BATCH/PRE_ORDER/CONSIGNMENT se agregan libre
-    // como siempre, sin pasar por route_day_stops.
-    let dayStopId: number | null = null;
-    if (stop_type === 'CUSTOMER') {
-      const routeDate = (routeRows as any[])[0].scheduled_date;
-      const [[dayStop]] = await pool.query(
-        `SELECT id FROM route_day_stops
-         WHERE scheduled_date = ? AND customer_id = ? AND assigned_route_id IS NULL`,
-        [routeDate, customer_id]
-      ) as any[];
-      // El operador agrega clientes sobre la marcha, sin planificación previa
-      // del admin: si el cliente sí estaba planificado se enlaza igual, si no
-      // se permite igual.
-      if (!dayStop && !isOperator) {
-        res.status(400).json({
-          error: 'Este cliente no fue asignado a este día por el admin — pedile que lo agregue primero en Rutas del día.',
-        });
-        return;
-      }
-      dayStopId = dayStop?.id ?? null;
-    }
-
     const [[posRow]] = await pool.query(
       'SELECT COALESCE(MAX(position), 0) + 1 AS pos FROM route_stops WHERE route_id = ?', [id]
     ) as any[];
@@ -860,9 +813,6 @@ export async function addStop(req: Request, res: Response): Promise<void> {
       ]
     ) as any;
 
-    if (dayStopId) {
-      await pool.query('UPDATE route_day_stops SET assigned_route_id = ? WHERE id = ?', [id, dayStopId]);
-    }
     if (isOperator) {
       await pool.query('UPDATE routes SET manual_close = 1 WHERE id = ?', [id]);
     }
@@ -883,7 +833,7 @@ export async function reorderStops(req: Request, res: Response): Promise<void> {
       res.status(400).json({ error: 'stop_ids debe ser un array no vacío' });
       return;
     }
-    const [[routeRow]] = await pool.query('SELECT status, returns_reviewed_at FROM routes WHERE id = ?', [id]) as any[];
+    const [[routeRow]] = await pool.query('SELECT status, returns_reviewed_at, ready_at FROM routes WHERE id = ?', [id]) as any[];
     if (!routeRow) {
       res.status(404).json({ error: 'Ruta no encontrada' });
       return;
@@ -898,6 +848,11 @@ export async function reorderStops(req: Request, res: Response): Promise<void> {
     }
     if (routeRow.returns_reviewed_at) {
       res.status(400).json({ error: 'Devoluciones ya revisadas: no se puede modificar esta ruta' });
+      return;
+    }
+    const reorderLocked = editLockedReason(routeRow.status, routeRow.ready_at);
+    if (reorderLocked) {
+      res.status(400).json({ error: reorderLocked });
       return;
     }
     for (let i = 0; i < stop_ids.length; i++) {
@@ -915,10 +870,9 @@ export async function reorderStops(req: Request, res: Response): Promise<void> {
 
 export async function removeStop(req: Request, res: Response): Promise<void> {
   await ensureTables();
-  await ensureDayStopsTable();
   try {
     const { id, stopId } = req.params;
-    const [[routeRow]] = await pool.query('SELECT status, returns_reviewed_at, scheduled_date FROM routes WHERE id = ?', [id]) as any[];
+    const [[routeRow]] = await pool.query('SELECT status, returns_reviewed_at, ready_at FROM routes WHERE id = ?', [id]) as any[];
     if (!routeRow) {
       res.status(404).json({ error: 'Ruta no encontrada' });
       return;
@@ -935,24 +889,17 @@ export async function removeStop(req: Request, res: Response): Promise<void> {
       res.status(400).json({ error: 'Devoluciones ya revisadas: no se puede modificar esta ruta' });
       return;
     }
-    const [[stopRow]] = await pool.query(
-      'SELECT stop_type, customer_id FROM route_stops WHERE id = ? AND route_id = ?', [stopId, id]
-    ) as any[];
+    const removeStopLocked = editLockedReason(routeRow.status, routeRow.ready_at);
+    if (removeStopLocked) {
+      res.status(400).json({ error: removeStopLocked });
+      return;
+    }
     const [result] = await pool.query(
       'DELETE FROM route_stops WHERE id = ? AND route_id = ?', [stopId, id]
     ) as any;
     if ((result as any).affectedRows === 0) {
       res.status(404).json({ error: 'Parada no encontrada' });
       return;
-    }
-    // Libera el cupo en route_day_stops para que otra ruta del mismo día
-    // pueda tomarlo — mismo criterio inverso al claim que hace addStop.
-    if (stopRow && stopRow.stop_type === 'CUSTOMER') {
-      await pool.query(
-        `UPDATE route_day_stops SET assigned_route_id = NULL
-         WHERE assigned_route_id = ? AND scheduled_date = ? AND customer_id = ? LIMIT 1`,
-        [id, routeRow.scheduled_date, stopRow.customer_id]
-      );
     }
     res.json({ message: 'Parada eliminada' });
   } catch (err) {
@@ -1080,7 +1027,7 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
     // Android/webapp la muestran como tal en vez de un nombre de cliente.
     const routeStopId = route_stop_id ?? null;
 
-    const [[routeRow]] = await pool.query('SELECT status, warehouse_id, returns_reviewed_at FROM routes WHERE id = ?', [id]) as any[];
+    const [[routeRow]] = await pool.query('SELECT status, warehouse_id, returns_reviewed_at, ready_at FROM routes WHERE id = ?', [id]) as any[];
     if (!routeRow) {
       res.status(404).json({ error: 'Ruta no encontrada' });
       return;
@@ -1095,6 +1042,11 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
     }
     if (routeRow.returns_reviewed_at) {
       res.status(400).json({ error: 'Devoluciones ya revisadas: no se puede modificar esta ruta' });
+      return;
+    }
+    const addItemLocked = editLockedReason(routeRow.status, routeRow.ready_at);
+    if (addItemLocked) {
+      res.status(400).json({ error: addItemLocked });
       return;
     }
     if (routeStopId) {
@@ -1114,6 +1066,13 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
     if (!product) {
       res.status(404).json({ error: 'Producto no encontrado' });
       return;
+    }
+
+    // Cantidad vs tipo (Case/Unit/Bucket sin decimales) — whole_box se omite:
+    // la cantidad sale del remaining_qty real del lote, no la tipeó nadie.
+    if (!wholeBox) {
+      const invalid = await collectQuantityWarnings([{ product_id: product.id, quantity }]);
+      if (respondIfInvalidQuantities(res, invalid)) return;
     }
 
     // Asignación FIFO: por default el sistema elige el/los lote(s) — puede
@@ -1196,63 +1155,80 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
       }
     }
 
-    // route_stop_id puede ser NULL ("carga sin asignar") — el UNIQUE KEY
-    // (route_id, product_id, route_stop_id) trata cada NULL como distinto en
-    // MySQL, así que ON DUPLICATE KEY UPDATE nunca fusiona dos cargas sin
-    // asignar del mismo producto. Se resuelve a mano (buscar con `<=>`,
-    // null-safe, en vez de `=`) para que sumar cantidad funcione igual con o
-    // sin parada.
-    const [[existingItem]] = await pool.query(
-      'SELECT id FROM route_items WHERE route_id = ? AND product_id = ? AND route_stop_id <=> ?',
-      [id, product.id, routeStopId]
-    ) as any[];
-    if (existingItem) {
-      await pool.query(
-        'UPDATE route_items SET quantity = quantity + ?, updated_at = NOW() WHERE id = ?',
-        [quantity, existingItem.id]
-      );
-    } else {
-      await pool.query(
+    // Fase 130 (2026-09-30) — cada carga es su PROPIA línea de route_items, ya
+    // no se fusiona por (ruta, producto, parada): antes dos cajas del mismo
+    // producto con distinto lote/peso se sumaban en una sola fila y el
+    // operador solo veía "nombre + lbs totales". Una línea por lote asignado
+    // (FIFO puede partir la carga entre varios) o una sola si viene de stock
+    // general. Requiere que el índice único route_product_stop ya no exista
+    // (ver ensureTables / schema.sql).
+    // Todo lo local (stock, líneas, lotes, movimientos) va en UNA transacción:
+    // si algo falla, rollback y no queda stock descontado sin línea. Los lotes
+    // ya se reservaron arriba (applyFifoAllocation, con su propia compensación),
+    // así que en el rollback se restauran a mano. QBO se sincroniza recién
+    // después del commit.
+    const conn = await pool.getConnection();
+    const itemIds: number[] = [];
+    const movementIds: number[] = [];
+    try {
+      await conn.beginTransaction();
+      await conn.query('UPDATE products SET stock = GREATEST(stock - ?, 0) WHERE id = ?', [quantity, product.id]);
+    const insertLine = async (qty: number): Promise<number> => {
+      const [r] = await conn.query(
         `INSERT INTO route_items (route_id, product_id, route_stop_id, barcode, quantity, scanned_by)
          VALUES (?, ?, ?, ?, ?, ?)`,
-        [id, product.id, routeStopId, product.barcode ?? null, quantity, req.user?.id ?? null]
-      );
-    }
-    await pool.query('UPDATE products SET stock = GREATEST(stock - ?, 0) WHERE id = ?', [quantity, product.id]);
-
-    const [[routeItem]] = await pool.query(
-      'SELECT id FROM route_items WHERE route_id = ? AND product_id = ? AND route_stop_id <=> ?', [id, product.id, routeStopId]
-    ) as any[];
+        [id, product.id, routeStopId, product.barcode ?? null, qty, req.user?.id ?? null]
+      ) as any;
+      return r.insertId;
+    };
     if (useStock) {
-      await recordMovement({
+      itemIds.push(await insertLine(quantity));
+      const m = await recordMovement({
         warehouseId, productId: product.id, lotId: null, movementType: 'ROUTE_LOAD',
-        quantity: -quantity, routeId: Number(id), createdBy: req.user?.id ?? null,
+        quantity: -quantity, routeId: Number(id), createdBy: req.user?.id ?? null, conn,
       });
+      movementIds.push(m.movementId);
     } else {
       for (const a of allocations) {
-        await pool.query(
+        const routeItemId = await insertLine(a.qty);
+        itemIds.push(routeItemId);
+        await conn.query(
           `INSERT INTO route_item_lots (route_item_id, lot_id, quantity, used_suggested_lot)
            VALUES (?, ?, ?, ?)`,
-          [routeItem.id, a.lot_id, a.qty, lot_id ? 0 : 1]
+          [routeItemId, a.lot_id, a.qty, lot_id ? 0 : 1]
         );
-        await recordMovement({
+        const m = await recordMovement({
           warehouseId, productId: product.id, lotId: a.lot_id, movementType: 'ROUTE_LOAD',
-          quantity: -a.qty, routeId: Number(id), createdBy: req.user?.id ?? null,
+          quantity: -a.qty, routeId: Number(id), createdBy: req.user?.id ?? null, conn,
         });
+        movementIds.push(m.movementId);
       }
     }
+      await conn.commit();
+    } catch (txErr) {
+      await conn.rollback().catch(() => {});
+      if (!useStock) {
+        for (const a of allocations) await restoreLotQuantity(a.lot_id, a.qty);
+      }
+      throw txErr;
+    } finally {
+      conn.release();
+    }
+    syncMovementsToQbo(product.id, movementIds);
 
-    const [[itemRow]] = await pool.query(
+    const [itemRows] = await pool.query(
       `SELECT ri.id, ri.route_id, ri.product_id, ri.route_stop_id, ri.barcode, ri.quantity, p.name, p.sku, p.unit
        FROM route_items ri JOIN products p ON p.id = ri.product_id
-       WHERE ri.route_id = ? AND ri.product_id = ? AND ri.route_stop_id <=> ?`, [id, product.id, routeStopId]
+       WHERE ri.id IN (?) ORDER BY ri.id`, [itemIds]
     ) as any[];
     // Mismo cast que getRoute — route_items.quantity es DECIMAL (Fase 118).
-    const item = { ...itemRow, quantity: Number(itemRow.quantity) };
+    // `item` = primera línea creada (compat con Android); `items` = todas.
+    const createdItems = (itemRows as any[]).map(r => ({ ...r, quantity: Number(r.quantity) }));
+    const item = createdItems[0];
     const [[{ stock }]] = await pool.query('SELECT stock FROM products WHERE id = ?', [product.id]) as any[];
 
     res.status(201).json({
-      item, stock, lots: allocations,
+      item, items: createdItems, stock, lots: allocations,
       qbSynced: true,
     });
   } catch (err) {
@@ -1340,7 +1316,7 @@ export async function removeRouteItem(req: Request, res: Response): Promise<void
   await ensureRouteLinkedWarehouseTables();
   try {
     const { id, itemId } = req.params;
-    const [[routeRow]] = await pool.query('SELECT status, warehouse_id, returns_reviewed_at FROM routes WHERE id = ?', [id]) as any[];
+    const [[routeRow]] = await pool.query('SELECT status, warehouse_id, returns_reviewed_at, ready_at FROM routes WHERE id = ?', [id]) as any[];
     if (!routeRow) {
       res.status(404).json({ error: 'Ruta no encontrada' });
       return;
@@ -1355,6 +1331,11 @@ export async function removeRouteItem(req: Request, res: Response): Promise<void
     }
     if (routeRow.returns_reviewed_at) {
       res.status(400).json({ error: 'Devoluciones ya revisadas: no se puede modificar esta ruta' });
+      return;
+    }
+    const removeItemLocked = editLockedReason(routeRow.status, routeRow.ready_at);
+    if (removeItemLocked) {
+      res.status(400).json({ error: removeItemLocked });
       return;
     }
     const warehouseId = routeRow.warehouse_id ?? await getDefaultWarehouseId();
@@ -1485,12 +1466,29 @@ export async function registerConsignment(req: Request, res: Response): Promise<
         continue;
       }
 
-      await pool.query(
-        `INSERT INTO route_items (route_id, product_id, route_stop_id, barcode, quantity, scanned_by)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE quantity = quantity + VALUES(quantity), updated_at = NOW()`,
-        [id, product.id, stopId, product.barcode ?? null, quantity, req.user?.id ?? null]
-      );
+      // Fase 130 — ya no existe el índice único route_product_stop (addRouteItem
+      // inserta una línea por carga), así que ON DUPLICATE KEY UPDATE dejó de
+      // fusionar. Consignación sí sigue acumulando en UNA línea por
+      // parada/producto: se fusiona a mano.
+      // Solo se fusiona en una línea SIN lotes (route_item_lots): si la línea
+      // viene de una carga con lote, sumarle consignación dejaría cantidad sin
+      // lote detrás y removeRouteItem no la revertiría bien.
+      const [[existingLine]] = await pool.query(
+        `SELECT ri.id FROM route_items ri
+         LEFT JOIN route_item_lots ril ON ril.route_item_id = ri.id
+         WHERE ri.route_id = ? AND ri.product_id = ? AND ri.route_stop_id <=> ? AND ril.id IS NULL
+         ORDER BY ri.id LIMIT 1`,
+        [id, product.id, stopId]
+      ) as any[];
+      if (existingLine) {
+        await pool.query('UPDATE route_items SET quantity = quantity + ?, updated_at = NOW() WHERE id = ?', [quantity, existingLine.id]);
+      } else {
+        await pool.query(
+          `INSERT INTO route_items (route_id, product_id, route_stop_id, barcode, quantity, scanned_by)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [id, product.id, stopId, product.barcode ?? null, quantity, req.user?.id ?? null]
+        );
+      }
       await pool.query('UPDATE products SET stock = GREATEST(stock - ?, 0) WHERE id = ?', [quantity, product.id]);
       await recordMovement({
         warehouseId, productId: product.id, lotId: null, movementType: 'ROUTE_LOAD',
@@ -1787,7 +1785,7 @@ export async function getExpectedReturns(req: Request, res: Response): Promise<v
     // qué parada se cargó (route_items.route_stop_id, obligatorio desde esta
     // fecha), así que el desglose por cliente sale directo de acá.
     const [loadedRows] = await pool.query(
-      `SELECT ri.product_id, ri.barcode, ri.route_stop_id, p.name, p.sku, p.unit, ri.quantity AS loaded_qty,
+      `SELECT ri.id AS route_item_id, ri.product_id, ri.barcode, ri.route_stop_id, p.name, p.sku, p.unit, ri.quantity AS loaded_qty,
               ri.created_at AS loaded_at, u.name AS loaded_by_name,
               rs.customer_name, rs.stop_type, rs.position
        FROM route_items ri
@@ -1795,7 +1793,7 @@ export async function getExpectedReturns(req: Request, res: Response): Promise<v
        LEFT JOIN users u ON u.id = ri.scanned_by
        LEFT JOIN route_stops rs ON rs.id = ri.route_stop_id
        WHERE ri.route_id = ?
-       ORDER BY p.id, (rs.position IS NULL), rs.position`, [id]
+       ORDER BY p.id, (rs.position IS NULL), rs.position, ri.id`, [id]
     ) as any[];
 
     // rs.batch_id ya cubre las 2 formas en que una parada llega a tener un
@@ -1870,12 +1868,37 @@ export async function getExpectedReturns(req: Request, res: Response): Promise<v
       rowsByProduct.set(row.product_id, list);
     }
 
+    // Desglose por lote de lo CARGADO en cada línea (referencia — la cantidad
+    // devuelta sigue capturándose por producto, route_returns no tiene lote).
+    const lotsByItem = await loadLotsForRouteItems((loadedRows as any[]).map(r => r.route_item_id));
+
     const data: any[] = [];
     for (const [productId, rows] of rowsByProduct) {
       const returned = returnedByProduct.get(productId) ?? { good: 0, damaged: 0, expired: 0, transporterDamage: 0 };
       const consignmentSettled = consignmentSettledByProduct.get(productId) ?? 0;
 
-      const sold: any[] = rows.map((row: any) => row.route_stop_id != null && row.barcode ? (soldByStopBarcode.get(`${row.route_stop_id}|${row.barcode}`) ?? 0) : 0);
+      // Fase 130 — varias líneas del mismo producto en la misma parada (una
+      // por caja/lote): lo vendido de esa parada se REPARTE entre ellas (en
+      // orden de carga, cada una hasta su capacidad; la última absorbe el
+      // resto, igual que antes con una sola línea). Sin esto se contaba el
+      // total vendido completo en cada línea.
+      const soldLeft = new Map<string, number>();
+      const lastRowOfKey = new Map<string, number>();
+      rows.forEach((row: any, i: number) => {
+        if (row.route_stop_id != null && row.barcode) {
+          const key = `${row.route_stop_id}|${row.barcode}`;
+          soldLeft.set(key, soldByStopBarcode.get(key) ?? 0);
+          lastRowOfKey.set(key, i);
+        }
+      });
+      const sold: any[] = rows.map((row: any, i: number) => {
+        if (row.route_stop_id == null || !row.barcode) return 0;
+        const key = `${row.route_stop_id}|${row.barcode}`;
+        const left = soldLeft.get(key) ?? 0;
+        const take = lastRowOfKey.get(key) === i ? left : Math.min(left, Number(row.loaded_qty));
+        soldLeft.set(key, left - take);
+        return take;
+      });
       // Cargas sin asignar (route_stop_id NULL, backlog #3): la clave por
       // parada nunca matchea, así que se les atribuye lo vendido del producto
       // que las líneas asignadas no cubren (ventas en paradas sin línea propia
@@ -1933,6 +1956,8 @@ export async function getExpectedReturns(req: Request, res: Response): Promise<v
           consignment_settled_qty: consignmentAlloc[i],
           discrepancy,
           loaded_at: row.loaded_at, loaded_by_name: row.loaded_by_name,
+          lots: lotsByItem.get(row.route_item_id) ?? [],
+          unlotted_qty: unlottedQty(Number(row.loaded_qty), lotsByItem.get(row.route_item_id) ?? []),
         });
       });
     }
@@ -1988,6 +2013,12 @@ export async function createReturns(req: Request, res: Response): Promise<void> 
       return;
     }
     const warehouseId = routeRow.warehouse_id ?? await getDefaultWarehouseId();
+
+    // Cantidad vs tipo: rechaza toda la revisión (400) antes de escribir nada.
+    const invalid = await collectQuantityWarnings(
+      items.map((l: any) => ({ product_id: l.product_id, quantity: Number(l.quantity) }))
+    );
+    if (respondIfInvalidQuantities(res, invalid)) return;
 
     const results: any[] = [];
     // Un mismo producto puede volver parte bueno y parte dañado/vencido — el
