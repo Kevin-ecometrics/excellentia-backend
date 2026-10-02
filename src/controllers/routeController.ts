@@ -17,6 +17,7 @@ import { computeDamageCredit, lineTotal } from '../services/creditCalculator.ts'
 import { reserveInvoiceNumber } from '../services/invoiceCounter.ts';
 import { collectQuantityWarnings, respondIfInvalidQuantities } from '../services/quantityWarnings.ts';
 import { loadLotsForRouteItems, unlottedQty } from '../services/routeLots.ts';
+import { loadPreOrderSummary } from '../services/preOrderSummary.ts';
 import { startBlockReason, readyBlockReason, reopenBlockReason, editLockedReason } from '../services/routeReadiness.ts';
 
 // Orden forward-only: PLANNED -> IN_PROGRESS -> COMPLETED, sin poder retroceder.
@@ -314,6 +315,9 @@ export async function getRoute(req: Request, res: Response): Promise<void> {
             'SELECT * FROM pre_order_items WHERE pre_order_id = ? ORDER BY id', [stop.pre_order_id]
           ) as any[];
           preOrder.items = itemRows;
+          // Fase 146 — cajas pedidas por producto (Lbs: filas; resto: quantity)
+          // para que la parada diga "Producto – 3 cajas" en vez de N líneas.
+          preOrder.summary = await loadPreOrderSummary(stop.pre_order_id);
         }
         stops.push({ ...stop, preOrder });
       } else {
@@ -1049,14 +1053,16 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
       res.status(400).json({ error: addItemLocked });
       return;
     }
+    let stopPreOrderId: number | null = null;
     if (routeStopId) {
       const [[stopRow]] = await pool.query(
-        'SELECT id FROM route_stops WHERE id = ? AND route_id = ?', [routeStopId, id]
+        'SELECT id, stop_type, pre_order_id FROM route_stops WHERE id = ? AND route_id = ?', [routeStopId, id]
       ) as any[];
       if (!stopRow) {
         res.status(404).json({ error: 'Parada no encontrada en esta ruta' });
         return;
       }
+      if (stopRow.stop_type === 'PRE_ORDER' && stopRow.pre_order_id) stopPreOrderId = stopRow.pre_order_id;
     }
     const warehouseId = routeRow.warehouse_id ?? await getDefaultWarehouseId();
 
@@ -1066,6 +1072,28 @@ export async function addRouteItem(req: Request, res: Response): Promise<void> {
     if (!product) {
       res.status(404).json({ error: 'Producto no encontrado' });
       return;
+    }
+
+    // Fase 146 — a una parada PRE_ORDER solo se cargan productos de esa pre-orden.
+    // Un producto de más quedaba cargado al camión (stock descontado) pero fuera de
+    // la pre-orden: el operador no lo ve en el detalle y convertPreOrder no lo
+    // factura. Las cargas sin parada (route_stop_id NULL) y las paradas CUSTOMER
+    // (venta desde el camión) no se validan.
+    if (stopPreOrderId) {
+      const [[inPreOrder]] = await pool.query(
+        `SELECT 1 AS ok FROM pre_order_items pi
+         JOIN products p ON p.barcode = pi.barcode
+         WHERE pi.pre_order_id = ? AND p.id = ? LIMIT 1`,
+        [stopPreOrderId, product.id]
+      ) as any[];
+      if (!inPreOrder) {
+        // `code` para que el app muestre el texto en su idioma; `error` queda de respaldo.
+        res.status(400).json({
+          code: 'PRODUCT_NOT_IN_PREORDER',
+          error: 'Este producto no está en la pre-orden de esta parada. Agrégalo a la pre-orden antes de cargarlo.',
+        });
+        return;
+      }
     }
 
     // Cantidad vs tipo (Case/Unit/Bucket sin decimales) — whole_box se omite:
@@ -1265,42 +1293,25 @@ export async function getExpectedStopItems(req: Request, res: Response): Promise
       return;
     }
     if (stop.stop_type === 'PRE_ORDER' && stop.pre_order_id) {
-      // Backlog #2 paso 2 (2026-09-28) — además de barcode/cantidad, la caja
-      // puntual que la pre-orden prometió (pre_order_items.lot_id) con su peso
-      // y disponibilidad vivos, para que Warehouse la vea/cargue al armar la
-      // parada. `quantity` NULL (pre-orden sin detalle) sale como 0. Si
-      // pre_order_items.lot_id todavía no existe (se crea perezosa en
-      // preOrderController), cae a la consulta de siempre.
-      try {
-        const [rows] = await pool.query(
-          `SELECT pi.barcode, pi.product_name, COALESCE(pi.quantity, 0) AS quantity, pi.unit, pi.case_qty,
-                  pi.lot_id, pl.remaining_qty AS lot_remaining_qty, pl.received_qty AS lot_weight,
-                  pl.lot_number AS lot_number, pl.expiration_date AS lot_expiration_date,
-                  (pl.id IS NOT NULL AND pl.status = 'ACTIVE' AND pl.remaining_qty > 0) AS lot_available
-           FROM pre_order_items pi
-           LEFT JOIN product_lots pl ON pl.id = pi.lot_id
-           WHERE pi.pre_order_id = ?`,
-          [stop.pre_order_id]
-        ) as any[];
-        res.json({
-          data: (rows as any[]).map(r => ({
-            ...r,
-            quantity: Number(r.quantity) || 0,
-            lot_remaining_qty: r.lot_remaining_qty != null ? Number(r.lot_remaining_qty) : null,
-            lot_weight: r.lot_weight != null ? Number(r.lot_weight) : null,
-            lot_available: r.lot_id != null ? !!r.lot_available : null,
-          })),
-        });
-        return;
-      } catch (lotErr) {
-        logger.warn('getExpectedStopItems: sin datos de caja, uso consulta básica:', lotErr);
-      }
-      const [rows] = await pool.query(
-        `SELECT barcode, product_name, quantity, unit, case_qty
-         FROM pre_order_items WHERE pre_order_id = ?`,
-        [stop.pre_order_id]
-      ) as any[];
-      res.json({ data: rows });
+      // Fase 146 — Warehouse ve cuántas cajas/baldes pidió la pre-orden por
+      // producto ("Michoacano – 8 cajas"), sin elegir cajas puntuales (se
+      // reemplazó la caja puntual del backlog #2). Una línea por producto:
+      // Lbs → `box_count` = filas (cada caja es una fila); Case/Unit/Bucket →
+      // `requested_qty` = suma de quantity. La unidad se resuelve contra
+      // products porque una pre-orden sin detallar trae pre_order_items.unit
+      // NULL. Los campos lot_* se mandan en null por compatibilidad con la app.
+      res.json({
+        data: (await loadPreOrderSummary(stop.pre_order_id)).map(l => ({
+          ...l,
+          quantity: l.quantity ?? 0,
+          lot_id: null,
+          lot_remaining_qty: null,
+          lot_weight: null,
+          lot_number: null,
+          lot_expiration_date: null,
+          lot_available: null,
+        })),
+      });
       return;
     }
     res.json({ data: [] });

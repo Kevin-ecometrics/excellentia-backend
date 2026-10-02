@@ -5,6 +5,8 @@ import { computeDamageCredit, lineTotal, isLbsUnit } from '../services/creditCal
 import { getCustomerBalance, applyCustomerCredit } from '../services/creditController.ts';
 import { reserveInvoiceNumber } from '../services/invoiceCounter.ts';
 import { ensureWarehouseTables } from './warehouseController.ts';
+import { expandBoxItems } from '../services/preOrderQuantities.ts';
+import { loadPreOrderSummary } from '../services/preOrderSummary.ts';
 
 async function ensureTables() {
   await pool.query("CREATE TABLE IF NOT EXISTS pre_orders (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, assigned_user_id INT DEFAULT NULL, customer_id VARCHAR(100) NOT NULL, customer_name VARCHAR(255) NOT NULL, salesperson_name VARCHAR(255) DEFAULT NULL, scheduled_date DATE, notes TEXT, status ENUM('DRAFT','CONFIRMED','CONVERTED','CANCELLED') DEFAULT 'DRAFT', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
@@ -73,6 +75,14 @@ export async function createPreOrder(req: Request, res: Response): Promise<void>
     // admins, ver canAccessPreOrder) al resto del equipo que no fue seleccionado.
     const assignedUserId = assigned_user_id != null ? Number(assigned_user_id) : null;
 
+    // Fase 146 — un ítem Lbs puede venir con `box_count: N` (cajas pedidas) y
+    // se guarda como N filas; ver services/preOrderQuantities.ts.
+    const expanded = expandBoxItems(items);
+    if ('error' in expanded) {
+      res.status(400).json({ error: expanded.error });
+      return;
+    }
+
     const [result] = await pool.query(
       'INSERT INTO pre_orders (user_id, assigned_user_id, customer_id, customer_name, salesperson_name, scheduled_date, notes) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [req.user?.id ?? null, assignedUserId, customer_id, customer_name, salesperson_name ?? null, scheduled_date ?? null, notes ?? null]
@@ -86,12 +96,17 @@ export async function createPreOrder(req: Request, res: Response): Promise<void>
     // que no tiene sentido impedir crearla por el stock de HOY. Mismo
     // umbral de "stock bajo" que ya usa la webapp (ProductRow.tsx, <= 5).
     const stockWarnings: { barcode: string; product_name: string; stock: number }[] = [];
-    for (const item of items) {
+    const warnedBarcodes = new Set<string>();
+    for (const item of expanded.items as any[]) {
       const { barcode, product_name, price, quantity, unit, case_qty } = item;
       const hasPricing = price != null && quantity != null;
       const total = hasPricing ? (item.total ?? lineTotal(price, quantity, unit, case_qty)) : null;
-      await insertPreOrderItem(preOrderId, item, hasPricing ? price : null, hasPricing ? quantity : null, total);
+      // quantity se guarda aunque todavía no haya precio: es la cantidad de
+      // cajas/baldes que Warehouse ve en la ruta (Fase 146).
+      await insertPreOrderItem(preOrderId, item, hasPricing ? price : null, quantity ?? null, total);
 
+      if (warnedBarcodes.has(barcode)) continue; // N cajas Lbs = N filas, un solo aviso
+      warnedBarcodes.add(barcode);
       const [[product]] = await pool.query('SELECT stock FROM products WHERE barcode = ?', [barcode]) as any[];
       if (product && Number(product.stock) <= 5) {
         stockWarnings.push({ barcode, product_name, stock: Number(product.stock) });
@@ -175,10 +190,14 @@ export async function getPreOrder(req: Request, res: Response): Promise<void> {
       [id]
     ) as any[];
     for (const it of items as any[]) {
+      // lot_available sale de una expresión booleana de SQL: mysql2 la devuelve
+      // como número (0/1), también en ítems sin lote (LEFT JOIN sin match → 0).
+      // Gson en Android espera Boolean y revienta con "Expected a boolean but
+      // was NUMBER" — se normaliza siempre, no solo cuando hay lot_id.
+      it.lot_available = !!it.lot_available;
       if (it.lot_id != null) {
         it.lot_weight = it.lot_weight != null ? Number(it.lot_weight) : null;
         it.lot_remaining_qty = it.lot_remaining_qty != null ? Number(it.lot_remaining_qty) : null;
-        it.lot_available = !!it.lot_available;
         it.lot_on_route = false;
       }
     }
@@ -212,7 +231,9 @@ export async function getPreOrder(req: Request, res: Response): Promise<void> {
         logger.warn('getPreOrder: no se pudo calcular lot_on_route:', routeErr);
       }
     }
-    res.json({ data: { ...preOrder, items } });
+    // Fase 146 — resumen por producto (cajas pedidas) para Warehouse/detalle.
+    const summary = await loadPreOrderSummary(id as string);
+    res.json({ data: { ...preOrder, items, summary } });
   } catch (err) {
     logger.error('getPreOrder error:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
@@ -270,12 +291,17 @@ export async function updatePreOrder(req: Request, res: Response): Promise<void>
     await pool.query(`UPDATE pre_orders SET ${updates.join(', ')} WHERE id = ?`, updateParams);
 
     if (Array.isArray(items)) {
+      const expanded = expandBoxItems(items);
+      if ('error' in expanded) {
+        res.status(400).json({ error: expanded.error });
+        return;
+      }
       await pool.query('DELETE FROM pre_order_items WHERE pre_order_id = ?', [id]);
-      for (const item of items) {
-        const { barcode, product_name, price, quantity, unit, case_qty } = item;
+      for (const item of expanded.items as any[]) {
+        const { price, quantity, unit, case_qty } = item;
         const hasPricing = price != null && quantity != null;
         const total = hasPricing ? (item.total ?? lineTotal(price, quantity, unit, case_qty)) : null;
-        await insertPreOrderItem(id, item, hasPricing ? price : null, hasPricing ? quantity : null, total);
+        await insertPreOrderItem(id, item, hasPricing ? price : null, quantity ?? null, total);
       }
     }
 

@@ -8185,3 +8185,69 @@ Tras borrar `app/routes/`, `npm run build` falló con `Cannot find module '../..
 - Riesgos conocidos sin corregir de la auditoría del 2026-09-30 (ver Fase 141).
 
 **Siguiente módulo: Ventas / Operador** (flujo del operador en Android: ventas, rutas asignadas, cobro y aprobación). Alcance, pedidos del cliente y diseño por definir; se documentará como nueva fase al arrancar. Mientras tanto no se abre trabajo nuevo de Warehouse salvo correcciones que salgan de la revisión del cliente.
+
+## Fase 145: Warehouse — flujo de carga por escaneo en 2 pasos (producto → peso) con modal guía (2026-10-02)
+
+Modificación pedida tras la aprobación del módulo, **solo al armar la ruta escaneando productos Lbs** (solo Android; sin cambios de backend ni webapp, usa los mismos endpoints `listLots`/`addRouteItem`).
+
+- **Antes (Fase 144):** escanear el producto abría directo la lista de cajas (lotes); escanear el peso con la lista abierta cargaba esa caja.
+- **Ahora:**
+  1. Escanear el producto muestra un modal con el nombre del producto y "Ahora escaneá el código de barras del peso de la caja" (`showWeightScanPrompt`).
+  2. Escanear el peso: caja libre única con ese peso → se carga entera (`wholeBox`) y el modal se cierra.
+  3. Sin coincidencia, o caja reservada para una pre-orden → el error se muestra **dentro del modal** (queda abierto para reintentar), no en Snackbar.
+  4. Botón **"Ver lista"** (siempre disponible) abre la lista de cajas de siempre (`showBoxList`, multi-selección + "Otra cantidad"); desde ahí escanear un peso sigue cargando la caja directo.
+- **Varias cajas libres con el mismo peso:** antes cargaba la primera por FIFO sin avisar. Ahora un modal ("Se encontraron N cajas de X lb con el mismo peso — elegí cuál es") lista cada caja con peso, vencimiento y lote para tocar la correcta (`showSameWeightChooser`). Las reservadas a pre-orden no cuentan como candidatas; si queda una sola libre, se carga directo. Con ese modal abierto, un nuevo escaneo de peso re-resuelve.
+- **Sin cambios:** productos no-Lbs (Case/Unit/Bucket) y Lbs sin lotes siguen con el diálogo de cantidad; escanear otro producto con un modal abierto lo cierra y arranca de nuevo.
+- Archivos: `WarehouseRouteDetailActivity.kt` (`BoxScan` con flag `prompt`, `showBoxScanError`, `showWeightScanPrompt`, `showBoxList`, `showSameWeightChooser`, `onBoxWeightScanned`) y strings es/en (`wh_scan_weight_prompt`, `wh_btn_view_list`, `wh_scan_box_multiple`).
+
+**Verificación:** Android `:app:compileDebugKotlin` OK. **Sin probar en el TC22** (pendiente confirmar cómo se ve el mensaje sobre la lista de opciones en `showSameWeightChooser`).
+
+**Pendiente:** generar APK nuevo y distribuirlo a los TC22 (junto con lo pendiente de la Fase 144); commit en el repo Android.
+
+## Fase 146: Pre-órdenes — Lbs por cajas, mismo modal para todos los tipos y carga a la ruta restringida a la pre-orden (2026-10-02)
+
+Primer trabajo del módulo **Pre-órdenes** (el de Warehouse quedó concluido por el cliente el 2026-10-02). Backend + Android; **sin cambios de webapp ni de esquema SQL**. Arrancó con un bug y siguió con pedidos del usuario en la misma sesión.
+
+### 0. Bug — `Expected a boolean but was NUMBER` al abrir el detalle
+`getPreOrder` (`preOrderController.ts`) devolvía `lot_available` (una expresión booleana de SQL → `mysql2` la entrega como número) y solo la convertía a boolean si el ítem tenía `lot_id`. Una pre-orden sin caja elegida llegaba con `0` y Gson (Android) reventaba. Ahora se normaliza para todos los ítems. Mismo gotcha de `TINYINT(1)` ya documentado en este archivo.
+
+### 1. Lbs se pide por cajas, no por peso ni por caja puntual
+- **Antes:** al agregar un producto Lbs a una pre-orden salía "Choose a box" con el listado del Sub-inventario (`lot_id`, informativo, no reservaba nada) y el stepper de peso.
+- **Ahora:** el vendedor solo dice **cuántas cajas** (modal "¿Cuántas cajas?", 1–200). El peso real se captura recién al entregar.
+- **Sin columna nueva.** Los datos reales mostraron que una caja Lbs ya era **una fila** de `pre_order_items` (antes y después de convertir), así que "cuántas cajas" = número de filas de ese producto. `createPreOrder`/`updatePreOrder` aceptan `box_count: N` en un ítem Lbs y lo expanden a N filas (`expandBoxItems`).
+- **La unidad se resuelve contra `products`:** una pre-orden sin detallar trae `pre_order_items.unit` NULL y `isLbsUnit(null)` es `true`, así que sin resolverla un borrador de Case/Unit se tomaría por Lbs. `COALESCE(pi.unit, products.unit)`.
+- **`quantity` se guarda aunque no haya precio** (antes se descartaba si faltaba `price`): así un borrador Case/Unit/Bucket conserva cuántas cajas/baldes se pidieron.
+- Nuevo `summary` (una línea por producto: `box_count` para Lbs, `requested_qty` para el resto) en `getPreOrder`, en cada parada `PRE_ORDER` de `getRoute` y en `getExpectedStopItems`. Lógica pura y testeada en `services/preOrderQuantities.ts` (+ `.test.ts`); la consulta en `services/preOrderSummary.ts`.
+- `lot_id` y su lógica quedan en la base y el código **sin uso** (no se hace DROP, criterio del proyecto). `getExpectedStopItems` sigue mandando los campos `lot_*` en `null` por compatibilidad con APK viejos.
+
+### 2. Mismo modal para Lbs, Case/Unit y Bucket (Android)
+- `BoxCountDialog.kt` (nuevo): `showCountDialog` — "¿Cuántas cajas?" (Lbs y Case/Unit) / "¿Cuántos baldes?" (Bucket), valida entero 1–200 sin cerrarse. `buildCountedPreOrderItem` arma el ítem Case/Unit/Bucket (precio por **unidad**, total con `lineTotal()`, Fase 122).
+- **`CreatePreOrderActivity`:** ya no abre `ProductDetailActivity` (stepper) para ningún tipo.
+- **`PreOrderDetailActivity`, por estado:**
+  - **`DRAFT`:** los Lbs se agrupan en una línea "Producto — N cajas"; el botón abre el modal (si cambia el número se guarda con `updatePreOrder`). Cada producto se **confirma** con su modal; el contador dice "X de N confirmados" y **"Confirmar pre-orden" se habilita solo cuando todos están confirmados**. Sin total ni precio por línea (el peso final de los Lbs no se conoce).
+  - **`CONFIRMED` (entrega):** vuelve el flujo de siempre — el botón abre el **stepper** (peso real para Lbs, cantidad para el resto) y se muestra el total. Cada caja Lbs sin pesar dice "Caja 1 de 3" (antes mostraba solo el código de barras). Esto deja **convertir pre-órdenes con Lbs** (el peso sale del stepper); la idea de tomar el peso de lo cargado en la ruta quedó descartada por innecesaria.
+- **Fix — el stepper no precargaba las cajas guardadas:** `finalizeItem` exigía `caseQty > 0` para tratar un producto como "por caja", pero el catálogo suele traer el tamaño de caja en `qty` (no en `caseQty`). La cantidad guardada (ej. 2) viajaba como tamaño de caja y el stepper arrancaba en 1. Ahora basta el tipo Case/Unit.
+- **Cantidades enteras:** Case/Unit/Bucket se muestran "2" en vez de "2.00" (`formatPreOrderQty`, `Models.kt`); Lbs conserva sus decimales. Plurales correctos ("1 caja" / "N cajas", "1 box" / "N boxes").
+
+### 3. Lo que ve Almacén y el operador
+- **Parada de una pre-orden (Almacén y "Mis rutas" del operador):** una línea por producto — Lbs "Chicharrón — 3 cajas", resto con su cantidad. Antes el operador veía "Chicharrón — ? lbs" porque la cantidad Lbs es null.
+- **Selector de pre-órdenes disponibles (`WarehouseActivity`):** ya no muestra el monto, solo "Cliente · #id". (`msg_link_preorder` conserva un precio en los strings pero ningún código lo usa.)
+
+### 4. Carga a la ruta restringida a la pre-orden de la parada
+`addRouteItem`: a una parada `PRE_ORDER` solo se cargan productos que están en `pre_order_items` de esa pre-orden; si no, 400. **Motivo:** un producto de más quedaba cargado al camión (stock descontado) pero fuera de la pre-orden — el operador no lo veía y `convertPreOrder` no lo facturaba. **No se valida** en cargas sin parada (`route_stop_id` NULL) ni en paradas `CUSTOMER` (venta desde el camión). La respuesta lleva `code: 'PRODUCT_NOT_IN_PREORDER'`; Android muestra el texto en el idioma de la app (`ApiErrorBody.code`) y el `error` en español queda de respaldo. Limitación: desde el detalle solo se pueden **quitar** productos de una pre-orden, no agregar.
+
+### Datos observados en la base
+Pre-órdenes `DRAFT` 38 (Azteca Mexican Market, 2026-10-02) y 39 (Pancho Villa - SD, 2026-10-05) tenían una caja elegida (`lot_id` 346 y 345, Oaxaca Tiras). Con el cambio el almacén ya no ve el lote prometido en esas dos (el dato sigue guardado); el usuario decidió no tocarlas. Los borradores Case/Unit viejos (ej. GEL02) nunca guardaron cantidad y no se puede reconstruir.
+
+### Lección de build (Android)
+`:app:compileDebugKotlin` **no procesa recursos**: un `strings.xml` roto (apóstrofo sin escapar en "this stop's…") pasó la compilación y reventó en Android Studio con `Can not extract resource from ParsedResource`. Verificar con `:app:assembleDebug` (o `processDebugResources`); evitar apóstrofos en strings.
+
+### Verificación
+Backend: `tsc --noEmit` limpio, `bun test` 42 pass (8 nuevos). Android: `:app:assembleDebug` OK. **Confirmado por el usuario en pantalla durante la sesión:** modales de Lbs, el bloqueo de carga y su alerta en el idioma de la app. El resto (confirmación por producto, detalle `CONFIRMED`, formatos) se fue ajustando según lo que el usuario veía, **sin una pasada de prueba completa en el TC22**.
+
+### Pendiente
+- **Desplegar backend primero y luego el APK.** APK nuevo + backend viejo pierde `box_count` (guarda una sola fila sin cajas); APK viejo + backend nuevo sigue funcionando. Sin dependencias nuevas (no hace falta `npm install` en cPanel).
+- Commits por repo (backend en `warehouse-module`; Android en su rama). `PROGRESS.md` ya traía la Fase 145 sin commitear.
+- Otros mensajes del backend se muestran en español aunque la app esté en inglés (ej. cantidad con decimales en Case/Unit/Bucket al cargar a la ruta); mismo remedio: un `code` por error.
+- Posible: agregar productos a una pre-orden existente desde el detalle.
+- Documentar esta fase en `CLAUDE.md` (sección de pre-órdenes) y revisar si queda algo de la sección "Pre-órdenes — Fase 87/104".
