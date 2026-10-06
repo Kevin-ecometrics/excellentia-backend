@@ -198,7 +198,7 @@ export async function createRoute(req: Request, res: Response): Promise<void> {
         [driver_user_id]
       ) as any[];
       if (active) {
-        res.status(400).json({ error: `Este repartidor ya tiene una ruta activa: "${active.name}"` });
+        res.status(400).json({ error: `Este repartidor ya tiene una ruta activa: "${active.name}". Agrega las pre-órdenes como paradas a esa ruta.` });
         return;
       }
     }

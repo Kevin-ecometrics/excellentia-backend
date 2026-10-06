@@ -8251,3 +8251,32 @@ Backend: `tsc --noEmit` limpio, `bun test` 42 pass (8 nuevos). Android: `:app:as
 - Otros mensajes del backend se muestran en español aunque la app esté en inglés (ej. cantidad con decimales en Case/Unit/Bucket al cargar a la ruta); mismo remedio: un `code` por error.
 - Posible: agregar productos a una pre-orden existente desde el detalle.
 - Documentar esta fase en `CLAUDE.md` (sección de pre-órdenes) y revisar si queda algo de la sección "Pre-órdenes — Fase 87/104".
+
+## Fase 147: Pre-órdenes — varias pre-órdenes por operador y consulta de inventario/ventas por cliente (2026-10-06)
+
+Pedidos del cliente sobre pre-órdenes y Sub-inventario. Backend + Android; **sin cambios de webapp ni de esquema SQL, sin dependencias nuevas**.
+
+### 1. Asignar varias pre-órdenes al mismo operador
+- **Problema:** "asignar" una pre-orden a un operador en Android = crear una ruta con ese repartidor. `createRoute`/`updateRoute` rechazan si el repartidor ya tiene una ruta activa (`PLANNED`/`IN_PROGRESS`): `"Este repartidor ya tiene una ruta activa: X"`. La regla es deliberada (evita dos camiones a la vez), no un bug.
+- **Decisión (confirmada con el usuario):** se mantiene la regla; las pre-órdenes nuevas se **suman como paradas de la ruta existente** en vez de crear una ruta por pre-orden. Descartado: relajar la regla a una ruta activa por fecha.
+- **Android (`WarehouseRouteDetailActivity`):** "Agregar parada" suma el botón **Pre-órdenes** → picker multi-selección con `listAvailableStops` (ya excluye las pre-órdenes en otra ruta) → `addRouteStop(PRE_ORDER)` por cada una. Hereda las guardas de `btnAddStop` (ruta bloqueada, `DIRECT` llena). El backend (`addStop`) ya lo soportaba; solo faltaba la opción en la UI.
+- **Backend:** el error de `createRoute` agrega "Agrega las pre-órdenes como paradas a esa ruta."
+- **Operador (`MyRouteDetailActivity`):** la primera parada `PENDING` (por posición, excluye CONSIGNMENT) muestra la etiqueta **SIGUIENTE PARADA** con la ruta `IN_PROGRESS` y sin venta en curso. Es solo guía visual: no fuerza el orden ni avanza sola. Al resolver una parada (Entregado/Saltado) la etiqueta pasa a la siguiente.
+- **Limitaciones conocidas:** una ruta marcada "Lista" (`ready_at`) está bloqueada → "Reabrir carga" antes de agregar pre-órdenes. Con la ruta `IN_PROGRESS` se pueden seguir sumando, pero el almacén tiene que cargar al camión los productos de las paradas nuevas.
+
+### 2. Sub-inventario → pestaña "Clientes" (solo consulta)
+- Cuarto chip en `InventoryMovementsActivity` (junto a Disponible/Historial/Recibos). Elige el cliente con `CustomerPickerActivity` (el de siempre) y ofrece dos vistas:
+  - **Inventario en el cliente:** consignación que sigue en su tienda (`route_consignment_items`: dejado − vendido − devuelto, solo saldo > 0, ignora rutas `CANCELLED`), por producto.
+  - **Vendido al cliente:** `orders` del cliente (excluye `CANCELLED`, incluye `AWAITING_APPROVAL` con aviso de "líneas por aprobar") agrupado por producto, con total. Filtro **Últimos 30 días** (default) / **Todo**.
+- **Backend (nuevo, solo lectura, `warehouseOnly`):** `GET /api/warehouse/customers/:customerId/inventory` y `GET /api/warehouse/customers/:customerId/sales?days=30|all` (`customerInventoryController.ts`). Reglas puras en `services/customerInventory.ts` (`parseSalesDays`: sin valor→30, `all`→sin filtro, inválido→30, tope 3650; `consignmentRemaining`: nunca negativo, acepta strings DECIMAL) + `.test.ts` (10 tests).
+- **Fix de contraste:** en esta app `@color/background` y `@color/primary` son el **mismo verde** (`ex_green` `#023334`); los botones con estilo por defecto quedaban camuflados contra el fondo. En esta pestaña llevan color explícito (blanco; la vista activa con relleno blanco, ver `highlightCustomerMode`). **El botón de fecha del Historial usa el estilo por defecto y probablemente tiene el mismo problema — no se tocó.**
+
+### Estado (2026-10-06)
+- **Deploy hecho** (backend y app) por el usuario; el cliente ya fue avisado para que revise la actualización. **A la espera de sus comentarios.**
+- Verificación previa al deploy: backend `tsc --noEmit` limpio y `bun test` 52 pass (10 nuevos); Android `:app:assembleDebug` OK. El usuario confirmó en pantalla que agregar pre-órdenes como paradas funciona; el resto (etiqueta "Siguiente", pestaña Clientes y sus colores) **sin pasada de prueba completa en el TC22** al momento de escribir esto.
+
+### Pendiente
+- Recoger y atender los comentarios del cliente sobre esta actualización.
+- Commits por repo (backend en `warehouse-module`; Android en su rama).
+- Posible: mismo arreglo de contraste en el botón de fecha del Historial.
+- Documentar esta fase en `CLAUDE.md` (secciones de rutas/pre-órdenes y Sub-inventario).

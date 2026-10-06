@@ -15,6 +15,7 @@ import {
   listMovements,
   retryMovementSync,
 } from '../controllers/warehouseController.ts';
+import { getCustomerInventory, getCustomerSales } from '../controllers/customerInventoryController.ts';
 import { auth } from '../middleware/auth.ts';
 import { warehouseOnly } from '../middleware/warehouseOnly.ts';
 import { adminOnly } from '../middleware/adminOnly.ts';
@@ -39,5 +40,8 @@ router.post('/lots/:id/condition',       auth, warehouseOnly, setLotCondition);
 router.put('/lots/:id',                  auth, warehouseOnly, updateLot);
 router.get('/movements',                 auth, warehouseOnly, listMovements);
 router.post('/movements/:id/retry-sync', auth, adminOnly,     retryMovementSync);
+// Consulta por cliente (solo lectura): consignación en su tienda y ventas.
+router.get('/customers/:customerId/inventory', auth, warehouseOnly, getCustomerInventory);
+router.get('/customers/:customerId/sales',     auth, warehouseOnly, getCustomerSales);
 
 export default router;
